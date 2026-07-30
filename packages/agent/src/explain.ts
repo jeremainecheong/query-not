@@ -74,6 +74,25 @@ import {
   type StatisticsProof,
 } from './statistics.ts';
 import type { CandidateRewrite, GeneratedRewriteKind } from './transform.ts';
+import { SqlParseError } from './rewrite.ts';
+import {
+  accessSignature,
+  buildStatsProbe,
+  buildVariants,
+  chooseSite,
+  composeNarrative,
+  discoverPredicates,
+  findFlips,
+  hasParamRef,
+  interpretStats,
+  SENSITIVITY_NOTE,
+  type FlipPoint,
+  type PredicateSite,
+  type SensitivityResult,
+  type SensitivityVariant,
+  type StatsRow,
+  type VariantSpec,
+} from './sensitivity.ts';
 
 export class AgentError extends Error {
   readonly hint: string | null;
@@ -843,6 +862,259 @@ export async function whatIfRewrite(
 
     return { candidate, preconditions, outcome, planDiff, equivalence, note };
   });
+}
+
+/**
+ * Sweep one predicate's constant along the column's own statistics and re-plan
+ * at each point — parameter sensitivity.
+ *
+ * NEVER ANALYZE, structurally: the EXPLAIN string below is hard-coded without
+ * it. Two reasons, both also in the response note. (a) Executing the sweep
+ * runs the user's query once per point, and a p10 range constant can select
+ * ~90% of a large table — production cost multiplied by the variant count.
+ * (b) The flip is a planner phenomenon: the decision boundary lives in the
+ * cost model, and plain EXPLAIN reports the exact numbers the planner decided
+ * with. Execution would add wall-clock noise, not evidence.
+ *
+ * Nothing is written to the Store: a sweep is diagnosis with nothing
+ * appliable — decisions record changes with verdicts, and "the plan flips at
+ * 49042" is not a change anyone ships. Catalog facts are read fresh, in the
+ * same session as the EXPLAINs, so unqualified names resolve through exactly
+ * the search_path the query gets, and are never cached across requests.
+ */
+export async function whatIfParameterSensitivity(
+  db: Database,
+  sql: string,
+  location: number | null = null,
+): Promise<SensitivityResult> {
+  const admission = admitQuery(sql);
+  if (!admission.ok) throw new AgentError(admission.reason ?? 'Query refused.');
+
+  let tree: unknown;
+  try {
+    tree = parseSync(sql);
+  } catch (err) {
+    const e = err as { message?: string; cursorPosition?: number };
+    throw new SqlParseError(e?.message ?? String(err), e?.cursorPosition ?? null);
+  }
+
+  // A parameterised query has no value to vary — and EXPLAIN would refuse it
+  // anyway. Refuse with the fix rather than a syntax error later.
+  if (hasParamRef(tree)) {
+    throw new AgentError(
+      'This query is parameterised — a $n placeholder has no value to vary.',
+      'Substitute a representative literal for each parameter and re-run the sweep.',
+    );
+  }
+
+  const discovered = discoverPredicates(sql, tree);
+  if (discovered.length === 0) {
+    throw new AgentError(
+      'The top-level WHERE clause contains no column-to-constant comparison to sweep.',
+      'Sensitivity varies a literal compared against a base-table column with = < <= > or >= — e.g. total_cents > 495000.',
+    );
+  }
+
+  // An explicit pin overrides the choice; a pin that matches nothing is stale
+  // coordinates, the same conflict whatIfRewrite reports.
+  let pinned: number | null = null;
+  if (location !== null) {
+    pinned = discovered.findIndex((d) => d.candidate.location === location);
+    if (pinned < 0) {
+      throw new AgentError('The SQL no longer contains a comparison at that position — re-run the analysis.', null, 409);
+    }
+    const skipped = discovered[pinned].candidate.skipped;
+    if (skipped !== null) {
+      throw new AgentError(`That comparison cannot be swept: ${skipped}.`);
+    }
+  }
+
+  const describeCandidate = (c: { column: string | null; operator: string | null; value: string | null; skipped: string | null }): string =>
+    `\`${c.column ?? '?'} ${c.operator ?? '?'} ${c.value ?? '…'}\` — ${c.skipped ?? ''}`;
+
+  const usable = discovered
+    .map((d, index) => ({ ...d, index }))
+    .filter((d): d is typeof d & { site: PredicateSite } => d.site !== null);
+  if (usable.length === 0) {
+    throw new AgentError(
+      `Comparisons were found, but none can be swept: ${discovered.map((d) => describeCandidate(d.candidate)).join('; ')}.`,
+    );
+  }
+
+  const statement = sql.trim().replace(/;\s*$/, '');
+
+  const session = await db.readOnlySession(async (client) => {
+    // Stats probe in the SAME session as the EXPLAINs: to_regclass resolves
+    // through this session's search_path — the resolution the query gets.
+    const probe = buildStatsProbe(usable.map((u) => u.site));
+    const rows = (await client.query<StatsRow>(probe.text, probe.values)).rows;
+    const stats = interpretStats(usable.map((u) => u.site), rows);
+
+    // Sites whose statistics cannot support a sweep become skipped candidates
+    // with the pg_stats evidence as the reason — reported, never dropped.
+    const eligible: Array<{ site: PredicateSite; stats: (typeof stats)[number]; index: number }> = [];
+    stats.forEach((s, i) => {
+      if (s.basis !== null) eligible.push({ site: usable[i].site, stats: s, index: usable[i].index });
+      else discovered[usable[i].index].candidate.skipped = s.evidence;
+    });
+
+    if (pinned !== null) {
+      const hit = eligible.find((e) => e.index === pinned);
+      if (!hit) {
+        throw new AgentError(`That comparison cannot be swept: ${discovered[pinned].candidate.skipped ?? 'its statistics are unusable'}.`);
+      }
+    }
+    if (eligible.length === 0) {
+      throw new AgentError(
+        `Comparisons were found, but none can be swept: ${discovered.map((d) => describeCandidate(d.candidate)).join('; ')}.`,
+        'ANALYZE the table if pg_stats has no rows for these columns.',
+      );
+    }
+
+    let chosenAt: number;
+    let why: string;
+    if (pinned !== null) {
+      chosenAt = eligible.findIndex((e) => e.index === pinned);
+      why = `pinned by request to the comparison at byte offset ${location}`;
+    } else {
+      const choice = chooseSite(eligible.map((e) => ({ site: e.site, stats: e.stats })));
+      chosenAt = choice.index;
+      why = choice.why;
+    }
+    const chosen = eligible[chosenAt];
+    discovered[chosen.index].candidate.chosen = true;
+
+    const build = buildVariants(sql, chosen.site, chosen.stats);
+    if (!build.ok) throw new AgentError(build.refusal, null, build.refusal.includes('agent bug') ? 500 : 400);
+
+    // Generated output is untrusted by design: every variant passes the same
+    // admission gate as user input, and a failure is a 500 — an agent bug,
+    // never a quiet downgrade (whatIfRewrite's treatment of its own output).
+    for (const variant of build.variants) {
+      const variantAdmission = admitQuery(variant.sql);
+      if (!variantAdmission.ok) {
+        throw new AgentError(`A generated variant failed admission: ${variantAdmission.reason}`, null, 500);
+      }
+    }
+
+    const explain = async (text: string): Promise<QueryPlan> => {
+      // Plain EXPLAIN only — see the function comment for why ANALYZE never
+      // appears in this string.
+      const res = await client.query<Record<string, unknown>>(`EXPLAIN (FORMAT JSON) ${text}`);
+      const row = res.rows[0];
+      if (!row) throw new AgentError('EXPLAIN returned no rows.', null, 500);
+      return parseExplainJson(Object.values(row)[0] as unknown, text);
+    };
+
+    const baselinePlan = await explain(statement);
+    const variantPlans: QueryPlan[] = [];
+    for (const variant of build.variants) {
+      variantPlans.push(await explain(variant.sql.trim().replace(/;\s*$/, '')));
+    }
+
+    return { chosen, why, build, baselinePlan, variantPlans };
+  });
+
+  const { chosen, why, build, baselinePlan, variantPlans } = session;
+  const site = chosen.site;
+
+  const scanRowsOf = (plan: QueryPlan): number | null => {
+    const relname = site.relation.at(-1);
+    const scan = plan.nodes.find((n) => n.nodeType.endsWith('Scan') && n.relation === relname);
+    return scan ? scan.estimatedRowsTotal : null;
+  };
+
+  const signatures = variantPlans.map(accessSignature);
+  const points: FlipPoint[] = build.variants.map((v: VariantSpec, i: number) => ({
+    label: v.label,
+    value: v.value,
+    signature: signatures[i],
+    totalCost: variantPlans[i].totalCost,
+    estimatedRows: variantPlans[i].root.estimatedRowsTotal,
+  }));
+  const flips = findFlips(points, site);
+
+  // Payload discipline: full plans + diffs only for the two points flanking
+  // the FIRST flip boundary; with no flip, the baseline plan ships instead.
+  let firstFlipAt = -1;
+  for (let i = 0; i + 1 < points.length; i += 1) {
+    const a = points[i].signature;
+    const b = points[i + 1].signature;
+    if (a.length !== b.length || a.some((x, j) => x !== b[j])) {
+      firstFlipAt = i;
+      break;
+    }
+  }
+  const flank = new Set(firstFlipAt >= 0 ? [firstFlipAt, firstFlipAt + 1] : []);
+
+  const diffs = variantPlans.map((p) => diffPlans(baselinePlan, p));
+  const variants: SensitivityVariant[] = build.variants.map((v: VariantSpec, i: number) => ({
+    label: v.label,
+    value: v.value,
+    sql: v.sql,
+    frequency: v.frequency,
+    verdict: diffs[i].summary.verdict,
+    totalCost: variantPlans[i].totalCost,
+    estimatedRows: variantPlans[i].root.estimatedRowsTotal,
+    scanRows: scanRowsOf(variantPlans[i]),
+    signature: signatures[i],
+    plan: flank.has(i) ? variantPlans[i] : null,
+    diff: flank.has(i) ? diffs[i] : null,
+  }));
+
+  const baselineSignature = accessSignature(baselinePlan);
+  const baselineMatch = points.find((p) =>
+    p.signature.length === baselineSignature.length && p.signature.every((x, j) => x === baselineSignature[j]));
+  const baseline: SensitivityVariant = {
+    label: 'as written',
+    value: site.literalText,
+    sql: statement,
+    frequency: null,
+    verdict: null,
+    totalCost: baselinePlan.totalCost,
+    estimatedRows: baselinePlan.root.estimatedRowsTotal,
+    scanRows: scanRowsOf(baselinePlan),
+    signature: baselineSignature,
+    plan: firstFlipAt < 0 ? baselinePlan : null,
+    diff: null,
+  };
+
+  const narrative = composeNarrative({
+    site,
+    stats: chosen.stats,
+    evidence: chosen.stats.evidence,
+    points,
+    flips,
+    baselineMatchesLabel: baselineMatch?.label ?? null,
+    notes: build.notes,
+  });
+
+  return {
+    predicate: {
+      column: site.column,
+      relation: site.relation,
+      operator: site.operator,
+      originalValue: site.literalText,
+      location: site.location,
+      charSpan: site.charSpan,
+      why,
+    },
+    candidates: discovered.map((d) => d.candidate),
+    basis: {
+      kind: chosen.stats.basis as 'histogram' | 'mcv',
+      evidence: chosen.stats.evidence,
+      nDistinct: chosen.stats.nDistinct,
+      nullFrac: chosen.stats.nullFrac,
+      reltuples: chosen.stats.reltuples,
+    },
+    baseline,
+    variants,
+    flips,
+    baselineMatchesLabel: baselineMatch?.label ?? null,
+    narrative,
+    costOnly: true,
+    note: SENSITIVITY_NOTE,
+  };
 }
 
 /**

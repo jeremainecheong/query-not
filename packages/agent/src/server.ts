@@ -18,6 +18,7 @@ import {
   analyzeQuery,
   verifySuggestions,
   whatIfIndex,
+  whatIfParameterSensitivity,
   whatIfRewrite,
   whatIfSettings,
   whatIfStatistics,
@@ -134,6 +135,10 @@ app.get('/api/health', async (_req, res) => {
       // opt-in sandbox with a role that can write, plus the parser for the
       // server-side candidate re-derivation.
       proveStatistics: (sandboxHealth?.canDdl ?? false) && parserReady,
+      // Parameter sensitivity needs a connection (pg_stats + EXPLAIN) and the
+      // parser, no extension — surfaced so the UI gates the sweep button
+      // rather than offering a broken one.
+      sensitivity: probe.connected && parserReady,
       persistence: true,
     },
   });
@@ -518,6 +523,36 @@ app.post('/api/whatif/statistics', async (req, res) => {
     const columns = req.body?.columns;
     res.json(await whatIfStatistics(sandbox, sql, relation.trim(), columns));
   } catch (err) {
+    fail(res, err);
+  }
+});
+
+/**
+ * Parameter sensitivity: sweep one predicate's constant along the column's own
+ * pg_stats and re-plan at each point. Estimate-only, structurally — see
+ * whatIfParameterSensitivity for the two-part why. The optional "location"
+ * pins a discovered candidate by the byte offset reported in candidates[],
+ * mirroring whatif/rewrite's coordinate idiom.
+ */
+app.post('/api/whatif/sensitivity', async (req, res) => {
+  try {
+    const sql = requireSql(req.body);
+    if (!parserReady) {
+      throw new AgentError('The SQL parser failed to load; sensitivity analysis is unavailable.', null, 503);
+    }
+    const location = req.body?.location ?? null;
+    if (location !== null && typeof location !== 'number') {
+      throw new AgentError('Provide the candidate\'s numeric "location", or null.');
+    }
+    res.json(await whatIfParameterSensitivity(db, sql, location));
+  } catch (err) {
+    if (err instanceof SqlParseError) {
+      res.status(400).json({
+        error: err.message,
+        hint: err.cursorPosition !== null ? `Parser stopped at character ${err.cursorPosition}.` : null,
+      });
+      return;
+    }
     fail(res, err);
   }
 });
