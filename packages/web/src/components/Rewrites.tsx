@@ -27,7 +27,7 @@ export function Rewrites({ rewrites }: { rewrites: RewriteFinding[] }) {
   return (
     <div>
       {rewrites.map((rewrite, i) => (
-        <div className="finding" key={`${rewrite.kind}-${i}`} style={{ cursor: 'default' }}>
+        <div className="group__row finding" key={`${rewrite.kind}-${i}`}>
           <div className={`finding__icon finding__icon--${rewrite.severity}`} aria-hidden="true">
             {GLYPH[rewrite.severity]}
           </div>
@@ -39,7 +39,7 @@ export function Rewrites({ rewrites }: { rewrites: RewriteFinding[] }) {
             <div className="finding__detail">{rewrite.detail}</div>
 
             {rewrite.snippet && (
-              <div className="suggestion__ddl" style={{ marginTop: 'var(--sp-2)' }}>
+              <div className="code" style={{ marginTop: 'var(--sp-2)' }}>
                 {rewrite.snippet}
               </div>
             )}
@@ -47,7 +47,7 @@ export function Rewrites({ rewrites }: { rewrites: RewriteFinding[] }) {
             <div className="finding__suggestion">{rewrite.suggestion}</div>
 
             {rewrite.semanticChange && (
-              <div className="suggestion__caveat">
+              <div className="caveat">
                 <strong>Changes results, not just speed.</strong> {rewrite.semanticChange}
               </div>
             )}

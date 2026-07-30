@@ -45,8 +45,8 @@ That second sentence is the point. The tool says what it proved and what it didn
   surfaced node by node in the UI.
 - **Collector agent** — holds the database connection, runs the what-if loop, and
   normalises query text before anything leaves the network.
-- **Web UI** — findings, exclusive-time flame graph, plan tree, rewrite advice, a
-  settings what-if panel, and the proof loop.
+- **Web UI** — a plan graph that makes hotspots obvious, ranked slowest operations,
+  findings, rewrite advice, a settings what-if panel, and the proof loop.
 
 Not yet built: workload ingestion (`pg_stat_statements` / `auto_explain`) and the CI
 gate. See [REQUIREMENTS.md](REQUIREMENTS.md).
@@ -130,10 +130,10 @@ That's what keeps credentials and raw query text inside your network.
 ```bash
 npm test          # 161 unit tests across core and agent
 npm run typecheck
-npm run test:e2e  # full stack: seeds, starts both servers, 140 checks, tears down
+npm run test:e2e  # full stack: builds, starts both servers, 165 checks, tears down
 ```
 
-**301 checks in total** — 161 unit, 78 API end-to-end, 62 browser end-to-end.
+**326 checks in total** — 161 unit, 78 API end-to-end, 87 browser end-to-end.
 
 Core's test fixtures are **real `EXPLAIN` output** captured from a seeded Postgres
 (`packages/core/test/fixtures/seed.sql`), not hand-written JSON — including a
@@ -151,15 +151,33 @@ That last check earned its place: it caught the flame labels rendering at 2.1:1 
 a palette validated at 9.3:1. The colours were right; an SVG `fill` attribute cannot
 resolve `var()`, and a CSS rule was overriding it anyway.
 
+## Visualising a plan
+
+The Hotspots view answers two questions at once, because in practice they are the same
+question:
+
+- **The graph** draws the plan as a node-link diagram with rows flowing upward, leaves
+  at the bottom. **Edge thickness is row volume**, so a fat edge narrowing to a thin one
+  is visible waste — 388,000 rows into a join, 15 out. The slowest operation is ringed
+  and labelled `HOTSPOT` rather than left to inference.
+- **Slowest operations** ranks every node by self time, descending.
+
+The ranked list exists because a flame graph is a *bad* answer to "which operation is
+slowest": in a deep plan every ancestor spans the full width, so five different nodes
+all render as full-width bars and the picture reads as "everything is equal". The flame
+graph is still there, under the Plan tab, where nesting is what you actually want.
+
 ### Typography
 
-`-apple-system` leads the font stack, so Apple devices render SF Pro from the OS.
-Everyone else gets [Inter](https://rsms.me/inter/), self-hosted and bundled — no runtime
-CDN request, so the app works offline and under a strict CSP.
+SF Pro and SF Mono are vendored under `packages/web/src/fonts` — the variable SF Pro
+subset to 79KB from 21MB, SF Mono at 13KB per weight.
 
-SF Pro is deliberately *not* vendored: Apple's licence covers UI mockups for
-Apple-platform apps and does not permit self-hosting the font on the web. Inter was
-designed as an SF-alike and is SIL OFL.
+⚠️ **Read [`packages/web/src/fonts/LICENSE-NOTE.md`](packages/web/src/fonts/LICENSE-NOTE.md)
+before deploying this publicly.** Apple's licence for the SF fonts covers UI mockups for
+Apple-platform apps and does not grant redistribution — which is what serving them to a
+browser is. The note documents the compliant fallback (`-apple-system` plus Inter) and
+the two-line change to switch back; `@fontsource-variable/inter` is kept in
+`package.json` for exactly that reason.
 
 ## Prior art
 

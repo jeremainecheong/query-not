@@ -67,7 +67,7 @@ export function WhatIfSettings({ sql, measure }: { sql: string; measure: boolean
   }
 
   return (
-    <div className="card__body">
+    <div className="group__row">
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--sp-2)' }}>
         {PRESETS.map((preset) => (
           <button
@@ -88,7 +88,7 @@ export function WhatIfSettings({ sql, measure }: { sql: string; measure: boolean
         ))}
       </div>
 
-      <p className="card__sub" style={{ marginTop: 'var(--sp-3)' }}>
+      <p className="t-small" style={{ marginTop: 'var(--sp-4)', color: 'var(--ink-muted)' }}>
         {measure
           ? 'Both plans will be executed, so the comparison is measured wall-clock time.'
           : 'Neither plan will be executed — this compares planner cost estimates. Turn on “Execute to measure” for real timings.'}
@@ -107,7 +107,7 @@ export function WhatIfSettings({ sql, measure }: { sql: string; measure: boolean
 
       {state.status === 'done' && (
         <div style={{ marginTop: 'var(--sp-4)' }}>
-          <div className="card__sub" style={{ marginBottom: 'var(--sp-2)' }}>
+          <div className="t-caption" style={{ marginBottom: 'var(--sp-2)' }}>
             {state.label}
           </div>
           <Proof result={state.result} />

@@ -31,7 +31,9 @@ export function Findings({ findings, selectedNodeId, onSelect }: Props) {
       {findings.map((finding, i) => (
         <div
           key={`${finding.kind}-${finding.nodeId ?? 'plan'}-${i}`}
-          className={`finding${finding.nodeId && finding.nodeId === selectedNodeId ? ' finding--selected' : ''}`}
+          className={`group__row group__row--interactive finding${
+            finding.nodeId && finding.nodeId === selectedNodeId ? ' group__row--selected' : ''
+          }`}
           onClick={() => onSelect(finding.nodeId)}
           role="button"
           tabIndex={0}

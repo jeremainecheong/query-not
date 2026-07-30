@@ -71,9 +71,9 @@ function SuggestionRow({
   }
 
   return (
-    <div className="suggestion">
+    <div className="group__row suggestion">
       <div className="suggestion__head">
-        <code className="suggestion__ddl">{suggestion.ddl}</code>
+        <code className="code">{suggestion.ddl}</code>
         <button
           className="btn btn--small"
           onClick={prove}
@@ -100,7 +100,7 @@ function SuggestionRow({
       </div>
 
       {suggestion.caveat && (
-        <div className="suggestion__caveat">
+        <div className="caveat">
           <strong>Caveat.</strong> {suggestion.caveat}
         </div>
       )}
