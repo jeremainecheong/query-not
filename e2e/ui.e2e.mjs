@@ -423,6 +423,20 @@ section('Tier B rewrite proofs');
     /customers_pkey/.test(panel) && /at most one row/.test(panel), panel.slice(0, 200));
   check('the verdict is Proven', /Proven/.test(panel), panel.slice(0, 80));
 
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-tierb-proof.png`, fullPage: true });
+  await ctx.close();
+}
+
+{
+  // A fresh page, like every other analysis in this file: analyse() waits on
+  // .verdict, and a verdict left over from a previous run on the same page
+  // resolves that wait instantly — the tab click then races the pending
+  // analysis, which resets the active tab when it lands. CI's slower planner
+  // loses that race deterministically; a fast machine never sees it.
+  const { ctx, page, errors } = await newPage();
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
+
   // The OR split: exact by construction, honestly worse without indexes —
   // and with no preconditions, no empty list may render.
   await setSql(page, "SELECT id FROM orders WHERE status = 'disputed' OR total_cents > 495000");
@@ -444,7 +458,7 @@ section('Tier B rewrite proofs');
     (await page.locator('.proof .preconditions').count()) === 0);
 
   check('no console errors', errors.length === 0, errors.join('; '));
-  if (OUT) await page.screenshot({ path: `${OUT}/e2e-tierb-proof.png`, fullPage: true });
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-tierb-orsplit.png`, fullPage: true });
   await ctx.close();
 }
 
