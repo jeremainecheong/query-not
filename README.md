@@ -98,6 +98,17 @@ itself tells you not to apply. The CI gate fails a build on camera.
   not timing, because a committed baseline gets compared on someone else's machine.
 - **Decisions** — every proven change is recorded automatically with its verdict and
   numbers, plus whether it was ever actually shipped.
+- **Drop-safety proofs** — every user index listed with its size, definition and
+  `idx_scan` count, each sentence carrying the counter's blind spots (resets, replica
+  reads, constraint enforcement); indexes that enforce semantics — primary keys,
+  unique and exclusion constraints, replica identities, FK-referenced — are flagged
+  not-droppable-for-performance and refused outright. "Prove drop" hides the index
+  with hypopg 1.4's `hypopg_hide_index` in one session, re-plans every query the
+  agent knows about (recorded analyses plus admissible `pg_stat_statements` entries,
+  each re-admitted, capped and fully enumerated), and diffs each plan. A load-bearing
+  index comes back **regressed — do not drop** with the collapsing query and its cost
+  pair; a quiet one is **safe to drop against these queries** — never "safe", full
+  stop, because queries the agent has not seen are not covered and the note says so.
 
 Every phase in [REQUIREMENTS.md](REQUIREMENTS.md) is now built.
 

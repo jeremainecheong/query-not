@@ -794,6 +794,50 @@ section('Decisions page');
   await ctx.close();
 }
 
+section('Indexes page');
+{
+  const { ctx, page, errors } = await newPage();
+  await page.goto(new globalThis.URL('/indexes', URL).toString(), { waitUntil: 'networkidle' });
+  await page.waitForSelector('.indexrow, .alert', { timeout: 60000 });
+
+  check('the deep link renders the inventory',
+    (await page.locator('.indexrow').count()) > 0);
+  check('the page frames idx_scan honestly, caveats first',
+    /replica|reset/i.test(await page.locator('.verdict__sub').innerText()));
+  check('semantics-enforcing indexes are separated with their evidence',
+    /Not droppable for performance/i.test(await page.locator('.main').innerText()) &&
+    /indisprimary/.test(await page.locator('.main').innerText()));
+  check('candidate rows carry the usage evidence sentence',
+    /since/.test(await page.locator('.indexrow__evidence').first().innerText()));
+  check('the prove button is enabled when the capability is on',
+    await page.locator('button:has-text("Prove drop")').first().isEnabled());
+
+  // Prove the safe drop end to end. The store has queries from the sections
+  // above, none of which plan through promotions_applied_at_idx.
+  const promoRow = page.locator('.indexrow', { hasText: 'promotions_applied_at_idx' });
+  await promoRow.locator('button:has-text("Prove drop")').click();
+  await page.waitForSelector('.proof__verdict', { timeout: 90000 });
+  check('a completed proof shows its outcome',
+    (await page.locator('.proof__verdict').first().innerText()).trim().length > 0);
+  check('the proof is labelled estimate-only',
+    (await page.locator('.chip', { hasText: 'estimate only' }).count()) > 0);
+  check('coverage is stated on the panel',
+    /tested/.test(await page.locator('.proof').first().innerText()));
+
+  // Nav + back button for the new route.
+  await page.click('.header__link:has-text("Workload")');
+  await page.waitForTimeout(250);
+  await page.goBack();
+  await page.waitForTimeout(250);
+  check('the back button returns to the indexes page',
+    new globalThis.URL(page.url()).pathname === '/indexes', page.url());
+  check('the view follows the back button', (await page.locator('.indexrow').count()) > 0);
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-indexes.png`, fullPage: true });
+  await ctx.close();
+}
+
 section('Command palette');
 {
   const { ctx, page } = await newPage();

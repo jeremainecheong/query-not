@@ -660,6 +660,120 @@ const nestedOr = await call('/api/whatif/rewrite', {
 check('a nested-scope OR refuses with the reason', nestedOr.status === 409 && /nested subquery/.test(nestedOr.body.error ?? ''),
   JSON.stringify(nestedOr.body).slice(0, 160));
 
+// ── Index drop proofs ────────────────────────────────────────────────────────
+
+section('Index drop candidates');
+const dropHealth = await call('/api/health');
+check('hypopg_hide_index detected on the seeded hypopg 1.4 database',
+  dropHealth.body.database?.hypopgHideIndex === true);
+check('drop proofs advertised as a capability', dropHealth.body.capabilities?.dropIndex === true);
+
+const inventory = await call('/api/indexes');
+check('inventory responds', inventory.status === 200, JSON.stringify(inventory.body).slice(0, 160));
+check('a page-level stats note frames what idx_scan can and cannot see',
+  typeof inventory.body.statsNote === 'string' && /replica/.test(inventory.body.statsNote));
+const invByName = new Map((inventory.body.indexes ?? []).map((i) => [i.index, i]));
+for (const pkey of ['orders_pkey', 'customers_pkey', 'order_items_pkey', 'promotions_pkey']) {
+  const row = invByName.get(pkey);
+  check(`${pkey} is not droppable for performance, citing indisprimary`,
+    row?.droppableForPerformance === false &&
+    row.disqualifiers.some((d) => d.kind === 'primary-key' && /indisprimary/.test(d.evidence)),
+    JSON.stringify(row?.disqualifiers ?? null));
+}
+check('the plain indexes are listed as candidates',
+  invByName.get('order_items_order_id_idx')?.droppableForPerformance === true &&
+  invByName.get('promotions_applied_at_idx')?.droppableForPerformance === true);
+check('every row carries a definition, a size and a since-caveat evidence sentence',
+  (inventory.body.indexes ?? []).length >= 6 &&
+  inventory.body.indexes.every((i) =>
+    /CREATE .*INDEX/.test(i.definition) && i.sizeBytes > 0 && /since/.test(i.evidence)));
+check('no listing row ever claims safety — that is the prove endpoint’s job',
+  !/safe to drop/i.test(JSON.stringify(inventory.body.indexes)));
+
+section('Prove an index is safe to drop');
+// Make the index load-bearing for a known query first: this equality shape
+// plans as an Index Scan using order_items_order_id_idx (measured cost ~11),
+// and analysing it records it in the store the proof reads.
+const loadBearing = await call('/api/analyze', {
+  sql: 'SELECT * FROM order_items WHERE order_id = 12345', analyze: false,
+});
+check('the order_id query plans through the index before anything is hidden',
+  loadBearing.body.plan?.nodes?.some((n) => n.indexName === 'order_items_order_id_idx'),
+  JSON.stringify(loadBearing.body.plan?.nodes?.map((n) => [n.nodeType, n.indexName]) ?? []));
+
+const dropProof = await call('/api/whatif/drop-index', { index: 'order_items_order_id_idx' });
+check('the proof endpoint answers', dropProof.status === 200, JSON.stringify(dropProof.body).slice(0, 200));
+check('a load-bearing index comes back regressed', dropProof.body.outcome === 'regressed',
+  `outcome ${dropProof.body.outcome}`);
+const regressedRow = (dropProof.body.perQuery ?? []).find(
+  (q) => q.usedIndex === true && q.verdict === 'regressed');
+check('the regressing query used the index and its plan collapsed without it',
+  Boolean(regressedRow), JSON.stringify(dropProof.body.perQuery ?? []).slice(0, 300));
+check('the regression is measured in the costs: two orders of magnitude or more',
+  regressedRow && regressedRow.costAfter > regressedRow.costBefore * 100,
+  `cost ${regressedRow?.costBefore} → ${regressedRow?.costAfter}`);
+check('the access change names the lost index',
+  (regressedRow?.accessChanges ?? []).some((c) => c.includes('order_items_order_id_idx')),
+  JSON.stringify(regressedRow?.accessChanges ?? []));
+check('the proof is cost-only and says so', dropProof.body.costOnly === true &&
+  /estimate/i.test(dropProof.body.note ?? ''));
+check('the note refuses the drop in plain words',
+  /load-bearing|do not/i.test(dropProof.body.note ?? ''), dropProof.body.note);
+check('coverage is enumerated, never implied',
+  dropProof.body.coverage?.tested > 0 && dropProof.body.coverage?.cap === 20 &&
+  typeof dropProof.body.coverage?.fromStore === 'number' &&
+  Array.isArray(dropProof.body.coverage?.skipped));
+
+// The safe case: nothing this agent knows about plans through this index —
+// the date() originals in the store cannot use it.
+const safeProof = await call('/api/whatif/drop-index', {
+  index: 'promotions_applied_at_idx', schema: 'public',
+});
+check('an unused index comes back no-plan-changed', safeProof.body.outcome === 'no-plan-changed',
+  `outcome ${safeProof.body.outcome}: ${safeProof.body.note}`);
+check('the verdict is bounded to the enumerated queries',
+  /queries this agent knows about/.test(safeProof.body.note ?? '') &&
+  /never analysed here are not covered/.test(safeProof.body.note ?? ''), safeProof.body.note);
+check('the counter evidence is cited with its blind spots',
+  /idx_scan|stats/.test(safeProof.body.note ?? ''), safeProof.body.note);
+check('the safe proof actually tested stored queries',
+  safeProof.body.coverage?.tested > 0 && safeProof.body.coverage?.fromStore > 0,
+  JSON.stringify(safeProof.body.coverage ?? {}));
+check('every tested plan stood still (or errored and was excluded)',
+  (safeProof.body.perQuery ?? []).every((q) => q.verdict === 'unchanged' || q.error !== null));
+
+// The unhide hazard: hidden-index state is backend memory that survives
+// ROLLBACK. If any exit path skipped hypopg_unhide_all_indexes(), the pooled
+// connection would now plan this query without the index.
+const afterUnhide = await call('/api/analyze', {
+  sql: 'SELECT * FROM order_items WHERE order_id = 12345', analyze: false,
+});
+check('hidden indexes do not leak into later queries',
+  afterUnhide.body.plan?.nodes?.some((n) => n.indexName === 'order_items_order_id_idx'),
+  'hypopg_unhide_all_indexes() must run before the connection returns to the pool');
+check('and the plan cost is the indexed one, not the seq-scan one',
+  afterUnhide.body.plan?.totalCost < 1000,
+  `totalCost ${afterUnhide.body.plan?.totalCost} — measured ~11 with the index, ~11050 without`);
+
+section('Drop-proof refusals');
+const pkeyProof = await call('/api/whatif/drop-index', { index: 'orders_pkey' });
+check('a primary key is refused with the catalog evidence',
+  pkeyProof.status === 409 && /indisprimary|primary key/.test(pkeyProof.body.error ?? ''),
+  JSON.stringify(pkeyProof.body).slice(0, 160));
+check('the refusal says it is a refusal, not a verdict',
+  /refusal, not a verdict/.test(pkeyProof.body.error ?? ''));
+check('an unknown index 404s',
+  (await call('/api/whatif/drop-index', { index: 'no_such_index' })).status === 404);
+check('a missing index field is rejected',
+  (await call('/api/whatif/drop-index', {})).status === 400);
+const dropDecision = await call('/api/decisions', {
+  kind: 'drop-index', change: 'DROP INDEX "public"."promotions_applied_at_idx";',
+  verdict: safeProof.body.outcome ?? 'no-plan-changed', headline: safeProof.body.note ?? '',
+  fingerprint: 'public.promotions_applied_at_idx', costOnly: true,
+});
+check('decisions accept kind drop-index', dropDecision.status === 200 &&
+  dropDecision.body.kind === 'drop-index', JSON.stringify(dropDecision.body).slice(0, 120));
+
 // ── Verify the database was never mutated ────────────────────────────────────
 
 section('Nothing was written');
