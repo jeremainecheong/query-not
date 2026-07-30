@@ -25,6 +25,7 @@ import { fingerprint, TUNABLE_GUCS } from './safety.ts';
 import { analyzeRewrites, initParser, SqlParseError } from './rewrite.ts';
 import { Store } from './store.ts';
 import { buildHistory } from './history.ts';
+import { listIndexInventory, proveDropIndex } from './dropindex.ts';
 import {
   collectWorkload,
   deltaWorkload,
@@ -91,6 +92,10 @@ app.get('/api/health', async (_req, res) => {
       // The one what-if that can be executed rather than just costed — it
       // needs a connection and the parser, and no extension at all.
       proveRewrite: probe.connected && parserReady,
+      // Hiding an existing index needs hypopg 1.4+ (hypopg_hide_index),
+      // probed by function existence rather than version-string parsing. The
+      // /api/indexes listing itself needs no extension; only proving does.
+      dropIndex: probe.hypopgInstalled && probe.hypopgHideIndex,
       persistence: true,
     },
   });
@@ -292,6 +297,43 @@ function withExplainable<T extends { query: string }>(entry: T) {
   return { ...entry, explainable: ok, notExplainableReason: reason };
 }
 
+// ── Indexes ──────────────────────────────────────────────────────────────────
+
+/**
+ * Every user index with its usage evidence, semantics-enforcing ones flagged.
+ *
+ * Works without hypopg — it reads statistics and the catalog only. The listing
+ * never says "safe"; verdicts are the prove endpoint's job.
+ */
+app.get('/api/indexes', async (_req, res) => {
+  try {
+    res.json(await listIndexInventory(db));
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+/**
+ * Prove an index is safe to drop: hide it with hypopg_hide_index in one
+ * session, re-plan every query this agent knows about, diff each plan, and
+ * conclude — or refuse, when the index enforces semantics rather than speed.
+ */
+app.post('/api/whatif/drop-index', async (req, res) => {
+  try {
+    const index = req.body?.index;
+    if (typeof index !== 'string' || index.trim().length === 0) {
+      throw new AgentError('Provide an "index" name.');
+    }
+    const schema = req.body?.schema;
+    if (schema !== undefined && schema !== null && typeof schema !== 'string') {
+      throw new AgentError('"schema" must be a string or null.');
+    }
+    res.json(await proveDropIndex(db, store, index, typeof schema === 'string' ? schema : null));
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
 app.get('/api/saved', (_req, res) => {
   res.json({ queries: store.listSavedQueries() });
 });
@@ -329,8 +371,8 @@ app.delete('/api/saved/:name', (req, res) => {
 app.post('/api/decisions', (req, res) => {
   try {
     const body = req.body ?? {};
-    if (body.kind !== 'index' && body.kind !== 'settings' && body.kind !== 'rewrite') {
-      throw new AgentError('kind must be "index", "settings" or "rewrite".');
+    if (body.kind !== 'index' && body.kind !== 'settings' && body.kind !== 'rewrite' && body.kind !== 'drop-index') {
+      throw new AgentError('kind must be "index", "settings", "rewrite" or "drop-index".');
     }
     if (typeof body.change !== 'string' || body.change.trim().length === 0) {
       throw new AgentError('Provide the "change" that was tested.');

@@ -65,7 +65,7 @@ export interface Decision {
   id: number;
   analysisSlug: string | null;
   fingerprint: string;
-  kind: 'index' | 'settings' | 'rewrite';
+  kind: 'index' | 'settings' | 'rewrite' | 'drop-index';
   /** The DDL, or a JSON object of settings. */
   change: string;
   verdict: string;
@@ -403,7 +403,7 @@ export class Store {
   recordDecision(input: {
     analysisSlug: string | null;
     fingerprint: string;
-    kind: 'index' | 'settings' | 'rewrite';
+    kind: 'index' | 'settings' | 'rewrite' | 'drop-index';
     change: string;
     verdict: string;
     headline: string;
@@ -529,7 +529,7 @@ function toDecision(row: Record<string, unknown>): Decision {
     id: row['id'] as number,
     analysisSlug: (row['analysis_slug'] as string | null) ?? null,
     fingerprint: row['fingerprint'] as string,
-    kind: row['kind'] as 'index' | 'settings' | 'rewrite',
+    kind: row['kind'] as 'index' | 'settings' | 'rewrite' | 'drop-index',
     change: row['change_text'] as string,
     verdict: row['verdict'] as string,
     headline: row['headline'] as string,

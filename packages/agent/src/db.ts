@@ -103,6 +103,7 @@ export class Database {
     readOnlyRole: boolean;
     hypopgAvailable: boolean;
     hypopgInstalled: boolean;
+    hypopgHideIndex: boolean;
     error: string | null;
   }> {
     try {
@@ -116,10 +117,14 @@ export class Database {
           `SELECT has_database_privilege(current_user, current_database(), 'CREATE') AS can_write`,
         );
 
-        const hypopg = await client.query<{ available: boolean; installed: boolean }>(
+        // can_hide probes for hypopg_hide_index by existence rather than by
+        // parsing a version string: hiding arrived in hypopg 1.4.0, and the
+        // function either answers or it does not.
+        const hypopg = await client.query<{ available: boolean; installed: boolean; can_hide: boolean }>(
           `SELECT
              EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'hypopg') AS available,
-             EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'hypopg') AS installed`,
+             EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'hypopg') AS installed,
+             EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'hypopg_hide_index') AS can_hide`,
         );
 
         return {
@@ -129,6 +134,7 @@ export class Database {
           readOnlyRole: !(writable.rows[0]?.can_write ?? true),
           hypopgAvailable: hypopg.rows[0]?.available ?? false,
           hypopgInstalled: hypopg.rows[0]?.installed ?? false,
+          hypopgHideIndex: hypopg.rows[0]?.can_hide ?? false,
           error: null,
         };
       });
@@ -140,6 +146,7 @@ export class Database {
         readOnlyRole: false,
         hypopgAvailable: false,
         hypopgInstalled: false,
+        hypopgHideIndex: false,
         error: err instanceof Error ? err.message : String(err),
       };
     }
