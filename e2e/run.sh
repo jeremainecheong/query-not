@@ -39,6 +39,10 @@ wait_for() {
       fail "$name did not come up — see $LOGS"
       return 1
     fi
+    # Without this the loop is 120 instantly-refused curls — about half a
+    # second of "waiting", which a cold agent (module graph + wasm parser)
+    # loses on a slow runner. With it the budget is a real 30 seconds.
+    sleep 0.25
   done
   printf '  %s up\n' "$name"
 }
