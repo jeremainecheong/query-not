@@ -30,7 +30,12 @@
  */
 import { parseSync } from 'libpg-query';
 
-export type GeneratedRewriteKind = 'not-in-subquery' | 'not-in-list' | 'function-on-column';
+export type GeneratedRewriteKind =
+  | 'not-in-subquery'
+  | 'not-in-list'
+  | 'function-on-column'
+  | 'or-across-columns'
+  | 'correlated-subquery-in-select';
 
 /** A schema fact that must hold for the rewrite to preserve results. */
 export type PreconditionSpec =
@@ -47,6 +52,29 @@ export type PreconditionSpec =
       relation: string[];
       column: string;
       oneOf: string[];
+      why: string;
+    }
+  | {
+      /**
+       * A unique index whose key columns are a subset of `columns` must exist
+       * on `relation`. Equality on every pinned column then admits at most one
+       * row — the fact that stops a LEFT JOIN fanning out where the scalar
+       * subquery it replaces would have raised an error.
+       */
+      kind: 'unique-key-covers';
+      relation: string[];
+      columns: string[];
+      why: string;
+    }
+  | {
+      /**
+       * None of `functions` may resolve to an aggregate. `sum(x)` and
+       * `upper(x)` are indistinguishable in the parse tree — aggregate-ness
+       * lives in pg_proc — and a transform that re-shapes the statement around
+       * an unnoticed aggregate changes what it computes.
+       */
+      kind: 'function-not-aggregate';
+      functions: string[];
       why: string;
     };
 
@@ -191,6 +219,124 @@ function nextOpenParen(buf: Buffer, from: number): number {
     i += 1;
   }
   return -1;
+}
+
+// ── word tokens ──────────────────────────────────────────────────────────────
+//
+// The statement-rebuilding transforms need clause boundaries — where WHERE
+// ends, where ORDER BY starts — and the AST does not carry them (SortBy nodes
+// report location -1). A single literal-and-comment-aware pass that records
+// every bare word with its paren depth answers all of those questions: a
+// depth-relative occurrence of a reserved clause keyword *is* the clause,
+// because an unquoted reserved word cannot be an identifier.
+
+interface WordToken {
+  start: number;
+  /** Exclusive. */
+  end: number;
+  depth: number;
+  upper: string;
+}
+
+const isWordStart = (c: number): boolean =>
+  (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x5f;
+// Bytes ≥ 0x80 continue a word: `froméx` is one identifier, and treating its
+// ASCII prefix as a token would fabricate a FROM keyword out of a column name.
+const isWordCont = (c: number): boolean =>
+  isWordStart(c) || (c >= 0x30 && c <= 0x39) || c === 0x24 || c >= 0x80;
+
+function wordTokens(buf: Buffer, from = 0, to = buf.length, baseDepth = 0): WordToken[] {
+  const out: WordToken[] = [];
+  let depth = baseDepth;
+  let i = from;
+  while (i < to) {
+    const after = skipComment(buf, i);
+    if (after !== i) { i = after; continue; }
+    const c = buf[i];
+    if (c === SQUOTE || c === DQUOTE) { i = skipQuoted(buf, i, c); continue; }
+    if (c === OPEN) { depth += 1; i += 1; continue; }
+    if (c === CLOSE) { depth -= 1; i += 1; continue; }
+    if (isWordStart(c)) {
+      let j = i + 1;
+      while (j < to && isWordCont(buf[j])) j += 1;
+      out.push({ start: i, end: j, depth, upper: buf.subarray(i, j).toString('latin1').toUpperCase() });
+      i = j;
+      continue;
+    }
+    i += 1;
+  }
+  return out;
+}
+
+/** Only whitespace, comments and `(` between `from` and `to`? */
+function gapIsOpeners(buf: Buffer, from: number, to: number): boolean {
+  let i = from;
+  while (i < to) {
+    const after = skipComment(buf, i);
+    if (after !== i) { i = after; continue; }
+    const c = buf[i];
+    if (c === OPEN || c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) { i += 1; continue; }
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Exclusive end of the statement's own text: everything before trailing
+ * whitespace, semicolons and comments. Needed because a rebuilt statement must
+ * not carry the terminator into the middle of the new text.
+ */
+function statementEnd(buf: Buffer): number {
+  let last = 0;
+  let i = 0;
+  while (i < buf.length) {
+    const after = skipComment(buf, i);
+    if (after !== i) { i = after; continue; }
+    const c = buf[i];
+    if (c === SQUOTE || c === DQUOTE) { const j = skipQuoted(buf, i, c); last = j; i = j; continue; }
+    if (c !== 0x20 && c !== 0x09 && c !== 0x0a && c !== 0x0d && c !== 0x3b /* ; */) last = i + 1;
+    i += 1;
+  }
+  return last;
+}
+
+/**
+ * Drop unmatched trailing `)` from a fragment sliced out of a larger
+ * expression. An arm of `WHERE (a = 1) OR b = 2` starts *inside* its
+ * parenthesis — the parser reports the expression, not the grouping — so the
+ * slice ends with closers whose openers were never included. Anything else
+ * unbalanced is a scan failure and refuses.
+ */
+function stripUnbalancedTail(text: string): string | null {
+  const balance = (t: string): { final: number; min: number } => {
+    const buf = Buffer.from(t, 'utf8');
+    let depth = 0;
+    let min = 0;
+    let i = 0;
+    while (i < buf.length) {
+      const after = skipComment(buf, i);
+      if (after !== i) { i = after; continue; }
+      const c = buf[i];
+      if (c === SQUOTE || c === DQUOTE) { i = skipQuoted(buf, i, c); continue; }
+      if (c === OPEN) depth += 1;
+      if (c === CLOSE) { depth -= 1; if (depth < min) min = depth; }
+      i += 1;
+    }
+    return { final: depth, min };
+  };
+
+  // Strip one trailing `)` at a time, re-balancing after each: a closer that is
+  // *not* at the tail (`b) AND (c))` — the first `)` is the excess one) cannot
+  // be fixed by end-stripping, and that loop shape refuses it instead of
+  // removing a matched closer.
+  let out = text.replace(/[\s;]+$/, '');
+  let b = balance(out);
+  while (b.min < 0) {
+    if (!out.endsWith(')')) return null;
+    out = out.slice(0, -1).replace(/\s+$/, '');
+    b = balance(out);
+  }
+  return b.final === 0 ? out : null;
 }
 
 // ── AST helpers ──────────────────────────────────────────────────────────────
@@ -374,6 +520,40 @@ export function validateSplice(originalSql: string, rewrittenSql: string, replac
   const want = stripLocations(expected);
   const found = ancestry(commonAncestor(diff)).some(p => same(at(after, p), want));
   if (!found) return 'the changed region is not the replacement that was written';
+  return null;
+}
+
+/** Structural equality with key order ignored — `same()` is order-sensitive. */
+const equalAst = (a: unknown, b: unknown): boolean => divergences(a, b, '', [], 1).length === 0;
+
+const clone = <T,>(v: T): T => structuredClone(v);
+
+/**
+ * Validation for rewrites that rebuild the statement rather than splice one
+ * region: construct the tree the rewritten text *must* parse to — derived from
+ * the original parse tree by the same structural operation the text transform
+ * claims to perform — and require the reparse to equal it, locations stripped.
+ *
+ * Stronger than region containment: every node of the rewritten statement is
+ * accounted for, so a slicing bug anywhere — a dropped predicate, an ORDER BY
+ * absorbed into an arm, a join attached at the wrong level — is a mismatch and
+ * the candidate is withheld.
+ */
+export function validateReconstruction(rewrittenSql: string, expectedStmt: Node): string | null {
+  let tree: unknown;
+  try {
+    tree = parseSync(rewrittenSql);
+  } catch (err) {
+    return `the rewritten statement does not parse: ${(err as Error).message}`;
+  }
+  const stmts = (node(tree)?.['stmts'] as unknown[]) ?? [];
+  if (stmts.length !== 1) return 'the rewrite produced more than one statement';
+  const got = stripLocations((node(stmts[0]) as Node)?.['stmt']);
+  const want = stripLocations(expectedStmt);
+  if (!equalAst(want, got)) {
+    const diff = divergences(want, got, '', [], 3);
+    return `the rewritten statement does not parse to the intended structure (at ${diff.join(', ') || 'root'})`;
+  }
   return null;
 }
 
@@ -767,6 +947,600 @@ export function generateFunctionOnColumn(sql: string, stmt: Node, expr: Node): C
   );
 }
 
+// ── shared pieces for the statement-rebuilding transforms ────────────────────
+
+/** First token position of a subtree, or -1 when the parser reported none. */
+function minLocation(value: unknown): number {
+  const locs = locations(value);
+  return locs.length > 0 ? Math.min(...locs) : -1;
+}
+
+/**
+ * Clause keywords that can follow WHERE at the top level of a SELECT. Reserved
+ * words, so a depth-0 occurrence is the clause itself and never an identifier.
+ */
+const CLAUSE_KEYWORDS = new Set([
+  'GROUP', 'HAVING', 'WINDOW', 'ORDER', 'LIMIT', 'OFFSET', 'FETCH', 'FOR',
+  'UNION', 'INTERSECT', 'EXCEPT', 'RETURNING', 'INTO',
+]);
+
+/** A clause field that is present and non-empty. */
+const hasClause = (sel: Node, key: string): boolean => {
+  const v = sel[key];
+  return v !== undefined && v !== null && !(Array.isArray(v) && v.length === 0);
+};
+
+/**
+ * Function names called in a subtree, plus the two things about a call that
+ * are aggregate- or window-shaped *syntactically* and refuse structurally.
+ * Plain `sum(x)` is indistinguishable from `upper(x)` here — that distinction
+ * is pg_proc's, so it comes back as a `function-not-aggregate` precondition.
+ */
+function functionUse(value: unknown): { names: string[]; refused: string | null } {
+  const names = new Set<string>();
+  let refused: string | null = null;
+  const visit = (v: unknown): void => {
+    if (refused) return;
+    if (Array.isArray(v)) { for (const x of v) visit(x); return; }
+    const n = node(v);
+    if (!n) return;
+    for (const [k, val] of Object.entries(n)) {
+      const child = node(val);
+      if (k === 'FuncCall' && child) {
+        if (child['over']) { refused = 'a window function'; return; }
+        if (child['agg_star'] || child['agg_distinct'] || child['agg_order'] ||
+            child['agg_filter'] || child['agg_within_group']) {
+          refused = 'an aggregate call';
+          return;
+        }
+        const name = lastSval(child['funcname']);
+        if (name) names.add(name.toLowerCase());
+      }
+      visit(val);
+    }
+  };
+  visit(value);
+  return { names: [...names].sort(), refused };
+}
+
+/** Names (aliases or bare table names) addressable in a FROM clause. */
+function fromClauseNames(from: unknown): Set<string> {
+  const out = new Set<string>();
+  const visit = (v: unknown): void => {
+    const n = node(v);
+    if (!n) return;
+    const rv = node(n['RangeVar']);
+    if (rv) {
+      out.add((node(rv['alias'])?.['aliasname'] as string) ?? (rv['relname'] as string));
+      return;
+    }
+    const je = node(n['JoinExpr']);
+    if (je) {
+      visit(je['larg']);
+      visit(je['rarg']);
+      const alias = node(je['alias'])?.['aliasname'];
+      if (typeof alias === 'string') out.add(alias);
+      return;
+    }
+    for (const key of ['RangeSubselect', 'RangeFunction', 'RangeTableFunc', 'RangeTableSample']) {
+      const item = node(n[key]);
+      const alias = node(item?.['alias'])?.['aliasname'];
+      if (typeof alias === 'string') out.add(alias);
+      if (item) return;
+    }
+  };
+  if (Array.isArray(from)) for (const f of from) visit(f);
+  return out;
+}
+
+/** The statement count of the whole input — a rebuild must not drop a sibling. */
+function inputStatementCount(sql: string): number {
+  try {
+    return ((node(parseSync(sql))?.['stmts'] as unknown[]) ?? []).length;
+  } catch {
+    return -1;
+  }
+}
+
+// ── transform: OR across columns → UNION ALL of exclusive arms ───────────────
+
+/**
+ * `WHERE a OR b` → `(… WHERE a) UNION ALL (… WHERE b AND (a) IS NOT TRUE)`.
+ *
+ * The guards are what make this exact rather than approximate: each arm takes
+ * only the rows no earlier arm took, so the arms partition the original result
+ * multiset. `IS NOT TRUE` rather than `NOT` is deliberate — a row where the
+ * earlier arm evaluates to NULL did not match it, and must not be lost from
+ * the later arm the way `AND NOT (arm)` would lose it. No schema fact is
+ * involved; when the target list calls functions, their non-aggregate-ness is
+ * the one thing that cannot be read off the tree and becomes a precondition.
+ *
+ * ORDER BY / LIMIT / OFFSET hoist to the set operation, where they keep their
+ * meaning; each arm can then be served by its own index, which is the point.
+ */
+export function generateOrSplit(sql: string, sel: Node, orExpr: Node): CandidateResult {
+  if (inputStatementCount(sql) !== 1) {
+    return { ok: false, blocked: 'the input contains more than one statement' };
+  }
+  if (sel['op'] !== 'SETOP_NONE') {
+    return { ok: false, blocked: 'the statement is already a set operation' };
+  }
+  if (node(sel['whereClause'])?.['BoolExpr'] !== orExpr) {
+    return {
+      ok: false,
+      blocked: 'the OR sits inside a larger predicate — only an OR that is the whole ' +
+        'WHERE clause splits into arms that mean the same thing',
+    };
+  }
+
+  for (const [key, why] of [
+    ['withClause', 'a WITH query — each arm would need its own copy of the CTE'],
+    ['distinctClause', 'DISTINCT — de-duplicating per arm is not de-duplicating the whole result'],
+    ['groupClause', 'GROUP BY — the split would aggregate per arm instead of once'],
+    ['havingClause', 'HAVING — the split would aggregate per arm instead of once'],
+    ['windowClause', 'a window clause — window functions would see one arm, not the whole result'],
+    ['lockingClause', 'FOR UPDATE/SHARE — row locking does not distribute over a set operation'],
+    ['intoClause', 'SELECT INTO'],
+  ] as const) {
+    if (hasClause(sel, key)) return { ok: false, blocked: `the query uses ${why}` };
+  }
+
+  const use = functionUse(sel['targetList']);
+  if (use.refused) {
+    return { ok: false, blocked: `the select list contains ${use.refused}, which would be evaluated per arm` };
+  }
+
+  // ORDER BY over a set operation resolves against output column names only.
+  const targets = Array.isArray(sel['targetList']) ? (sel['targetList'] as unknown[]) : [];
+  let hasStar = false;
+  const outputNames = new Set<string>();
+  for (const t of targets) {
+    const rt = node(node(t)?.['ResTarget']);
+    if (!rt) continue;
+    if (typeof rt['name'] === 'string') { outputNames.add(rt['name'] as string); continue; }
+    const fields = node(node(rt['val'])?.['ColumnRef'])?.['fields'];
+    if (Array.isArray(fields)) {
+      if (fields.some(f => node(f)?.['A_Star'] !== undefined)) { hasStar = true; continue; }
+      const last = node(node(fields.at(-1))?.['String'])?.['sval'];
+      if (typeof last === 'string') outputNames.add(last);
+    }
+  }
+  const sorts = Array.isArray(sel['sortClause']) ? (sel['sortClause'] as unknown[]) : [];
+  if (sorts.length > 0 && hasStar) {
+    return {
+      ok: false,
+      blocked: 'SELECT * with ORDER BY — whether the sort key is an output column of every ' +
+        'arm cannot be confirmed without the catalog',
+    };
+  }
+  for (const s of sorts) {
+    const sb = node(node(s)?.['SortBy']);
+    const key = sb?.['node'];
+    const ordinal = node(node(key)?.['A_Const'])?.['ival'] !== undefined;
+    const parts = columnParts(key);
+    const named = parts !== null && parts.length === 1 && outputNames.has(parts[0]);
+    if (!ordinal && !named) {
+      return {
+        ok: false,
+        blocked: 'ORDER BY over a set operation can only use output column names or ordinals — ' +
+          'a qualified column or an expression stops resolving once the arms are separate queries',
+      };
+    }
+  }
+
+  const args = Array.isArray(orExpr['args']) ? (orExpr['args'] as unknown[]) : [];
+  if (args.length < 2) return { ok: false, blocked: 'the OR has fewer than two arms' };
+  const armLocs = args.map(minLocation);
+  if (armLocs.some(l => l < 0) || armLocs.some((l, i) => i > 0 && l <= armLocs[i - 1])) {
+    return { ok: false, blocked: 'the parser reported no usable positions for the arms' };
+  }
+
+  const buf = Buffer.from(sql, 'utf8');
+  const toks = wordTokens(buf);
+  const whereTok = toks.filter(t => t.depth === 0 && t.upper === 'WHERE' && t.end <= armLocs[0]).at(-1);
+  if (!whereTok) return { ok: false, blocked: 'could not locate the WHERE keyword' };
+
+  const boundary = toks.find(t => t.depth === 0 && t.start > armLocs[0] && CLAUSE_KEYWORDS.has(t.upper));
+  const stmtEnd = statementEnd(buf);
+  const whereEnd = boundary ? boundary.start : stmtEnd;
+
+  const armTexts: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    let end: number;
+    if (i < args.length - 1) {
+      const sep = toks
+        .filter(t => t.upper === 'OR' && t.start >= armLocs[i] && t.end <= armLocs[i + 1] &&
+                     gapIsOpeners(buf, t.end, armLocs[i + 1]))
+        .at(-1);
+      if (!sep) return { ok: false, blocked: 'could not locate the OR that separates the arms' };
+      end = sep.start;
+    } else {
+      end = whereEnd;
+    }
+    const text = stripUnbalancedTail(buf.subarray(armLocs[i], end).toString('utf8'));
+    if (text === null || text.length === 0) {
+      return { ok: false, blocked: 'an arm of the OR could not be sliced out cleanly' };
+    }
+    armTexts.push(text);
+  }
+
+  const prefix = buf.subarray(0, whereTok.end).toString('utf8');
+  const tail = buf.subarray(whereEnd, stmtEnd).toString('utf8').trim();
+
+  const armSql = armTexts.map((text, i) => {
+    const guards = armTexts.slice(0, i).map(g => ` AND (${g}) IS NOT TRUE`);
+    return `${prefix} ${text}${guards.join('')}`;
+  });
+  const rewritten = armSql.map(s => `(${s})`).join('\nUNION ALL\n') + (tail ? `\n${tail}` : '');
+
+  // The tree this text must parse to, built from the original tree by the same
+  // operation: clone the SELECT per arm, replace the WHERE, hoist the tail.
+  const armSelect = (i: number): Node => {
+    const s = clone(sel);
+    delete s['sortClause'];
+    delete s['limitCount'];
+    delete s['limitOffset'];
+    s['limitOption'] = 'LIMIT_OPTION_DEFAULT';
+    const guards = args.slice(0, i).map(a => ({
+      BooleanTest: { arg: clone(a), booltesttype: 'IS_NOT_TRUE' },
+    }));
+    if (guards.length === 0) {
+      s['whereClause'] = clone(args[i]);
+    } else {
+      const base = clone(args[i]);
+      const baseBool = node(node(base)?.['BoolExpr']);
+      // Reparsing flattens AND chains, so an arm that is itself an AND must
+      // splice its guards into the flat args list, not nest beneath it.
+      s['whereClause'] = baseBool && baseBool['boolop'] === 'AND_EXPR'
+        ? { BoolExpr: { boolop: 'AND_EXPR', args: [...(baseBool['args'] as unknown[]), ...guards] } }
+        : { BoolExpr: { boolop: 'AND_EXPR', args: [base, ...guards] } };
+    }
+    return s;
+  };
+
+  let expected: Node = armSelect(0);
+  for (let i = 1; i < args.length; i += 1) {
+    expected = {
+      op: 'SETOP_UNION',
+      all: true,
+      larg: expected,
+      rarg: armSelect(i),
+      limitOption: 'LIMIT_OPTION_DEFAULT',
+    };
+  }
+  if (sel['sortClause']) expected['sortClause'] = clone(sel['sortClause']);
+  if (sel['limitCount']) expected['limitCount'] = clone(sel['limitCount']);
+  if (sel['limitOffset']) expected['limitOffset'] = clone(sel['limitOffset']);
+  expected['limitOption'] = sel['limitOption'] ?? 'LIMIT_OPTION_DEFAULT';
+
+  const problem = validateReconstruction(rewritten, { SelectStmt: expected });
+  if (problem) return { ok: false, blocked: problem };
+
+  const preconditions: PreconditionSpec[] = use.names.length > 0
+    ? [{
+        kind: 'function-not-aggregate',
+        functions: use.names,
+        why: 'The arms each run the select list; an aggregate there would collapse each arm ' +
+             'separately instead of the whole result once.',
+      }]
+    : [];
+
+  return {
+    ok: true,
+    candidate: {
+      kind: 'or-across-columns',
+      sql: rewritten,
+      byteSpan: { start: 0, end: stmtEnd },
+      charSpan: { start: 0, end: byteToCharIndex(sql, stmtEnd) },
+      replaced: buf.subarray(0, stmtEnd).toString('utf8'),
+      replacement: rewritten,
+      preconditions,
+      rationale:
+        'Each arm can use its own index instead of forcing one plan to satisfy both sides of the OR. ' +
+        'The IS NOT TRUE guards make the arms mutually exclusive — every original row lands in exactly ' +
+        'one arm, NULLs included — so no de-duplication is needed and none is added.',
+    },
+  };
+}
+
+// ── transform: correlated scalar subquery in SELECT → LEFT JOIN ──────────────
+
+/**
+ * `SELECT …, (SELECT expr FROM inner i WHERE i.k = outer.k) FROM …`
+ *   → `SELECT …, expr FROM … LEFT JOIN inner i ON i.k = outer.k`.
+ *
+ * The join preserves the subquery's NULL-on-no-match; what it cannot preserve
+ * unaided is the *at most one match* the scalar subquery enforced by raising
+ * an error. A unique index whose key columns are a subset of the equality-
+ * pinned columns makes a second match impossible — that is the precondition,
+ * and it is checked against pg_index before anything executes.
+ *
+ * The subquery's own alias is kept verbatim, so every reference inside the
+ * hoisted WHERE keeps its meaning; a collision with an outer name refuses
+ * rather than re-aliasing, because rewriting references is how scope capture
+ * happens.
+ */
+export function generateCorrelatedSelect(sql: string, sel: Node, link: Node): CandidateResult {
+  if (inputStatementCount(sql) !== 1) {
+    return { ok: false, blocked: 'the input contains more than one statement' };
+  }
+  if (sel['op'] !== 'SETOP_NONE') {
+    return { ok: false, blocked: 'the statement is a set operation' };
+  }
+  for (const [key, why] of [
+    ['groupClause', 'the outer query groups — the joined value would itself need grouping'],
+    ['havingClause', 'the outer query groups — the joined value would itself need grouping'],
+    ['lockingClause', 'FOR UPDATE cannot lock the nullable side of an outer join'],
+    ['intoClause', 'SELECT INTO'],
+  ] as const) {
+    if (hasClause(sel, key)) return { ok: false, blocked: why };
+  }
+
+  const targets = Array.isArray(sel['targetList']) ? (sel['targetList'] as unknown[]) : [];
+  const targetIndex = targets.findIndex(t => node(node(node(t)?.['ResTarget'])?.['val'])?.['SubLink'] === link);
+  if (targetIndex < 0) {
+    return {
+      ok: false,
+      blocked: 'the subquery is nested inside an expression — only a subquery that is itself ' +
+        'a select-list entry is rewritten',
+    };
+  }
+
+  const sub = node(node(link['subselect'])?.['SelectStmt']);
+  if (!sub) return { ok: false, blocked: 'the subquery is not a plain SELECT' };
+  if (sub['op'] !== 'SETOP_NONE') return { ok: false, blocked: 'the subquery is a set operation' };
+  for (const [key, why] of [
+    ['withClause', 'the subquery has its own WITH clause'],
+    ['distinctClause', 'the subquery uses DISTINCT'],
+    ['groupClause', 'the subquery aggregates — the grouped-join rewrite for that is not generated'],
+    ['havingClause', 'the subquery aggregates — the grouped-join rewrite for that is not generated'],
+    ['windowClause', 'the subquery uses a window clause'],
+    ['sortClause', 'ORDER BY in a scalar subquery pairs with LIMIT to pick one row per outer row — ' +
+                   'that is a lateral-join pattern, out of scope for a plain join'],
+    ['limitCount', 'LIMIT in a scalar subquery is either a no-op or a per-row top-1 — ' +
+                   'which one was meant cannot be told from the tree'],
+    ['limitOffset', 'OFFSET in a scalar subquery changes which row is returned'],
+    ['lockingClause', 'the subquery locks rows'],
+  ] as const) {
+    if (hasClause(sub, key)) return { ok: false, blocked: why };
+  }
+
+  const subFrom = sub['fromClause'];
+  if (!Array.isArray(subFrom) || subFrom.length !== 1) {
+    return { ok: false, blocked: 'the subquery reads more than one table' };
+  }
+  const rv = node(node(subFrom[0])?.['RangeVar']);
+  if (!rv) return { ok: false, blocked: 'the subquery does not read a plain table' };
+  const innerRelParts = [rv['schemaname'], rv['relname']].filter(x => typeof x === 'string') as string[];
+  const innerName = (node(rv['alias'])?.['aliasname'] as string) ?? (rv['relname'] as string);
+
+  const subTargets = sub['targetList'];
+  if (!Array.isArray(subTargets) || subTargets.length !== 1) {
+    return { ok: false, blocked: 'the subquery returns more than one column' };
+  }
+  const val = node(node(subTargets[0])?.['ResTarget'])?.['val'];
+  if (!val) return { ok: false, blocked: 'the subquery selects nothing usable' };
+  if (contains(val, type => type === 'SubLink')) {
+    return { ok: false, blocked: 'the subquery nests another subquery in its select list' };
+  }
+  const use = functionUse(val);
+  if (use.refused === 'an aggregate call') {
+    return {
+      ok: false,
+      blocked: 'the subquery aggregates — count(*) over no rows is 0 where a join produces NULL, ' +
+        'so the equivalent rewrite is a grouped join, which is not generated',
+    };
+  }
+  if (use.refused) {
+    return { ok: false, blocked: `the subquery's select list contains ${use.refused}` };
+  }
+
+  if (!sub['whereClause']) {
+    return {
+      ok: false,
+      blocked: 'the subquery is not correlated — Postgres already runs it once, not per row',
+    };
+  }
+
+  const outerNames = fromClauseNames(sel['fromClause']);
+  if (outerNames.has(innerName)) {
+    return {
+      ok: false,
+      blocked: `the subquery's table is addressed as \`${innerName}\`, which the outer FROM already ` +
+        'uses — hoisting it would collide, and re-aliasing would change what the preserved ' +
+        'references mean',
+    };
+  }
+
+  // Every column reference inside the subquery must be qualified, and the
+  // qualifier must be scopable: the inner table or a real outer name. An
+  // unqualified name binds by catalog lookup, which generation does not have.
+  let scopeProblem: string | null = null;
+  const scopeCheck = (value: unknown): void => {
+    if (scopeProblem) return;
+    if (Array.isArray(value)) { for (const v of value) scopeCheck(v); return; }
+    const n = node(value);
+    if (!n) return;
+    for (const [k, v] of Object.entries(n)) {
+      if (k === 'ColumnRef') {
+        const cr = node(v);
+        const fields = cr?.['fields'];
+        if (!Array.isArray(fields)) continue;
+        if (fields.some(f => node(f)?.['A_Star'] !== undefined)) {
+          scopeProblem = 'the subquery uses `*`';
+          return;
+        }
+        const parts = fields.map(f => node(node(f)?.['String'])?.['sval']).filter(s => typeof s === 'string') as string[];
+        if (parts.length !== fields.length) continue;
+        if (parts.length < 2) {
+          scopeProblem = `\`${parts[0] ?? '?'}\` is unqualified — which table it belongs to is a catalog ` +
+            'question, so qualify every column inside the subquery';
+          return;
+        }
+        const qual = parts.at(-2)!;
+        if (qual !== innerName && !outerNames.has(qual)) {
+          scopeProblem = `\`${qual}\` names neither the subquery table nor an outer table`;
+          return;
+        }
+      }
+      scopeCheck(v);
+    }
+  };
+  scopeCheck(subTargets);
+  scopeCheck(sub['whereClause']);
+  if (scopeProblem) return { ok: false, blocked: scopeProblem };
+
+  const refsInner = (v: unknown): boolean => referencesQualifier(v, innerName);
+  const refsOuter = (v: unknown): boolean =>
+    contains(v, (type, n) => {
+      if (type !== 'ColumnRef') return false;
+      const fields = n['fields'];
+      if (!Array.isArray(fields) || fields.length < 2) return false;
+      const qual = node(node(fields[fields.length - 2])?.['String'])?.['sval'];
+      return typeof qual === 'string' && outerNames.has(qual);
+    });
+  if (!refsOuter(sub['whereClause'])) {
+    return {
+      ok: false,
+      blocked: 'the subquery is not correlated — Postgres already runs it once, not per row',
+    };
+  }
+
+  // Equality-pinned inner columns: `inner.col = <no inner references>`. These
+  // are what a unique index must cover for the join to be fan-out-free.
+  const whereBool = node(node(sub['whereClause'])?.['BoolExpr']);
+  const conjuncts = whereBool && whereBool['boolop'] === 'AND_EXPR' && Array.isArray(whereBool['args'])
+    ? (whereBool['args'] as unknown[])
+    : [sub['whereClause']];
+  const pinned = new Set<string>();
+  for (const c of conjuncts) {
+    const ex = node(node(c)?.['A_Expr']);
+    if (!ex || ex['kind'] !== 'AEXPR_OP') continue;
+    const op = Array.isArray(ex['name']) && ex['name'].length === 1
+      ? node(node((ex['name'] as unknown[])[0])?.['String'])?.['sval']
+      : null;
+    if (op !== '=') continue;
+    for (const [colSide, otherSide] of [['lexpr', 'rexpr'], ['rexpr', 'lexpr']] as const) {
+      const parts = columnParts(ex[colSide]);
+      if (parts && parts.length >= 2 && parts.at(-2) === innerName && !refsInner(ex[otherSide])) {
+        pinned.add(parts.at(-1)!);
+      }
+    }
+  }
+  if (pinned.size === 0) {
+    return {
+      ok: false,
+      blocked: 'no conjunct pins a subquery column with `=` against the outer row — without one, ' +
+        'no unique index can bound the join to a single match',
+    };
+  }
+
+  const outerFrom = sel['fromClause'];
+  if (!Array.isArray(outerFrom) || outerFrom.length !== 1) {
+    return {
+      ok: false,
+      blocked: 'the outer FROM is a comma-separated list — a LEFT JOIN attaches to the last item ' +
+        'only, which is not where the correlation may point',
+    };
+  }
+
+  // ── text assembly: two edits, both verbatim slices of the original ─────────
+  const buf = Buffer.from(sql, 'utf8');
+  const linkLoc = typeof link['location'] === 'number' ? link['location'] : -1;
+  if (linkLoc < 0) return { ok: false, blocked: 'the parser reported no position for the subquery' };
+  const open = buf[linkLoc] === OPEN ? linkLoc : nextOpenParen(buf, linkLoc);
+  const close = open >= 0 ? matchParen(buf, open) : -1;
+  if (close < 0) return { ok: false, blocked: 'could not find the subquery parentheses' };
+
+  const localToks = wordTokens(buf, open + 1, close, 0);
+  const fromTok = localToks.find(t => t.depth === 0 && t.upper === 'FROM');
+  const whereTok = localToks.find(t => t.depth === 0 && t.upper === 'WHERE');
+  if (!fromTok || !whereTok) return { ok: false, blocked: 'could not locate the subquery FROM/WHERE keywords' };
+
+  const valStart = minLocation(val);
+  const relStart = typeof rv['location'] === 'number' ? rv['location'] : -1;
+  const onStart = minLocation(sub['whereClause']);
+  if (valStart < 0 || relStart < 0 || onStart < 0) {
+    return { ok: false, blocked: 'the parser reported no usable positions inside the subquery' };
+  }
+
+  const exprText = stripUnbalancedTail(buf.subarray(valStart, fromTok.start).toString('utf8'));
+  const relText = buf.subarray(relStart, whereTok.start).toString('utf8').trim();
+  const onText = stripUnbalancedTail(buf.subarray(onStart, close).toString('utf8'));
+  if (!exprText || !relText || !onText) {
+    return { ok: false, blocked: 'the subquery text could not be sliced out cleanly' };
+  }
+
+  const outerFromStart = minLocation(outerFrom);
+  const globalToks = wordTokens(buf);
+  const stmtEnd = statementEnd(buf);
+  const boundary = globalToks.find(
+    t => t.depth === 0 && t.start > outerFromStart && (t.upper === 'WHERE' || CLAUSE_KEYWORDS.has(t.upper)),
+  );
+  const insertAt = boundary ? boundary.start : stmtEnd;
+  if (insertAt <= close) return { ok: false, blocked: 'the outer FROM ends before the subquery — unexpected shape' };
+
+  const joinText = ` LEFT JOIN ${relText} ON ${onText} `;
+  const rewritten = (
+    buf.subarray(0, open).toString('utf8') +
+    exprText +
+    buf.subarray(close + 1, insertAt).toString('utf8') +
+    joinText +
+    buf.subarray(insertAt).toString('utf8')
+  ).trimEnd();
+
+  // Expected tree: same statement with the value expression hoisted into the
+  // select list and the FROM replaced by a left join whose qual is the
+  // subquery's WHERE, all subtrees reused from the original parse.
+  const expected = clone(sel);
+  const expectedTargets = expected['targetList'] as unknown[];
+  (node(node(expectedTargets[targetIndex])?.['ResTarget']) as Node)['val'] = clone(val);
+  expected['fromClause'] = [{
+    JoinExpr: {
+      jointype: 'JOIN_LEFT',
+      larg: clone(outerFrom[0]),
+      rarg: clone(subFrom[0]),
+      quals: clone(sub['whereClause']),
+    },
+  }];
+
+  const problem = validateReconstruction(rewritten, { SelectStmt: expected });
+  if (problem) return { ok: false, blocked: problem };
+
+  const preconditions: PreconditionSpec[] = [{
+    kind: 'unique-key-covers',
+    relation: innerRelParts,
+    columns: [...pinned].sort(),
+    why: 'The scalar subquery raised an error on a second matching row; the join would silently ' +
+         'duplicate the outer row instead. A unique index over the equality columns makes a ' +
+         'second match impossible.',
+  }];
+  if (use.names.length > 0) {
+    preconditions.push({
+      kind: 'function-not-aggregate',
+      functions: use.names,
+      why: 'An aggregate in the subquery returns a value even when no row matches — 0, not NULL — ' +
+           'which a plain join cannot reproduce.',
+    });
+  }
+
+  return {
+    ok: true,
+    candidate: {
+      kind: 'correlated-subquery-in-select',
+      sql: rewritten,
+      byteSpan: { start: open, end: close + 1 },
+      charSpan: { start: byteToCharIndex(sql, open), end: byteToCharIndex(sql, close + 1) },
+      replaced: buf.subarray(open, close + 1).toString('utf8'),
+      replacement: exprText,
+      preconditions,
+      rationale:
+        'A join is evaluated once as a set — the planner can hash or merge it — instead of the ' +
+        'subquery running once per output row. LEFT JOIN keeps the NULL where nothing matches.',
+    },
+  };
+}
+
 // ── pairing candidates with findings ─────────────────────────────────────────
 
 export interface CandidateSite {
@@ -825,6 +1599,12 @@ export function generateCandidates(sql: string, stmtContent: Node): CandidateSit
     for (const [key, v] of Object.entries(n)) {
       const child = node(v);
       if (child) {
+        if (key === 'BoolExpr' && child['boolop'] === 'OR_EXPR') {
+          emit('or-across-columns', loc(child), topScope, () => generateOrSplit(sql, sel!, child));
+        }
+        if (key === 'SubLink' && child['subLinkType'] === 'EXPR_SUBLINK' && child['subselect']) {
+          emit('correlated-subquery-in-select', loc(child), topScope, () => generateCorrelatedSelect(sql, sel!, child));
+        }
         if (key === 'BoolExpr' && child['boolop'] === 'NOT_EXPR' && Array.isArray(child['args'])) {
           // `x NOT IN (SELECT …)` parses as NOT over ANY_SUBLINK.
           for (const arg of child['args'] as unknown[]) {
