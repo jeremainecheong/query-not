@@ -17,8 +17,10 @@ import {
   whatIfIndex,
   whatIfSettings,
 } from './explain.ts';
-import { TUNABLE_GUCS } from './safety.ts';
+import { fingerprint, TUNABLE_GUCS } from './safety.ts';
 import { analyzeRewrites, initParser, SqlParseError } from './rewrite.ts';
+import { Store } from './store.ts';
+import { buildHistory } from './history.ts';
 
 const config = configFromEnv();
 const db = new Database(config);
@@ -28,6 +30,15 @@ const app = express();
 // a capability rather than assumed, so a load failure degrades that one feature
 // instead of taking the agent down.
 let parserReady = false;
+
+/**
+ * Persistence lives with the agent, inside the customer's network.
+ *
+ * Single-tenant by design, so there is no auth layer here: whoever can reach
+ * this process is already authorised by the network. Adding accounts would buy
+ * no access control that does not already exist.
+ */
+const store = new Store(process.env['QUERYNOT_STORE_PATH'] ?? './.querynot/store.db');
 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
@@ -56,6 +67,7 @@ app.get('/api/health', async (_req, res) => {
     agent: 'ok',
     statementTimeoutMs: config.statementTimeoutMs,
     tunableSettings: [...TUNABLE_GUCS],
+    store: store.stats(),
     database: probe,
     // Surfaced so the UI can warn rather than silently offering a broken feature.
     capabilities: {
@@ -63,6 +75,7 @@ app.get('/api/health', async (_req, res) => {
       whatIfSettings: probe.connected,
       measuredAnalysis: probe.connected,
       rewriteAdvisor: parserReady,
+      persistence: true,
     },
   });
 });
@@ -92,15 +105,146 @@ app.post('/api/rewrite', async (req, res) => {
   }
 });
 
-/** Explain and analyse one query. */
+/**
+ * Explain and analyse one query.
+ *
+ * Every run is recorded, not only explicitly saved ones — plan history is only
+ * useful if it accumulates without anyone remembering to press save. The slug
+ * comes back so the result is immediately shareable.
+ */
 app.post('/api/analyze', async (req, res) => {
   try {
     const sql = requireSql(req.body);
     const shouldAnalyze = req.body?.analyze === true;
-    res.json(await analyzeQuery(db, sql, { analyze: shouldAnalyze }));
+    const analysis = await analyzeQuery(db, sql, { analyze: shouldAnalyze });
+
+    let slug: string | null = null;
+    try {
+      slug = store.recordAnalysis({
+        fingerprint: analysis.fingerprint,
+        sql,
+        analyzed: analysis.plan.analyzed,
+        payload: analysis,
+        totalMs: analysis.plan.totalMs,
+        totalWorkMs: analysis.plan.totalWorkMs,
+        totalCost: analysis.plan.totalCost,
+      });
+    } catch (err) {
+      // A storage failure must not cost the user their analysis.
+      console.warn('[agent] could not record analysis:', err instanceof Error ? err.message : err);
+    }
+
+    res.json({ ...analysis, slug });
   } catch (err) {
     fail(res, err);
   }
+});
+
+// ── Persistence ──────────────────────────────────────────────────────────────
+
+/** A previously recorded analysis, by slug — this is what a shared link opens. */
+app.get('/api/analysis/:slug', (req, res) => {
+  const record = store.getAnalysis(req.params.slug);
+  if (!record) {
+    res.status(404).json({
+      error: 'No analysis with that id.',
+      hint: 'Links expire when history is pruned — the 50 most recent runs per query are kept.',
+    });
+    return;
+  }
+  res.json({
+    ...(record.payload as object),
+    slug: record.slug,
+    createdAt: record.createdAt,
+    sql: record.sql,
+  });
+});
+
+app.get('/api/analyses', (req, res) => {
+  res.json({ analyses: store.recentAnalyses(Number(req.query['limit'] ?? 25)) });
+});
+
+/** Plan history for one query, with the points where it changed shape. */
+app.get('/api/history/:fingerprint', (req, res) => {
+  res.json(buildHistory(store, req.params.fingerprint));
+});
+
+app.get('/api/saved', (_req, res) => {
+  res.json({ queries: store.listSavedQueries() });
+});
+
+app.post('/api/saved', (req, res) => {
+  try {
+    const sql = requireSql(req.body);
+    const name = req.body?.name;
+    if (typeof name !== 'string' || name.trim().length === 0) {
+      throw new AgentError('Provide a "name" for the saved query.');
+    }
+    if (name.length > 120) throw new AgentError('Name is too long (max 120 characters).');
+    res.json(store.saveQuery(name.trim(), sql, fingerprint(sql)));
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+app.delete('/api/saved/:name', (req, res) => {
+  const existed = store.deleteSavedQuery(req.params.name);
+  if (!existed) {
+    res.status(404).json({ error: 'No saved query with that name.', hint: null });
+    return;
+  }
+  res.json({ deleted: true });
+});
+
+/**
+ * Record what a what-if concluded.
+ *
+ * The reasoning behind an index is normally lost the moment the person who
+ * tested it moves on. This keeps the DDL, the verdict, the numbers, and whether
+ * it was ever actually shipped.
+ */
+app.post('/api/decisions', (req, res) => {
+  try {
+    const body = req.body ?? {};
+    if (body.kind !== 'index' && body.kind !== 'settings') {
+      throw new AgentError('kind must be "index" or "settings".');
+    }
+    if (typeof body.change !== 'string' || body.change.trim().length === 0) {
+      throw new AgentError('Provide the "change" that was tested.');
+    }
+    if (typeof body.verdict !== 'string' || typeof body.fingerprint !== 'string') {
+      throw new AgentError('Provide "verdict" and "fingerprint".');
+    }
+    res.json(
+      store.recordDecision({
+        analysisSlug: typeof body.analysisSlug === 'string' ? body.analysisSlug : null,
+        fingerprint: body.fingerprint,
+        kind: body.kind,
+        change: body.change,
+        verdict: body.verdict,
+        headline: typeof body.headline === 'string' ? body.headline : '',
+        costBefore: typeof body.costBefore === 'number' ? body.costBefore : null,
+        costAfter: typeof body.costAfter === 'number' ? body.costAfter : null,
+        costOnly: body.costOnly === true,
+      }),
+    );
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+app.get('/api/decisions', (req, res) => {
+  const fp = req.query['fingerprint'];
+  res.json({ decisions: store.listDecisions(typeof fp === 'string' ? fp : undefined) });
+});
+
+app.patch('/api/decisions/:id', (req, res) => {
+  const updated = store.markDecisionApplied(Number(req.params.id), req.body?.applied === true);
+  if (!updated) {
+    res.status(404).json({ error: 'No decision with that id.', hint: null });
+    return;
+  }
+  res.json(updated);
 });
 
 /** Test a hypothetical index. */
@@ -196,6 +340,7 @@ const server = app.listen(port, () => {
 async function shutdown(signal: string): Promise<void> {
   console.log(`[agent] ${signal} — shutting down`);
   server.close();
+  store.close();
   await db.close();
   process.exit(0);
 }

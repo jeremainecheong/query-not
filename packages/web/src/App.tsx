@@ -2,6 +2,9 @@ import { useEffect, useMemo, useState } from 'react';
 import { formatMs, formatPercent, formatRows, type Finding } from '@query-not/core';
 
 import { api, ApiError, type Analysis, type Health } from './api';
+import { Link, useRouter } from './router';
+import { SavedPage } from './pages/SavedPage';
+import { HistoryPage } from './pages/HistoryPage';
 import { FlameGraph } from './components/FlameGraph';
 import { Findings } from './components/Findings';
 import { Hotspots } from './components/Hotspots';
@@ -36,10 +39,37 @@ export function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [theme, setTheme] = useState<Theme>('system');
   const [tab, setTab] = useState<Tab>('graph');
+  const [saveName, setSaveName] = useState('');
+  const [savedNotice, setSavedNotice] = useState<string | null>(null);
+  const { route, navigate } = useRouter();
 
   useEffect(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
   }, []);
+
+  // A shared link resolves to a recorded analysis; load it and show it exactly
+  // as it was, without re-running anything against the database.
+  useEffect(() => {
+    if (route.name !== 'analysis') return;
+    setRunning(true);
+    setError(null);
+    api
+      .getAnalysis(route.slug)
+      .then((result) => {
+        setAnalysis(result);
+        if (result.sql) setSql(result.sql);
+        setSelectedId(null);
+        setTab('graph');
+      })
+      .catch((err) => {
+        setAnalysis(null);
+        setError({
+          message: err instanceof Error ? err.message : String(err),
+          hint: err instanceof ApiError ? err.hint : null,
+        });
+      })
+      .finally(() => setRunning(false));
+  }, [route.name, route.name === 'analysis' ? route.slug : null]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -55,6 +85,10 @@ export function App() {
       setAnalysis(result);
       setSelectedId(null);
       setTab('graph');
+      setSavedNotice(null);
+      // Replace rather than push: re-running a query should not stack history
+      // entries the back button has to walk through.
+      if (result.slug) navigate({ name: 'analysis', slug: result.slug }, { replace: true });
     } catch (err) {
       setAnalysis(null);
       setError({
@@ -63,6 +97,18 @@ export function App() {
       });
     } finally {
       setRunning(false);
+    }
+  }
+
+  async function saveQuery() {
+    const name = saveName.trim();
+    if (!name) return;
+    try {
+      await api.save(name, sql);
+      setSavedNotice(`Saved as “${name}”.`);
+      setSaveName('');
+    } catch (err) {
+      setSavedNotice(err instanceof Error ? err.message : 'Could not save.');
     }
   }
 
@@ -76,9 +122,23 @@ export function App() {
   return (
     <div className="app">
       <header className="header">
-        <div className="header__mark">
+        <Link className="header__mark" to={{ name: 'new' }}>
           query<span>-not</span>
-        </div>
+        </Link>
+        <nav className="header__nav">
+          <Link
+            className={`header__link${route.name === 'new' || route.name === 'analysis' ? ' header__link--active' : ''}`}
+            to={{ name: 'new' }}
+          >
+            Analyse
+          </Link>
+          <Link
+            className={`header__link${route.name === 'saved' ? ' header__link--active' : ''}`}
+            to={{ name: 'saved' }}
+          >
+            Saved
+          </Link>
+        </nav>
         <div className="header__spacer" />
 
         {health && (
@@ -104,6 +164,20 @@ export function App() {
       </header>
 
       <main className="main">
+        {route.name === 'saved' ? (
+          <div className="stack">
+            <section className="verdict">
+              <h2 className="t-title">Saved queries</h2>
+              <p className="t-lead verdict__sub">
+                Every run of a saved query is recorded, so its plan history builds up without
+                anyone having to remember.
+              </p>
+            </section>
+            <SavedPage onOpen={setSql} />
+          </div>
+        ) : route.name === 'history' ? (
+          <HistoryPage fingerprint={route.fingerprint} />
+        ) : (
         <div className="stack">
           <section className="composer">
             <textarea
@@ -143,6 +217,43 @@ export function App() {
               </span>
             </div>
           </section>
+
+          {analysis && (
+            <div className="toolbar">
+              <input
+                className="toolbar__input"
+                placeholder="Name this query to keep its history…"
+                value={saveName}
+                onChange={(e) => setSaveName(e.target.value)}
+                aria-label="Name for the saved query"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') void saveQuery();
+                }}
+              />
+              <button className="btn btn--small" onClick={() => void saveQuery()} disabled={!saveName.trim()}>
+                Save
+              </button>
+
+              {analysis.slug && (
+                <>
+                  <button
+                    className="btn btn--small"
+                    onClick={() => {
+                      void navigator.clipboard?.writeText(window.location.href).catch(() => undefined);
+                      setSavedNotice('Link copied.');
+                    }}
+                  >
+                    Copy link
+                  </button>
+                  <Link className="btn btn--small" to={{ name: 'history', fingerprint: analysis.fingerprint }}>
+                    History
+                  </Link>
+                </>
+              )}
+
+              {savedNotice && <span className="toolbar__notice">{savedNotice}</span>}
+            </div>
+          )}
 
           {error && (
             <div className="alert rise">
@@ -286,6 +397,7 @@ export function App() {
             </>
           )}
         </div>
+        )}
       </main>
     </div>
   );

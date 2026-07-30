@@ -431,6 +431,102 @@ for (const [name, viewport] of [
   await ctx.close();
 }
 
+// ── Routing and persistence ──────────────────────────────────────────────────
+
+section('Routing');
+{
+  const { ctx, page, errors } = await newPage();
+  await page.goto(URL, { waitUntil: 'networkidle' });
+  check('the composer is at the root', new globalThis.URL(page.url()).pathname === '/');
+
+  await analyse(page);
+  const analysisPath = new globalThis.URL(page.url()).pathname;
+  check('a run gets a shareable URL', /^\/a\/[\w-]+$/.test(analysisPath), analysisPath);
+
+  // Deep link: open the same URL cold in a fresh page. Nothing is re-run
+  // against the database — the recorded analysis is served back.
+  const fresh = await ctx.newPage();
+  await fresh.goto(new globalThis.URL(analysisPath, URL).toString(), { waitUntil: 'networkidle' });
+  await fresh.waitForSelector('.verdict', { timeout: 60000 });
+  check('a shared link opens the recorded analysis cold',
+    (await fresh.locator('.verdict__headline').innerText()).length > 10);
+  check('the shared link restores the original SQL',
+    (await fresh.locator('.editor').inputValue()).length > 10);
+  await fresh.close();
+
+  // Nav + back button.
+  await page.click('.header__link:has-text("Saved")');
+  await page.waitForTimeout(250);
+  check('nav reaches the saved page', new globalThis.URL(page.url()).pathname === '/saved');
+  await page.goBack();
+  await page.waitForTimeout(250);
+  check('the back button returns to the analysis',
+    new globalThis.URL(page.url()).pathname === analysisPath, page.url());
+  check('the view follows the back button, not just the URL',
+    (await page.locator('.verdict').count()) > 0);
+
+  // Refresh on a deep link must not 404.
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForSelector('.verdict', { timeout: 60000 });
+  check('refreshing a deep link still works', (await page.locator('.verdict').count()) > 0);
+
+  // Unknown paths fall back to the composer rather than a dead end.
+  await page.goto(new globalThis.URL('/nonsense/path', URL).toString(), { waitUntil: 'networkidle' });
+  check('an unknown path falls back to the composer', (await page.locator('.composer').count()) > 0);
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  await ctx.close();
+}
+
+section('Saving and history');
+{
+  const { ctx, page, errors } = await newPage();
+  await page.goto(URL, { waitUntil: 'networkidle' });
+  await analyse(page);
+
+  check('save and share controls appear once there is a result',
+    (await page.locator('.toolbar__input').count()) > 0);
+
+  const name = `e2e query ${Date.now()}`;
+  await page.fill('.toolbar__input', name);
+  await page.click('.toolbar button:has-text("Save")');
+  await page.waitForSelector('.toolbar__notice', { timeout: 30000 });
+  check('saving confirms', /Saved as/i.test(await page.locator('.toolbar__notice').innerText()));
+
+  await page.click('.header__link:has-text("Saved")');
+  await page.waitForSelector('.saved-row', { timeout: 30000 });
+  check('the saved query is listed', (await page.locator('.saved-row__name').allInnerTexts()).includes(name));
+  check('a saved query shows its run count',
+    /run/.test(await page.locator('.saved-row__meta').first().innerText()));
+
+  // History, from the saved list.
+  await page.locator('.saved-row', { hasText: name }).locator('a:has-text("History")').click();
+  await page.waitForSelector('.verdict', { timeout: 30000 });
+  check('history opens from the saved list', /\/history\//.test(page.url()), page.url());
+  check('history shows a summary', (await page.locator('.verdict__sub').innerText()).length > 20);
+  check('history charts cost over runs', (await page.locator('svg.graph').count()) > 0);
+  check('history lists every run', (await page.locator('.tree__row').count()) > 0);
+  check('the cost chart is described for screen readers',
+    ((await page.locator('svg.graph').getAttribute('aria-label')) ?? '').length > 20);
+
+  // Opening a run from history round-trips back to an analysis.
+  await page.locator('.tree__row').first().click();
+  await page.waitForSelector('.segmented', { timeout: 60000 });
+  check('a run opens from history', /\/a\//.test(page.url()), page.url());
+
+  // Clean up so repeat runs stay deterministic.
+  await page.click('.header__link:has-text("Saved")');
+  await page.waitForSelector('.saved-row', { timeout: 30000 });
+  await page.locator('.saved-row', { hasText: name }).locator('button:has-text("Delete")').click();
+  await page.waitForTimeout(400);
+  check('a saved query can be deleted',
+    !(await page.locator('.saved-row__name').allInnerTexts()).includes(name));
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-saved.png`, fullPage: true });
+  await ctx.close();
+}
+
 // ── Accessibility ────────────────────────────────────────────────────────────
 
 section('Accessibility');
