@@ -31,7 +31,9 @@ export interface Health {
     whatIfSettings: boolean;
     measuredAnalysis: boolean;
     rewriteAdvisor: boolean;
+    persistence: boolean;
   };
+  store?: { analyses: number; savedQueries: number; decisions: number; queries: number };
 }
 
 export type RewriteSeverity = 'critical' | 'warning' | 'info';
@@ -48,6 +50,65 @@ export interface RewriteFinding {
   snippet: string | null;
 }
 
+export interface SavedQuery {
+  id: number;
+  name: string;
+  sql: string;
+  fingerprint: string;
+  createdAt: string;
+  updatedAt: string;
+  latestSlug: string | null;
+  runCount: number;
+}
+
+export interface Decision {
+  id: number;
+  analysisSlug: string | null;
+  fingerprint: string;
+  kind: 'index' | 'settings';
+  change: string;
+  verdict: string;
+  headline: string;
+  costBefore: number | null;
+  costAfter: number | null;
+  costOnly: boolean;
+  applied: boolean;
+  createdAt: string;
+}
+
+export interface HistoryPoint {
+  slug: string;
+  createdAt: string;
+  analyzed: boolean;
+  totalMs: number | null;
+  totalCost: number;
+  rootNode: string;
+  accessMethods: string[];
+}
+
+export interface Regression {
+  fromSlug: string;
+  fromAt: string;
+  toSlug: string;
+  toAt: string;
+  verdict: string;
+  headline: string;
+  costBefore: number;
+  costAfter: number;
+  costChange: number;
+  timeChange: number | null;
+  accessChanges: string[];
+  worse: boolean;
+}
+
+export interface HistoryReport {
+  fingerprint: string;
+  sql: string | null;
+  points: HistoryPoint[];
+  regressions: Regression[];
+  summary: string | null;
+}
+
 export interface Analysis {
   plan: QueryPlan;
   findings: Finding[];
@@ -56,6 +117,10 @@ export interface Analysis {
   narration: string;
   flame: FlameLayout;
   fingerprint: string;
+  /** Set once the run has been recorded; this is the shareable id. */
+  slug?: string | null;
+  createdAt?: string;
+  sql?: string;
 }
 
 export interface VerifiedSuggestion {
@@ -93,11 +158,12 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, body?: unknown): Promise<T> {
+async function request<T>(path: string, body?: unknown, method?: string): Promise<T> {
   let response: Response;
+  const verb = method ?? (body === undefined ? 'GET' : 'POST');
   try {
     response = await fetch(path, {
-      method: body === undefined ? 'GET' : 'POST',
+      method: verb,
       headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
@@ -135,4 +201,39 @@ export const api = {
 
   /** Rewrite advice alone — needs no database connection. */
   rewrite: (sql: string) => request<{ rewrites: RewriteFinding[] }>('/api/rewrite', { sql }),
+
+  // ── Persistence ────────────────────────────────────────────────────────────
+
+  /** Re-open a recorded analysis. This is what a shared link resolves to. */
+  getAnalysis: (slug: string) => request<Analysis>(`/api/analysis/${encodeURIComponent(slug)}`),
+
+  history: (fingerprint: string) =>
+    request<HistoryReport>(`/api/history/${encodeURIComponent(fingerprint)}`),
+
+  listSaved: () => request<{ queries: SavedQuery[] }>('/api/saved'),
+
+  save: (name: string, sql: string) => request<SavedQuery>('/api/saved', { name, sql }),
+
+  deleteSaved: (name: string) =>
+    request<{ deleted: boolean }>(`/api/saved/${encodeURIComponent(name)}`, undefined, 'DELETE'),
+
+  listDecisions: (fingerprint?: string) =>
+    request<{ decisions: Decision[] }>(
+      `/api/decisions${fingerprint ? `?fingerprint=${encodeURIComponent(fingerprint)}` : ''}`,
+    ),
+
+  recordDecision: (input: {
+    analysisSlug: string | null;
+    fingerprint: string;
+    kind: 'index' | 'settings';
+    change: string;
+    verdict: string;
+    headline: string;
+    costBefore: number | null;
+    costAfter: number | null;
+    costOnly: boolean;
+  }) => request<Decision>('/api/decisions', input),
+
+  markApplied: (id: number, applied: boolean) =>
+    request<Decision>(`/api/decisions/${id}`, { applied }, 'PATCH'),
 };

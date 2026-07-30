@@ -225,6 +225,8 @@ button {
   border-bottom: 1px solid var(--hairline);
 }
 .header__mark { font-weight: 600; font-size: 16px; letter-spacing: -0.02em; }
+/* Backstop: nothing in the header may widen the document. */
+.header { overflow: hidden; }
 .header__mark span { color: var(--ink-muted); font-weight: 400; }
 .header__spacer { flex: 1; }
 
@@ -238,6 +240,57 @@ button {
 
 .stack { display: flex; flex-direction: column; gap: var(--sp-7); }
 .stack--tight { gap: var(--sp-5); }
+
+/* ── Header nav ──────────────────────────────────────────────────────────── */
+
+.header__mark { text-decoration: none; color: inherit; }
+.header__nav { display: flex; gap: 2px; margin-left: var(--sp-4); }
+.header__link {
+  padding: 5px var(--sp-3);
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink-secondary);
+  text-decoration: none;
+  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+}
+.header__link:hover { background: var(--hairline); color: var(--ink); }
+.header__link--active { background: var(--hairline); color: var(--ink); }
+
+/* ── Toolbar (save / share) ──────────────────────────────────────────────── */
+
+.toolbar { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.toolbar__input {
+  flex: 1;
+  min-width: 200px;
+  height: 30px;
+  padding: 0 var(--sp-3);
+  border: none;
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+  box-shadow: var(--shadow-sm);
+}
+.toolbar__input::placeholder { color: var(--ink-muted); }
+.toolbar__input:focus { box-shadow: 0 0 0 2px var(--accent); }
+.toolbar__notice { font-size: 12.5px; color: var(--ink-muted); }
+
+/* ── Saved queries ───────────────────────────────────────────────────────── */
+
+.saved-row { display: flex; align-items: flex-start; gap: var(--sp-4); }
+.saved-row__main { flex: 1; min-width: 0; }
+.saved-row__name { font-size: 15px; font-weight: 600; letter-spacing: -0.012em; }
+.saved-row__sql { margin-top: var(--sp-2); max-height: 64px; overflow: hidden; }
+.saved-row__meta { margin-top: var(--sp-2); display: flex; gap: var(--sp-2); font-size: 12.5px; color: var(--ink-muted); }
+.saved-row__actions { display: flex; gap: var(--sp-2); flex: none; align-items: center; }
+.saved-row__actions a { text-decoration: none; }
+
+a.tree__row { text-decoration: none; color: inherit; }
+a.chip { text-decoration: none; }
+a.chip:hover { background: var(--accent-wash); color: var(--accent); }
 
 /* ── Editor ──────────────────────────────────────────────────────────────── */
 
@@ -723,8 +776,19 @@ button {
   }
 }
 
+@media (max-width: 640px) {
+  /*
+   * Status pills are informational and the first thing to go when the header
+   * runs out of room — the mark, the nav and the theme control all do work the
+   * user initiates. Without this the header pushed the whole document 100px
+   * wide once the nav was added.
+   */
+  .header .pill { display: none; }
+}
+
 @media (max-width: 720px) {
   .header { padding: 0 var(--sp-4); }
+  .header__nav { margin-left: var(--sp-2); }
   .main { padding: var(--sp-5) var(--sp-4) var(--sp-8); }
   .stack { gap: var(--sp-6); }
   .group__row, .tree__row { padding-left: var(--sp-4); padding-right: var(--sp-4); }

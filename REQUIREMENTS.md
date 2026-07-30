@@ -370,10 +370,13 @@ over an IR we already have.
 | What-if engine (HypoPG + GUCs) | `packages/agent/src/explain.ts` |
 | Rewrite advisor (AST) | `packages/agent/src/rewrite.ts` |
 | Plan graph + ranked hotspots | `packages/web/src/components/{PlanGraph,Hotspots}.tsx` |
+| Agent-side store (node:sqlite) | `packages/agent/src/store.ts` |
+| Plan history + regression detection | `packages/agent/src/history.ts` |
+| Routing, saved queries, history pages | `packages/web/src/{router.tsx,pages/}` |
 | Web UI | `packages/web/` |
 | End-to-end suites | `e2e/` |
 
-**326 checks** — 161 unit, 78 API end-to-end, 87 browser end-to-end. Core's fixtures are
+**405 checks** — 189 unit, 107 API end-to-end, 109 browser end-to-end. Core's fixtures are
 real `EXPLAIN` output from a seeded Postgres, including a before/after pair captured
 either side of a live HypoPG hypothetical index.
 
@@ -397,15 +400,23 @@ logic — the class of error that is hardest to notice and most damaging to trus
    function-wrapped column — so an index that cannot work would have shipped as
    high-confidence advice. Type names and non-function keywords are now separate lists.
 
-3. **Flame-graph labels rendered at 2.1:1 against a palette validated at 9.3:1.** The
+3. **Plan history reported a regression on every re-run.** Three identical runs of the
+   same query produced two "the plan got worse" entries. `diffPlans` leads with measured
+   wall-clock time — correct for a what-if, where both plans run back to back under the
+   same conditions — but across history, timing varies with cache state and load. History
+   now keys off plan *structure* and planner *cost*, both deterministic given the data.
+   A history that cries wolf is worse than no history: the one entry that matters gets
+   buried.
+
+4. **Flame-graph labels rendered at 2.1:1 against a palette validated at 9.3:1.** The
    colours were correct; the wiring was not. An SVG `fill` *attribute* cannot resolve
    `var()`, and a blanket `fill: #fff` in the stylesheet was overriding it regardless.
    Only a contrast measurement taken in a real browser could catch this — static palette
    validation had already passed. It is why `e2e/ui.e2e.mjs` computes contrast from
    rendered pixels rather than trusting the tokens.
 
-A pattern worth naming: all three were in *presentation*, not logic, and all three would
-have read as authoritative. For a tool whose entire proposition is "trust this because
+A pattern worth naming: all of them were in *presentation or judgement*, not in the
+core computation, and all would have read as authoritative. For a tool whose entire proposition is "trust this because
 it was verified", that class of bug is the expensive one.
 
 ---

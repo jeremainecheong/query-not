@@ -45,6 +45,12 @@ That second sentence is the point. The tool says what it proved and what it didn
   surfaced node by node in the UI.
 - **Collector agent** — holds the database connection, runs the what-if loop, and
   normalises query text before anything leaves the network.
+- **Plan history** — every run is recorded and keyed by fingerprint, so the diff engine
+  can answer *"when did this get slower, and what changed?"* Regression detection keys
+  off plan structure and planner cost, never wall-clock, because timing varies run to
+  run and a history that cries wolf is worse than none.
+- **Saved queries and shareable links** — name a query to keep its history; every
+  analysis gets a URL you can paste to a colleague.
 - **Web UI** — a plan graph that makes hotspots obvious, ranked slowest operations,
   findings, rewrite advice, a settings what-if panel, and the proof loop.
 
@@ -117,7 +123,7 @@ operation, done once, at the boundary.
 
 ```
 packages/core     pure analysis engine — no I/O, no database, fully testable
-packages/agent    holds the connection, runs plan(sql, world), serves the IR
+packages/agent    holds the connection, runs plan(sql, world), serves the IR, owns the store
 packages/web      React UI — never talks to Postgres, only to the agent
 ```
 
@@ -125,15 +131,36 @@ The agent isn't a metrics shipper. The re-plan loop needs a live connection and 
 the agent has one, so `plan(sql, world)` executes there and the service orchestrates.
 That's what keeps credentials and raw query text inside your network.
 
+### No accounts, on purpose
+
+query-not is single-tenant: one team, one agent, inside one network. Whoever can reach
+the agent is already authorised by the network, so a login screen would add a user
+table, sessions and password reset while providing no access control that does not
+already exist.
+
+That placement is also what keeps the privacy story intact. History lives in a SQLite
+file beside the agent (`node:sqlite`, no dependency), so raw SQL never crosses a network
+and never needs redacting before storage. The fingerprint is still computed — but as an
+*identity* key, the thing that says "this is the same query as last Tuesday", rather
+than as redaction.
+
+The store is **never the customer's database**. The agent connects to that read-only,
+and writing its own tables there would break the guarantee the whole safety design
+rests on.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `QUERYNOT_STORE_PATH` | `./.querynot/store.db` | Where history lives |
+
 ## Development
 
 ```bash
-npm test          # 161 unit tests across core and agent
+npm test          # 189 unit tests across core and agent
 npm run typecheck
-npm run test:e2e  # full stack: builds, starts both servers, 165 checks, tears down
+npm run test:e2e  # full stack: builds, starts both servers, 216 checks, tears down
 ```
 
-**326 checks in total** — 161 unit, 78 API end-to-end, 87 browser end-to-end.
+**405 checks in total** — 189 unit, 107 API end-to-end, 109 browser end-to-end.
 
 Core's test fixtures are **real `EXPLAIN` output** captured from a seeded Postgres
 (`packages/core/test/fixtures/seed.sql`), not hand-written JSON — including a

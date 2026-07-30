@@ -6,6 +6,7 @@ import { createRoot } from 'react-dom/client';
 // them is narrower than it looks, and the compliant fallback stack is a
 // two-line change documented there.
 import { App } from './App';
+import { RouterProvider } from './router';
 import './styles.css';
 
 const root = document.getElementById('root');
@@ -13,6 +14,8 @@ if (!root) throw new Error('#root not found');
 
 createRoot(root).render(
   <StrictMode>
-    <App />
+    <RouterProvider>
+      <App />
+    </RouterProvider>
   </StrictMode>,
 );

@@ -263,6 +263,105 @@ check('missing sql is rejected', noSql.status >= 400);
 const syntaxErr = await call('/api/rewrite', { sql: 'SELECT FROM WHERE' });
 check('malformed SQL returns a parse error', syntaxErr.status >= 400 && typeof syntaxErr.body.error === 'string');
 
+// ── Persistence ──────────────────────────────────────────────────────────────
+
+section('Persistence: recording and sharing');
+const recorded = await call('/api/analyze', { sql: QUERIES.join, analyze: true });
+check('an analysis returns a shareable slug', typeof recorded.body.slug === 'string' && recorded.body.slug.length > 5,
+  String(recorded.body.slug));
+
+const reopened = await call(`/api/analysis/${recorded.body.slug}`);
+check('the slug reopens the same analysis', reopened.status === 200 &&
+  reopened.body.fingerprint === recorded.body.fingerprint);
+check('a reopened analysis carries its plan', Array.isArray(reopened.body.plan?.nodes) &&
+  reopened.body.plan.nodes.length > 0);
+check('a reopened analysis carries its findings', Array.isArray(reopened.body.findings));
+check('a reopened analysis carries the original SQL', typeof reopened.body.sql === 'string');
+check('an unknown slug 404s with a hint', (await call('/api/analysis/does-not-exist')).status === 404);
+
+section('Persistence: plan history');
+// Three identical runs. The plan cannot have changed, so history must be quiet
+// — wall-clock varies run to run and a time-led verdict would cry wolf here.
+await call('/api/analyze', { sql: QUERIES.join, analyze: true });
+await call('/api/analyze', { sql: QUERIES.join, analyze: true });
+const fp = encodeURIComponent(recorded.body.fingerprint);
+const history = await call(`/api/history/${fp}`);
+check('history accumulates every run', (history.body.points ?? []).length >= 3,
+  `${(history.body.points ?? []).length} points`);
+check('identical re-runs report no regression', (history.body.regressions ?? []).length === 0,
+  (history.body.regressions ?? []).map((r) => r.headline).join('; '));
+check('history summarises in plain English', typeof history.body.summary === 'string' &&
+  history.body.summary.length > 20);
+check('history points expose the access methods used',
+  (history.body.points ?? []).some((p) => Array.isArray(p.accessMethods)));
+const emptyHistory = await call('/api/history/never-seen-fingerprint');
+check('an unseen query returns an empty report', emptyHistory.status === 200 &&
+  (emptyHistory.body.points ?? []).length === 0);
+
+// Now force a genuinely different plan for the same query text.
+const forced = await call('/api/whatif/settings', {
+  sql: QUERIES.join, settings: { enable_hashjoin: 'off' }, analyze: true,
+});
+check('a forced plan change is a real structural difference',
+  forced.body.diff?.summary?.accessChanges?.length > 0 ||
+  forced.body.diff?.summary?.nodesAdded > 0,
+  'the settings what-if should change the plan shape');
+
+section('Persistence: saved queries');
+const saved = await call('/api/saved', { name: 'country totals', sql: QUERIES.join });
+check('saves a named query', saved.status === 200 && saved.body.name === 'country totals');
+check('a saved query links to its runs', saved.body.runCount >= 3 && typeof saved.body.latestSlug === 'string',
+  `runCount=${saved.body.runCount}`);
+
+const savedList = await call('/api/saved');
+check('saved queries are listed', (savedList.body.queries ?? []).some((q) => q.name === 'country totals'));
+
+const resaved = await call('/api/saved', { name: 'country totals', sql: 'SELECT 1' });
+check('re-saving the same name updates rather than duplicating', resaved.body.sql === 'SELECT 1');
+check('no duplicate entry was created',
+  (await call('/api/saved')).body.queries.filter((q) => q.name === 'country totals').length === 1);
+
+check('a nameless save is rejected', (await call('/api/saved', { sql: 'SELECT 1' })).status >= 400);
+check('a sql-less save is rejected', (await call('/api/saved', { name: 'x' })).status >= 400);
+
+const del = await fetch(`${BASE}/api/saved/${encodeURIComponent('country totals')}`, { method: 'DELETE' });
+check('a saved query can be deleted', del.status === 200);
+check('deleting it twice 404s', (await fetch(`${BASE}/api/saved/${encodeURIComponent('country totals')}`,
+  { method: 'DELETE' })).status === 404);
+
+section('Persistence: proven decisions');
+const decision = await call('/api/decisions', {
+  analysisSlug: recorded.body.slug,
+  fingerprint: recorded.body.fingerprint,
+  kind: 'index',
+  change: 'CREATE INDEX ON orders (status)',
+  verdict: 'improved',
+  headline: 'Estimated cost fell by 84%',
+  costBefore: 10559, costAfter: 1638, costOnly: true,
+});
+check('records what was tested and concluded', decision.status === 200 && decision.body.verdict === 'improved');
+check('a decision starts un-applied', decision.body.applied === false);
+check('decisions are listed per query',
+  (await call(`/api/decisions?fingerprint=${fp}`)).body.decisions.length >= 1);
+
+const applied = await fetch(`${BASE}/api/decisions/${decision.body.id}`, {
+  method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ applied: true }),
+});
+check('a decision can be marked as shipped', applied.status === 200 && (await applied.json()).applied === true);
+check('an unknown decision 404s', (await fetch(`${BASE}/api/decisions/999999`, {
+  method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ applied: true }),
+})).status === 404);
+
+check('an invalid decision kind is rejected',
+  (await call('/api/decisions', { kind: 'nonsense', change: 'x', verdict: 'y', fingerprint: 'z' })).status >= 400);
+
+section('Persistence: health reporting');
+const health2 = await call('/api/health');
+check('store stats are reported', typeof health2.body.store?.analyses === 'number' && health2.body.store.analyses > 0);
+check('persistence is advertised as a capability', health2.body.capabilities?.persistence === true);
+
 // ── Verify the database was never mutated ────────────────────────────────────
 
 section('Nothing was written');
