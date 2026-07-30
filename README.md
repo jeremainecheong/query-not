@@ -51,8 +51,12 @@ That second sentence is the point. The tool says what it proved and what it didn
   run and a history that cries wolf is worse than none.
 - **Saved queries and shareable links** — name a query to keep its history; every
   analysis gets a URL you can paste to a colleague.
-- **Web UI** — a plan graph that makes hotspots obvious, ranked slowest operations,
-  findings, rewrite advice, a settings what-if panel, and the proof loop.
+- **Operation reference** — every plan operation Postgres can emit, illustrated: what it
+  does, why the planner picks it, and how it goes wrong. Rendered from the same glossary
+  the narrator reads, so the reference and the explanation beside a real plan cannot
+  drift apart.
+- **Web UI** — a landing page, a query index, per-query history, saved queries, the
+  reference, and the analysis view with its plan graph and proof loop.
 
 Not yet built: workload ingestion (`pg_stat_statements` / `auto_explain`) and the CI
 gate. See [REQUIREMENTS.md](REQUIREMENTS.md).
@@ -157,10 +161,10 @@ rests on.
 ```bash
 npm test          # 189 unit tests across core and agent
 npm run typecheck
-npm run test:e2e  # full stack: builds, starts both servers, 216 checks, tears down
+npm run test:e2e  # full stack: builds, starts both servers, 237 checks, tears down
 ```
 
-**405 checks in total** — 189 unit, 107 API end-to-end, 109 browser end-to-end.
+**426 checks in total** — 189 unit, 107 API end-to-end, 130 browser end-to-end.
 
 Core's test fixtures are **real `EXPLAIN` output** captured from a seeded Postgres
 (`packages/core/test/fixtures/seed.sql`), not hand-written JSON — including a
@@ -177,6 +181,22 @@ colour contrast on the flame graph in both themes.
 That last check earned its place: it caught the flame labels rendering at 2.1:1 despite
 a palette validated at 9.3:1. The colours were right; an SVG `fill` attribute cannot
 resolve `var()`, and a CSS rule was overriding it anyway.
+
+## Pages
+
+| Path | What it is |
+|---|---|
+| `/` | Landing — what the tool does, where to go, recent runs |
+| `/analyse` | The composer. Paste a query, get the analysis |
+| `/a/:slug` | A recorded analysis. This is the shareable link |
+| `/queries` | Every query seen, grouped by fingerprint, plan changes first |
+| `/history/:fingerprint` | One query's plan history, with the points where it changed |
+| `/saved` | Named queries |
+| `/reference` | Every plan operation, illustrated |
+
+Routing is a ~120-line History-API router with no dependency. The three things a
+hand-rolled router usually gets wrong — back button, deep links, refresh — each have a
+browser test.
 
 ## Visualising a plan
 

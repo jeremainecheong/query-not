@@ -5,6 +5,9 @@ import { api, ApiError, type Analysis, type Health } from './api';
 import { Link, useRouter } from './router';
 import { SavedPage } from './pages/SavedPage';
 import { HistoryPage } from './pages/HistoryPage';
+import { LandingPage } from './pages/LandingPage';
+import { QueriesPage } from './pages/QueriesPage';
+import { ReferencePage } from './pages/ReferencePage';
 import { FlameGraph } from './components/FlameGraph';
 import { Findings } from './components/Findings';
 import { Hotspots } from './components/Hotspots';
@@ -122,21 +125,33 @@ export function App() {
   return (
     <div className="app">
       <header className="header">
-        <Link className="header__mark" to={{ name: 'new' }}>
+        <Link className="header__mark" to={{ name: 'home' }}>
           query<span>-not</span>
         </Link>
         <nav className="header__nav">
           <Link
-            className={`header__link${route.name === 'new' || route.name === 'analysis' ? ' header__link--active' : ''}`}
-            to={{ name: 'new' }}
+            className={`header__link${route.name === 'analyse' || route.name === 'analysis' ? ' header__link--active' : ''}`}
+            to={{ name: 'analyse' }}
           >
             Analyse
+          </Link>
+          <Link
+            className={`header__link${route.name === 'queries' || route.name === 'history' ? ' header__link--active' : ''}`}
+            to={{ name: 'queries' }}
+          >
+            History
           </Link>
           <Link
             className={`header__link${route.name === 'saved' ? ' header__link--active' : ''}`}
             to={{ name: 'saved' }}
           >
             Saved
+          </Link>
+          <Link
+            className={`header__link${route.name === 'reference' ? ' header__link--active' : ''}`}
+            to={{ name: 'reference' }}
+          >
+            Reference
           </Link>
         </nav>
         <div className="header__spacer" />
@@ -164,7 +179,13 @@ export function App() {
       </header>
 
       <main className="main">
-        {route.name === 'saved' ? (
+        {route.name === 'home' ? (
+          <LandingPage health={health} />
+        ) : route.name === 'queries' ? (
+          <QueriesPage />
+        ) : route.name === 'reference' ? (
+          <ReferencePage />
+        ) : route.name === 'saved' ? (
           <div className="stack">
             <section className="verdict">
               <h2 className="t-title">Saved queries</h2>

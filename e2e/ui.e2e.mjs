@@ -16,6 +16,7 @@
 import { chromium } from 'playwright';
 
 const URL = process.env.QUERYNOT_WEB_URL ?? 'http://127.0.0.1:5173/';
+const ANALYSE = '/analyse';
 const OUT = process.env.QUERYNOT_SHOT_DIR ?? null;
 
 let passed = 0;
@@ -84,8 +85,16 @@ section('Initial load');
   check('read-only role badge shown', (await page.locator('.pill', { hasText: 'read-only' }).count()) > 0);
   check('no "no hypopg" warning, since it is installed',
     (await page.locator('.pill', { hasText: 'no hypopg' }).count()) === 0);
-  check('empty state explains the product before any query is run',
-    /prove|test|hypothetical/i.test(await page.locator('.empty').first().innerText()));
+  check('the root is a landing page, not a bare composer',
+    (await page.locator('.hero__title').count()) > 0 && (await page.locator('.composer').count()) === 0);
+  check('the landing page states what the tool does',
+    /prove|hypothetical|re-plan/i.test(await page.locator('.hero__sub').innerText()));
+  check('the landing page offers the primary action',
+    (await page.locator('.hero__actions a:has-text("Analyse a query")').count()) > 0);
+  check('the landing page links every section',
+    (await page.locator('.card-tile').count()) >= 4);
+  check('the landing page reports connection state',
+    (await page.locator('.hero__status').count()) > 0);
 
   const fonts = await page.evaluate(async () => {
     await document.fonts.ready;
@@ -93,17 +102,27 @@ section('Initial load');
   });
   check('SF Pro loaded', fonts.some((f) => /SF Pro/i.test(f.family) && f.status === 'loaded'),
     JSON.stringify(fonts));
-  check('SF Mono loaded', fonts.some((f) => /SF Mono/i.test(f.family) && f.status === 'loaded'));
   check('body renders in SF Pro',
     await page.evaluate(() => getComputedStyle(document.body).fontFamily.startsWith('"SF Pro"')),
     await page.evaluate(() => getComputedStyle(document.body).fontFamily));
-  check('editor renders in SF Mono', await page.evaluate(() => {
-    const el = document.querySelector('.editor');
-    return el ? getComputedStyle(el).fontFamily.startsWith('"SF Mono"') : false;
-  }));
   check('vendored subset covers the UI glyph set', await page.evaluate(async () => {
     await document.fonts.ready;
     return ['→', '—', '…', '×', '·', '▸', '▾'].every((g) => document.fonts.check('15px "SF Pro"', g));
+  }));
+
+  // SF Mono has to be checked where mono text actually renders — webfonts load
+  // lazily on first use, so it is legitimately absent on a page with no code.
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
+  const monoFonts = await page.evaluate(async () => {
+    await document.fonts.ready;
+    return [...document.fonts].map((f) => ({ family: f.family, status: f.status }));
+  });
+  check('SF Mono loaded where code renders',
+    monoFonts.some((f) => /SF Mono/i.test(f.family) && f.status === 'loaded'),
+    JSON.stringify(monoFonts));
+  check('editor renders in SF Mono', await page.evaluate(() => {
+    const el = document.querySelector('.editor');
+    return el ? getComputedStyle(el).fontFamily.startsWith('"SF Mono"') : false;
   }));
 
   check('no console errors', errors.length === 0, errors.join('; '));
@@ -115,7 +134,7 @@ section('Initial load');
 section('Verdict hero');
 {
   const { ctx, page, errors } = await newPage();
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await analyse(page);
 
   const headline = await page.locator('.verdict__headline').innerText();
@@ -146,7 +165,7 @@ section('Verdict hero');
 section('Progressive disclosure');
 {
   const { ctx, page } = await newPage();
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await analyse(page);
 
   check('segmented control rendered', (await page.locator('.segmented__item').count()) === 6);
@@ -174,7 +193,7 @@ section('Progressive disclosure');
 section('Plan graph');
 {
   const { ctx, page, errors } = await newPage();
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await analyse(page);
   await tab(page, 'Hotspots');
 
@@ -234,7 +253,7 @@ section('Plan graph');
 section('Node selection');
 {
   const { ctx, page } = await newPage();
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await analyse(page);
   await tab(page, 'Plan');
 
@@ -258,7 +277,7 @@ section('Node selection');
 section('Proof loop (hypothetical index)');
 {
   const { ctx, page, errors } = await newPage();
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await setSql(page, SEQ_QUERY);
   await analyse(page);
   await tab(page, 'Indexes');
@@ -295,7 +314,7 @@ section('Proof loop (hypothetical index)');
 section('Settings what-if');
 {
   const { ctx, page, errors } = await newPage();
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await setSql(page, SORT_QUERY);
   await analyse(page);
   await tab(page, 'What-if');
@@ -317,7 +336,7 @@ section('Settings what-if');
 section('Rewrite advisor');
 {
   const { ctx, page, errors } = await newPage();
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await setSql(page, SMELLY);
   await analyse(page);
   await tab(page, 'Rewrites');
@@ -342,7 +361,7 @@ section('Rewrite advisor');
 section('Estimate-only mode');
 {
   const { ctx, page } = await newPage();
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await page.uncheck('.toggle input');
   await analyse(page);
 
@@ -359,7 +378,7 @@ section('Estimate-only mode');
 section('Failure paths');
 {
   const { ctx, page } = await newPage();
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
 
   await setSql(page, 'DELETE FROM orders');
   await page.click('button:has-text("Analyse")');
@@ -384,7 +403,7 @@ section('Failure paths');
 section('Keyboard');
 {
   const { ctx, page } = await newPage();
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await page.click('.editor');
   await page.keyboard.press('Control+Enter');
   await page.waitForSelector('.verdict', { timeout: 90000 });
@@ -397,7 +416,7 @@ section('Keyboard');
 section('Theme and layout');
 {
   const { ctx, page, errors } = await newPage('dark');
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await analyse(page);
 
   const darkBg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
@@ -421,7 +440,7 @@ for (const [name, viewport] of [
   ['mobile 390', { width: 390, height: 850 }],
 ]) {
   const { ctx, page } = await newPage('light', viewport);
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await analyse(page);
   const overflow = await page.evaluate(
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
@@ -437,8 +456,9 @@ section('Routing');
 {
   const { ctx, page, errors } = await newPage();
   await page.goto(URL, { waitUntil: 'networkidle' });
-  check('the composer is at the root', new globalThis.URL(page.url()).pathname === '/');
+  check('the landing page is at the root', new globalThis.URL(page.url()).pathname === '/');
 
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await analyse(page);
   const analysisPath = new globalThis.URL(page.url()).pathname;
   check('a run gets a shareable URL', /^\/a\/[\w-]+$/.test(analysisPath), analysisPath);
@@ -470,9 +490,9 @@ section('Routing');
   await page.waitForSelector('.verdict', { timeout: 60000 });
   check('refreshing a deep link still works', (await page.locator('.verdict').count()) > 0);
 
-  // Unknown paths fall back to the composer rather than a dead end.
+  // Unknown paths fall back to the front door rather than a dead end.
   await page.goto(new globalThis.URL('/nonsense/path', URL).toString(), { waitUntil: 'networkidle' });
-  check('an unknown path falls back to the composer', (await page.locator('.composer').count()) > 0);
+  check('an unknown path falls back to the landing page', (await page.locator('.hero__title').count()) > 0);
 
   check('no console errors', errors.length === 0, errors.join('; '));
   await ctx.close();
@@ -481,7 +501,7 @@ section('Routing');
 section('Saving and history');
 {
   const { ctx, page, errors } = await newPage();
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await analyse(page);
 
   check('save and share controls appear once there is a result',
@@ -527,12 +547,89 @@ section('Saving and history');
   await ctx.close();
 }
 
+// ── The operation reference ──────────────────────────────────────────────────
+
+section('Operation reference');
+{
+  const { ctx, page, errors } = await newPage();
+  await page.goto(new globalThis.URL('/reference', URL).toString(), { waitUntil: 'networkidle' });
+
+  const cards = await page.locator('.ref-card').count();
+  check('every operation in the glossary is documented', cards >= 20, `${cards} cards`);
+  check('every card carries a diagram', (await page.locator('.ref-card .diag').count()) === cards);
+  check('operations are grouped into families', (await page.locator('.section-label').count()) >= 5);
+
+  // The diagrams are a set, so they must render at one consistent size —
+  // scaling with the card made the same caption tiny in one row and oversized
+  // in another.
+  const widths = await page.evaluate(() =>
+    [...document.querySelectorAll('.diag')].map((d) => Math.round(d.getBoundingClientRect().width)));
+  check('diagrams render at a consistent size',
+    new Set(widths).size === 1, `widths: ${[...new Set(widths)].join(', ')}`);
+
+  check('every diagram is described for screen readers', await page.evaluate(() =>
+    [...document.querySelectorAll('.diag')].every((d) => (d.getAttribute('aria-label') ?? '').length > 20)));
+
+  // Search and filter.
+  await page.fill('.ref-controls .toolbar__input', 'hash');
+  await page.waitForTimeout(200);
+  const hits = await page.locator('.ref-card__name').allInnerTexts();
+  check('search narrows the list', hits.length > 0 && hits.length < cards, `${hits.length} of ${cards}`);
+  check('search matches operation names', hits.some((h) => /hash/i.test(h)), hits.join(', '));
+
+  await page.fill('.ref-controls .toolbar__input', 'zzzznope');
+  await page.waitForTimeout(200);
+  check('a search with no matches says so', (await page.locator('.empty').count()) > 0);
+
+  await page.fill('.ref-controls .toolbar__input', '');
+  await page.locator('.ref-controls .segmented__item:has-text("Combining tables")').click();
+  await page.waitForTimeout(200);
+  const joins = await page.locator('.ref-card__name').allInnerTexts();
+  check('family filter narrows to that family', joins.length > 0 && joins.length < cards,
+    joins.join(', '));
+  check('the join family contains the joins', joins.includes('Hash Join') && joins.includes('Nested Loop'));
+
+  // The reference must agree with the narrator, since both read one source.
+  check('reference text matches the narrator glossary', await page.evaluate(() => {
+    const seq = [...document.querySelectorAll('.ref-card')]
+      .find((c) => c.querySelector('.ref-card__name')?.textContent === 'Hash Join');
+    return /hash table/i.test(seq?.querySelector('.ref-card__what')?.textContent ?? '');
+  }));
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-reference.png`, fullPage: true });
+  await ctx.close();
+}
+
+section('Query index');
+{
+  const { ctx, page, errors } = await newPage();
+  // Make sure at least one query exists.
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
+  await analyse(page);
+
+  await page.click('.header__link:has-text("History")');
+  await page.waitForTimeout(400);
+  check('history nav reaches the query index', new globalThis.URL(page.url()).pathname === '/queries');
+  check('queries are listed', (await page.locator('.query-row').count()) > 0);
+  check('each query shows its run count',
+    /run/.test(await page.locator('.query-row__meta').first().innerText()));
+
+  await page.locator('.query-row').first().click();
+  await page.waitForTimeout(600);
+  check('a query opens its plan history', /\/history\//.test(page.url()), page.url());
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-queries.png`, fullPage: true });
+  await ctx.close();
+}
+
 // ── Accessibility ────────────────────────────────────────────────────────────
 
 section('Accessibility');
 {
   const { ctx, page } = await newPage();
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await analyse(page);
 
   check('tabs use the tablist role', (await page.locator('[role="tablist"]').count()) > 0);

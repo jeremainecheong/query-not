@@ -256,6 +256,60 @@ export class Store {
     }));
   }
 
+  /**
+   * One row per distinct query rather than per run.
+   *
+   * "The same query with different literals" is one thing to a person and a
+   * thousand rows to a database; the fingerprint is what collapses them.
+   */
+  queryGroups(limit = 200): Array<{
+    fingerprint: string;
+    sql: string;
+    runs: number;
+    firstSeen: string;
+    lastSeen: string;
+    lastMs: number | null;
+    lastCost: number;
+    savedAs: string | null;
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT a.fingerprint,
+                count(*)          AS runs,
+                min(a.created_at) AS first_seen,
+                max(a.created_at) AS last_seen
+         FROM analyses a
+         GROUP BY a.fingerprint
+         ORDER BY last_seen DESC
+         LIMIT ?`,
+      )
+      .all(limit) as Array<Record<string, unknown>>;
+
+    return rows.map((row) => {
+      const fingerprint = row['fingerprint'] as string;
+      const latest = this.db
+        .prepare(
+          `SELECT sql, total_ms, total_cost FROM analyses
+           WHERE fingerprint = ? ORDER BY created_at DESC, seq DESC LIMIT 1`,
+        )
+        .get(fingerprint) as Record<string, unknown> | undefined;
+      const saved = this.db
+        .prepare('SELECT name FROM saved_queries WHERE fingerprint = ? LIMIT 1')
+        .get(fingerprint) as { name: string } | undefined;
+
+      return {
+        fingerprint,
+        sql: (latest?.['sql'] as string) ?? '',
+        runs: row['runs'] as number,
+        firstSeen: row['first_seen'] as string,
+        lastSeen: row['last_seen'] as string,
+        lastMs: (latest?.['total_ms'] as number | null) ?? null,
+        lastCost: (latest?.['total_cost'] as number) ?? 0,
+        savedAs: saved?.name ?? null,
+      };
+    });
+  }
+
   recentAnalyses(limit = 25): AnalysisSummary[] {
     const rows = this.db
       .prepare(

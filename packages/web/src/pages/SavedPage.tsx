@@ -72,7 +72,7 @@ export function SavedPage({ onOpen }: { onOpen: (sql: string) => void }) {
               className="btn btn--small"
               onClick={() => {
                 onOpen(q.sql);
-                navigate({ name: 'new' });
+                navigate({ name: 'analyse' });
               }}
             >
               Open

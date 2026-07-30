@@ -12,7 +12,14 @@ export * from './types.ts';
 export { parseExplainJson, findNode, describeNode, PlanParseError } from './parse.ts';
 export { analyze, suggestIndexes } from './analyze.ts';
 export type { AnalyzeOptions } from './analyze.ts';
-export { narratePlan, narrateNode, explainNodeType } from './narrate.ts';
+export {
+  narratePlan,
+  narrateNode,
+  explainNodeType,
+  NODE_TYPES,
+  NODE_FAMILIES,
+} from './narrate.ts';
+export type { NodeExplanation, NodeTypeEntry, NodeFamily } from './narrate.ts';
 export { diffPlans } from './diff.ts';
 export type { PlanDiff, NodeDiff, DiffSummary, DiffStatus, Verdict } from './diff.ts';
 export { layoutFlame, hotspots } from './flame.ts';
