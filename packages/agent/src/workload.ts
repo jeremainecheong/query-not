@@ -147,19 +147,26 @@ export async function collectWorkloadOn(client: PoolClient, limit = 200): Promis
   const cols = await timeColumns(client);
   const stddev = cols.stddev ? `${cols.stddev}` : 'NULL';
 
+  // pg_stat_statements keeps one row per (userid, dbid, queryid) — the same
+  // statement run by two roles is two rows with one queryid. This view is
+  // "the workload against this database", so: scope to the current database
+  // and sum across roles. The mean re-derives from the sums; a stddev cannot
+  // be combined across rows, so it survives only when one role ran the query.
   const result = await client.query<Record<string, string | number | null>>(
-    `SELECT queryid::text          AS query_id,
-            query,
-            calls,
-            ${cols.total}          AS total_ms,
-            ${cols.mean}           AS mean_ms,
-            ${stddev}              AS stddev_ms,
-            rows,
-            shared_blks_hit,
-            shared_blks_read
+    `SELECT queryid::text                                   AS query_id,
+            min(query)                                      AS query,
+            sum(calls)                                      AS calls,
+            sum(${cols.total})                              AS total_ms,
+            sum(${cols.total}) / NULLIF(sum(calls), 0)      AS mean_ms,
+            CASE WHEN count(*) = 1 THEN max(${stddev}) END  AS stddev_ms,
+            sum(rows)                                       AS rows,
+            sum(shared_blks_hit)                            AS shared_blks_hit,
+            sum(shared_blks_read)                           AS shared_blks_read
      FROM pg_stat_statements
      WHERE queryid IS NOT NULL
-     ORDER BY ${cols.total} DESC
+       AND dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+     GROUP BY queryid
+     ORDER BY sum(${cols.total}) DESC
      LIMIT $1`,
     [limit],
   );
