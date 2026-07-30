@@ -891,6 +891,116 @@ const statsDecision = await call('/api/decisions', {
 check('decisions accept kind statistics', statsDecision.status === 200,
   JSON.stringify(statsDecision.body).slice(0, 120));
 
+// ── Parameter sensitivity ────────────────────────────────────────────────────
+
+section('Parameter sensitivity (plan flips across pg_stats)');
+const senseHealth = await call('/api/health');
+check('sensitivity capability advertised', senseHealth.body.capabilities?.sensitivity === true);
+
+// Range sweep with no flip: orders has only its pkey, so total_cents seq-scans
+// at every histogram point — a first-class outcome, not an error.
+const noFlip = await call('/api/whatif/sensitivity', { sql: 'SELECT id FROM orders WHERE total_cents > 495000' });
+check('range sweep returns 200', noFlip.status === 200, JSON.stringify(noFlip.body).slice(0, 160));
+check('basis is the histogram, citing pg_stats',
+  noFlip.body.basis?.kind === 'histogram' && /pg_stats/.test(noFlip.body.basis?.evidence ?? ''),
+  noFlip.body.basis?.evidence);
+check('variants are ordered p10 → p50 → p90',
+  (noFlip.body.variants ?? []).map((v) => v.label).join(',') === 'p10,p50,p90');
+check('sweep values are real histogram bounds in ascending order', (() => {
+  const nums = (noFlip.body.variants ?? []).map((v) => Number(v.value));
+  return nums.length === 3 && nums.every((n, i) => Number.isFinite(n) && (i === 0 || nums[i - 1] < n));
+})(), JSON.stringify((noFlip.body.variants ?? []).map((v) => v.value)));
+check('an all-seq-scan sweep reports no flip, saying the plan held',
+  noFlip.body.flips?.length === 0 && /same way/.test(noFlip.body.narrative ?? ''),
+  noFlip.body.narrative?.slice(0, 160));
+check('no-flip payload discipline: just the base plan ships, variants stay summaries',
+  noFlip.body.baseline?.plan !== null &&
+  (noFlip.body.variants ?? []).every((v) => v.plan === null && v.diff === null));
+check('baseline is labelled as written and never interleaved into the sweep',
+  noFlip.body.baseline?.label === 'as written' && typeof noFlip.body.baselineMatchesLabel === 'string');
+check('estimate-only by declaration: costOnly, with the why in the note',
+  noFlip.body.costOnly === true && /planner estimate/.test(noFlip.body.note ?? ''));
+check('nothing was executed: the shipped plan is not analyzed',
+  noFlip.body.baseline?.plan?.analyzed === false);
+
+// The pkey flip: SELECT * makes the index scan pay heap visits, so the plan
+// flips Index Scan → Seq Scan between p50 (~200K rows) and p90 (~360K).
+const flip = await call('/api/whatif/sensitivity', { sql: 'SELECT * FROM orders WHERE id < 201178' });
+check('pkey sweep returns 200', flip.status === 200, JSON.stringify(flip.body).slice(0, 160));
+check('the plan flips exactly once, between p50 and p90',
+  flip.body.flips?.length === 1 &&
+  flip.body.flips[0].fromLabel === 'p50' && flip.body.flips[0].toLabel === 'p90',
+  JSON.stringify(flip.body.flips ?? []).slice(0, 200));
+check('the flip is Index Scan via orders_pkey → Seq Scan',
+  /orders_pkey/.test((flip.body.flips?.[0]?.before ?? []).join(' ')) &&
+  (flip.body.flips?.[0]?.after ?? []).includes('Seq Scan on orders'));
+check('the headline brackets the boundary with both costs and disclaims measurement',
+  /→/.test(flip.body.flips?.[0]?.headline ?? '') &&
+  /estimates, not measurements/.test(flip.body.flips?.[0]?.headline ?? ''),
+  flip.body.flips?.[0]?.headline);
+check('full plans and diffs ship only for the two points flanking the flip', (() => {
+  const withPlan = (flip.body.variants ?? []).filter((v) => v.plan !== null);
+  return withPlan.length === 2 &&
+    withPlan.every((v) => ['p50', 'p90'].includes(v.label) && v.diff !== null && v.plan.analyzed === false) &&
+    flip.body.baseline?.plan === null;
+})(), JSON.stringify((flip.body.variants ?? []).map((v) => [v.label, v.plan !== null])));
+check('every variant still carries its summary: cost, rows and access signature',
+  (flip.body.variants ?? []).every((v) =>
+    typeof v.totalCost === 'number' && typeof v.estimatedRows === 'number' &&
+    Array.isArray(v.signature) && typeof v.verdict === 'string'));
+
+// Equality sweep on the skewed status column (97% 'complete'): only the
+// parallel degree moves with frequency, so the access path holds at every MCV.
+const eqSweep = await call('/api/whatif/sensitivity', { sql: "SELECT id FROM orders WHERE status = 'disputed'" });
+check('equality basis is the MCV list', eqSweep.status === 200 && eqSweep.body.basis?.kind === 'mcv');
+check('the most common value carries its sampled frequency (> 0.9)', (() => {
+  const mc = (eqSweep.body.variants ?? []).find((v) => v.label === 'most common');
+  return mc != null && mc.frequency > 0.9;
+})(), JSON.stringify((eqSweep.body.variants ?? []).map((v) => [v.label, v.frequency])));
+check('with no index on status the plan holds at every frequency',
+  eqSweep.body.flips?.length === 0 && /same way/.test(eqSweep.body.narrative ?? ''));
+check('the all-MCV column explains why no rarer value was tested',
+  /no rarer value exists to test/.test(eqSweep.body.narrative ?? ''), eqSweep.body.narrative?.slice(0, 200));
+
+// Choice and the candidates list: order_items.qty holds four distinct values,
+// all MCVs, so a range sweep on it must be skipped with the pg_stats evidence
+// — reported, never silently dropped — leaving total_cents chosen.
+const MULTI_SQL =
+  'SELECT o.id FROM orders o JOIN order_items oi ON oi.order_id = o.id WHERE o.total_cents > 400000 AND oi.qty > 2';
+const multi = await call('/api/whatif/sensitivity', { sql: MULTI_SQL });
+check('every candidate is returned, skipped ones citing pg_stats', (() => {
+  const cands = multi.body.candidates ?? [];
+  const qty = cands.find((c) => c.column === 'oi.qty');
+  return multi.status === 200 && cands.length === 2 &&
+    qty != null && /pg_stats/.test(qty.skipped ?? '') &&
+    cands.find((c) => c.column === 'o.total_cents')?.chosen === true;
+})(), JSON.stringify(multi.body.candidates ?? []).slice(0, 240));
+check('the choice cites its evidence from pg_class', /pg_class\.reltuples/.test(multi.body.predicate?.why ?? ''),
+  multi.body.predicate?.why);
+const pinLoc = (multi.body.candidates ?? []).find((c) => c.column === 'o.total_cents')?.location ?? null;
+const pinned = await call('/api/whatif/sensitivity', { sql: MULTI_SQL, location: pinLoc });
+check('a location pin overrides the choice and says so',
+  pinned.status === 200 && /pinned by request/.test(pinned.body.predicate?.why ?? ''));
+check('a stale pinned location is a conflict, not a guess',
+  (await call('/api/whatif/sensitivity', { sql: 'SELECT id FROM orders WHERE total_cents > 495000', location: 424242 }))
+    .status === 409);
+
+// Refusals: each names the shape or the statistic that stopped it.
+const noPred = await call('/api/whatif/sensitivity', { sql: 'SELECT count(*) FROM orders' });
+check('no comparison predicate refuses with the shape it needs',
+  noPred.status === 400 && /comparison/.test(noPred.body.error ?? ''));
+const paramRefusal = await call('/api/whatif/sensitivity', { sql: 'SELECT id FROM orders WHERE id = $1' });
+check('a parameterised query refuses, naming the placeholder',
+  paramRefusal.status === 400 && /parameterised|\$n/.test(paramRefusal.body.error ?? ''));
+const noHist = await call('/api/whatif/sensitivity', { sql: "SELECT id FROM orders WHERE note > 'a'" });
+check('a single-valued column refuses citing pg_stats',
+  noHist.status === 400 && /pg_stats/.test(noHist.body.error ?? ''), noHist.body.error);
+const uniqueEq = await call('/api/whatif/sensitivity', { sql: 'SELECT id FROM orders WHERE id = 42' });
+check('equality on a unique column refuses with the n_distinct lesson',
+  uniqueEq.status === 400 && /n_distinct/.test(uniqueEq.body.error ?? ''), uniqueEq.body.error);
+check('a write refuses through the same admission gate',
+  (await call('/api/whatif/sensitivity', { sql: 'DELETE FROM orders WHERE id < 5' })).status === 400);
+
 // ── Verify the database was never mutated ────────────────────────────────────
 
 section('Nothing was written');

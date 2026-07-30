@@ -178,7 +178,7 @@ section('Progressive disclosure');
   await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await analyse(page);
 
-  check('segmented control rendered', (await page.locator('.segmented__item').count()) === 6);
+  check('segmented control rendered', (await page.locator('.segmented__item').count()) === 7);
   check('Hotspots selected by default',
     (await page.locator('.segmented__item[aria-selected="true"]').innerText()).includes('Hotspots'));
   check('only one view is shown at a time', (await page.locator('.segmented__item[aria-selected="true"]').count()) === 1);
@@ -494,6 +494,42 @@ section('Tier B rewrite proofs');
 
   check('no console errors', errors.length === 0, errors.join('; '));
   if (OUT) await page.screenshot({ path: `${OUT}/e2e-tierb-orsplit.png`, fullPage: true });
+  await ctx.close();
+}
+
+// ── Parameter sensitivity ────────────────────────────────────────────────────
+
+section('Parameter sensitivity panel');
+{
+  const { ctx, page, errors } = await newPage();
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
+
+  // promotions.applied_at is indexed with a 101-bound histogram: the sweep
+  // flips Seq Scan → Bitmap Heap Scan between p10 and p50 on the seed.
+  await setSql(page, "SELECT * FROM promotions WHERE applied_at > '2025-01-01'");
+  await analyse(page);
+  await tab(page, 'Sensitivity');
+
+  await page.locator('button:has-text("Sweep the constant")').click();
+  await page.waitForSelector('.sweep__flip, .sweep__noflip', { timeout: 90000 });
+
+  const panel = await page.locator('.sweep').innerText();
+  check('the swept predicate and its why sentence render',
+    /applied_at/.test(panel) && /pg_class\.reltuples|usable statistics/.test(panel), panel.slice(0, 160));
+  check('the variant table lists the as-written baseline and the p-points',
+    /as written/.test(panel) && /p10/.test(panel) && /p90/.test(panel));
+  check('the flip callout renders with its bracket headline',
+    (await page.locator('.sweep__flip').count()) >= 1 && /the plan flips/i.test(panel));
+  check('the estimate-only disclaimer stands',
+    /estimates, not measurements|planner estimate/i.test(panel) && /nothing executed/i.test(panel));
+  check('the flanking plan diff expands behind a toggle', await (async () => {
+    await page.locator('.sweep .diff__toggle').first().click();
+    await page.waitForSelector('.sweep .diff__body', { timeout: 15000 });
+    return (await page.locator('.sweep .diff__row').count()) > 0;
+  })());
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-sensitivity.png`, fullPage: true });
   await ctx.close();
 }
 

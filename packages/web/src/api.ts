@@ -43,15 +43,12 @@ export interface Health {
     rewriteAdvisor: boolean;
     /** Generated rewrites can be proven — needs a connection and the parser. */
     proveRewrite?: boolean;
-<<<<<<< HEAD
     /** Drop proofs need hypopg 1.4+ (hypopg_hide_index) on the target. */
     dropIndex?: boolean;
     /** Statistics proofs need the sandbox (connected, can DDL) and the parser. */
     proveStatistics?: boolean;
-=======
     /** Parameter sensitivity — needs a connection and the parser, no extension. */
     sensitivity?: boolean;
->>>>>>> 09220a6 (feat(web): sensitivity panel on the analysis page)
     persistence: boolean;
   };
   store?: { analyses: number; savedQueries: number; decisions: number; queries: number };
