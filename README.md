@@ -58,24 +58,64 @@ That second sentence is the point. The tool says what it proved and what it didn
 - **Web UI** — a landing page, a query index, per-query history, saved queries, the
   reference, and the analysis view with its plan graph and proof loop.
 
-Not yet built: workload ingestion (`pg_stat_statements` / `auto_explain`) and the CI
-gate. See [REQUIREMENTS.md](REQUIREMENTS.md).
+- **Workload ingestion** — `pg_stat_statements`, delta'd between snapshots and ranked by
+  **total** time. The 4ms query running two million times a day costs more than the
+  eight-second report, and only one of those shows up in a slow-query log. Handles
+  counter resets and entry eviction, both of which produce plausible nonsense if ignored.
+- **CI gate** — `querynot ci` plans your queries against a committed baseline and fails
+  the build when an index stops being used or cost jumps. Baselines record plan *shape*,
+  not timing, because a committed baseline gets compared on someone else's machine.
+- **Decisions** — every proven change is recorded automatically with its verdict and
+  numbers, plus whether it was ever actually shipped.
+
+Every phase in [REQUIREMENTS.md](REQUIREMENTS.md) is now built.
 
 ## Getting started
 
-Requires Node 20+ and a PostgreSQL database.
+### Docker — one process
+
+```bash
+docker build -t query-not .
+docker run -p 5174:5174 \
+  -e QUERYNOT_DATABASE_URL=postgres://readonly:pw@host:5432/db \
+  -v querynot-data:/data \
+  query-not
+```
+
+The agent serves the UI and the API on one port. History lives on the volume; without
+it a redeploy loses every baseline.
+
+### From source
+
+Requires Node 22+ (for built-in `node:sqlite` and TypeScript stripping) and PostgreSQL.
 
 ```bash
 npm install
 npm run build --workspace @query-not/core
-```
 
-Point the agent at a database and start it:
-
-```bash
 export QUERYNOT_DATABASE_URL="postgres://readonly_user:pw@host:5432/yourdb"
 npm run agent          # http://localhost:5174
-npm run web            # http://localhost:5173
+npm run web            # http://localhost:5173 (dev server, hot reload)
+```
+
+Build the UI and the agent serves it too — one port, no second process.
+
+### Command line
+
+```bash
+npx querynot analyse query.sql --analyze     # findings in the terminal
+npx querynot rewrite query.sql               # structural advice, no database needed
+npx querynot baseline queries.json           # record plan baselines
+npx querynot ci queries.json                 # fail the build on a plan regression
+```
+
+The gate catches the case that matters — a migration dropping an index a hot query
+depended on:
+
+```
+  ✗ items_by_order
+    no longer uses Index Scan on order_items via order_items_order_id_idx
+    estimated cost rose 96321% (11 → 11050)
 ```
 
 To enable index what-ifs, install [HypoPG](https://github.com/HypoPG/hypopg) on the
@@ -96,6 +136,7 @@ Without it everything else still works; the UI shows a `no hypopg` badge and dis
 | `QUERYNOT_STATEMENT_TIMEOUT_MS` | `15000` | Hard ceiling on any statement |
 | `QUERYNOT_MAX_CONNECTIONS` | `4` | Pool size |
 | `QUERYNOT_PORT` | `5174` | Agent HTTP port |
+| `QUERYNOT_STORE_PATH` | `./.querynot/store.db` | Where history lives |
 
 ## Safety
 
@@ -159,12 +200,15 @@ rests on.
 ## Development
 
 ```bash
-npm test          # 189 unit tests across core and agent
+npm test          # 208 unit tests across core and agent
 npm run typecheck
-npm run test:e2e  # full stack: builds, starts both servers, 237 checks, tears down
+npm run test:e2e  # full stack, cold: 406 checks plus a production-bundle run
 ```
 
-**426 checks in total** — 189 unit, 107 API end-to-end, 130 browser end-to-end.
+**614 checks in total** — 208 unit, 116 API end-to-end, 145 browser end-to-end, and the
+whole browser suite again against the production bundle served by the agent. The dev
+server and the built artifact are different things; verifying only the first ships a
+build nobody ran.
 
 Core's test fixtures are **real `EXPLAIN` output** captured from a seeded Postgres
 (`packages/core/test/fixtures/seed.sql`), not hand-written JSON — including a

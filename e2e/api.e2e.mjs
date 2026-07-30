@@ -362,6 +362,40 @@ const health2 = await call('/api/health');
 check('store stats are reported', typeof health2.body.store?.analyses === 'number' && health2.body.store.analyses > 0);
 check('persistence is advertised as a capability', health2.body.capabilities?.persistence === true);
 
+// ── Workload ─────────────────────────────────────────────────────────────────
+
+section('Workload (pg_stat_statements)');
+const wl0 = await call('/api/workload');
+check('workload endpoint responds', wl0.status === 200);
+check('availability is reported either way', typeof wl0.body.availability?.installed === 'boolean');
+
+if (wl0.body.availability?.installed) {
+  const snap = await call('/api/workload/snapshot', {});
+  check('a snapshot can be taken', snap.status === 200 && snap.body.entries > 0,
+    JSON.stringify(snap.body).slice(0, 120));
+
+  // Generate traffic between snapshots so the delta has something in it.
+  for (let i = 0; i < 3; i++) await call('/api/analyze', { sql: `SELECT ${i}, count(*) FROM orders`, analyze: true });
+  await call('/api/workload/snapshot', {});
+
+  const wl = await call('/api/workload');
+  check('the window is a delta once two snapshots exist', wl.body.window?.isDelta === true);
+  check('the window has a start and an end',
+    typeof wl.body.window?.fromAt === 'string' && typeof wl.body.window?.toAt === 'string');
+  check('entries are ranked by total time descending',
+    (wl.body.window?.entries ?? []).every((e, i, a) => i === 0 || a[i - 1].totalMs >= e.totalMs));
+  check('every entry carries its share of the window',
+    (wl.body.window?.entries ?? []).every((e) => typeof e.share === 'number' && e.share >= 0 && e.share <= 1));
+  check('no delta is negative',
+    (wl.body.window?.entries ?? []).every((e) => e.calls >= 0 && e.totalMs >= 0));
+  check('normalised queries are marked as unplannable',
+    (wl.body.window?.entries ?? []).some((e) => e.explainable === false && e.notExplainableReason),
+    'pg_stat_statements text uses $1 placeholders, which cannot be EXPLAINed as-is');
+} else {
+  check('an unavailable extension explains itself',
+    typeof wl0.body.availability?.reason === 'string' && typeof wl0.body.availability?.hint === 'string');
+}
+
 // ── Verify the database was never mutated ────────────────────────────────────
 
 section('Nothing was written');

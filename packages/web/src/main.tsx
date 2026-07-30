@@ -7,6 +7,7 @@ import { createRoot } from 'react-dom/client';
 // two-line change documented there.
 import { App } from './App';
 import { RouterProvider } from './router';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import './styles.css';
 
 const root = document.getElementById('root');
@@ -14,8 +15,10 @@ if (!root) throw new Error('#root not found');
 
 createRoot(root).render(
   <StrictMode>
-    <RouterProvider>
-      <App />
-    </RouterProvider>
+    <ErrorBoundary>
+      <RouterProvider>
+        <App />
+      </RouterProvider>
+    </ErrorBoundary>
   </StrictMode>,
 );

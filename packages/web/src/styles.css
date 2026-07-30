@@ -296,6 +296,43 @@ button {
 .query-row__meta { margin-top: var(--sp-2); display: flex; gap: var(--sp-2); font-size: 12.5px; color: var(--ink-muted); flex-wrap: wrap; }
 .query-row__stats { display: flex; align-items: center; gap: var(--sp-2); flex: none; }
 
+/* ── Workload ────────────────────────────────────────────────────────────── */
+
+.workload-row { display: flex; align-items: flex-start; gap: var(--sp-4); position: relative; }
+.workload-row__bar {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--hairline-strong); border-radius: 2px; overflow: hidden;
+}
+.workload-row__bar span { display: block; width: 100%; background: var(--accent); border-radius: 2px; height: 100%; }
+.workload-row__main { flex: 1; min-width: 0; }
+.workload-row__sql { display: block; max-height: 76px; overflow: hidden; }
+.workload-row__meta {
+  margin-top: var(--sp-2); display: flex; gap: var(--sp-2); flex-wrap: wrap;
+  font-size: 12.5px; color: var(--ink-muted); font-variant-numeric: tabular-nums;
+}
+.workload-row__meta b { color: var(--ink); font-weight: 600; }
+.workload-row__flags { margin-top: var(--sp-2); display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+.workload-row__note { margin-top: var(--sp-2); font-size: 13px; color: var(--ink-secondary); line-height: 1.5; }
+.workload-row__caveat {
+  margin-top: var(--sp-2); font-size: 12.5px; color: var(--ink-muted);
+  padding-left: var(--sp-3); border-left: 2px solid var(--hairline-strong); line-height: 1.5;
+}
+.workload-row__actions { flex: none; }
+
+/* Share-of-window bar reads left-to-right as a horizontal fill instead. */
+.workload-row { padding-left: calc(var(--sp-5) + 8px); }
+.workload-row__bar { width: 4px; left: var(--sp-5); }
+
+/* ── Decisions ───────────────────────────────────────────────────────────── */
+
+.decision-row { display: flex; align-items: flex-start; gap: var(--sp-4); }
+.decision-row__main { flex: 1; min-width: 0; }
+.decision-row__head { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.decision-row__verdict { font-size: 15px; font-weight: 600; letter-spacing: -0.012em; }
+.decision-row__change { margin-top: var(--sp-3); display: block; }
+.decision-row__headline { margin-top: var(--sp-2); font-size: 13.5px; color: var(--ink-secondary); line-height: 1.5; }
+.decision-row__actions { flex: none; }
+
 /* ── Reference ───────────────────────────────────────────────────────────── */
 
 .ref-controls { display: flex; gap: var(--sp-3); flex-wrap: wrap; align-items: center; }
@@ -806,6 +843,43 @@ a.chip:hover { background: var(--accent-wash); color: var(--accent); }
 .diff__badge--added { background: color-mix(in srgb, var(--status-good) 18%, transparent); color: var(--status-good-text); }
 .diff__badge--removed { background: color-mix(in srgb, var(--status-critical) 16%, transparent); color: var(--status-critical); }
 .diff__badge--changed { background: var(--accent-wash); color: var(--accent); }
+
+/* ── Command palette ─────────────────────────────────────────────────────── */
+
+.palette {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(4px);
+  display: flex; justify-content: center; align-items: flex-start;
+  padding: 12vh var(--sp-4) var(--sp-4);
+}
+.palette__panel {
+  width: 100%; max-width: 520px;
+  background: var(--raised);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+  animation: rise 0.18s var(--ease) both;
+}
+.palette__input {
+  width: 100%; height: 52px;
+  padding: 0 var(--sp-5);
+  border: none; border-bottom: 1px solid var(--hairline);
+  background: transparent; color: var(--ink);
+  font-family: inherit; font-size: 16px; outline: none;
+}
+.palette__input::placeholder { color: var(--ink-muted); }
+.palette__results { max-height: 340px; overflow-y: auto; padding: var(--sp-2); }
+.palette__item {
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%; padding: 10px var(--sp-3);
+  border: none; border-radius: var(--radius-sm);
+  background: transparent; color: var(--ink);
+  font-size: 14px; text-align: left;
+}
+.palette__item--active { background: var(--accent-wash); }
+.palette__hint { font-size: 11.5px; color: var(--ink-muted); }
+.palette__empty { padding: var(--sp-5); text-align: center; color: var(--ink-muted); font-size: 14px; }
 
 /* ── Messages ────────────────────────────────────────────────────────────── */
 

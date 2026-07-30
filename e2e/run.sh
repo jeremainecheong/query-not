@@ -71,6 +71,22 @@ QUERYNOT_AGENT_URL="http://localhost:$AGENT_PORT" node e2e/api.e2e.mjs || fail "
 step "Browser end-to-end"
 QUERYNOT_WEB_URL="http://127.0.0.1:$WEB_PORT/" node e2e/ui.e2e.mjs || fail "UI e2e"
 
+# The dev server and the production bundle are different artifacts. Verifying
+# only the first ships a build nobody has run.
+step "Production bundle"
+npm run build --workspace @query-not/web >/dev/null 2>&1 || fail "web build"
+kill "$AGENT_PID" 2>/dev/null; AGENT_PID=""
+sleep 1
+QUERYNOT_DATABASE_URL="$PGURL" QUERYNOT_PORT="$AGENT_PORT" \
+  node --experimental-strip-types packages/agent/src/server.ts >"$LOGS/agent-prod.log" 2>&1 &
+AGENT_PID=$!
+if wait_for "http://localhost:$AGENT_PORT/api/health" "agent (serving UI)"; then
+  grep -q 'serving the UI' "$LOGS/agent-prod.log" || fail "agent did not pick up the built UI"
+  QUERYNOT_WEB_URL="http://localhost:$AGENT_PORT/" node e2e/ui.e2e.mjs >/dev/null 2>&1 \
+    || fail "UI e2e against the production bundle"
+  printf '  the built UI serves from the agent on one port\n'
+fi
+
 if [ "$STATUS" -eq 0 ]; then
   printf '\n\033[32m\033[1mAll green.\033[0m\n'
 else

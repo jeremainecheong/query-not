@@ -3,7 +3,7 @@
 A PostgreSQL query optimiser that doesn't just *show* you a slow plan — it proves what
 would fix it.
 
-Status: **Phases 1–2 built**, Phases 3–5 not started. This document captures decisions
+Status: **all five phases built**. This document captures decisions
 made, problems identified, and questions still open. See §8 for what exists today.
 
 ---
@@ -340,7 +340,7 @@ misestimate heat, teaching mode. Single query.
 **Phase 2 — the differentiator. ✅ Built.** Tree diff + what-if (HypoPG indexes, GUC
 changes). Suggestions are proven rather than guessed.
 
-**Phase 3 — workload.** `pg_stat_statements` + `auto_explain` ingestion, ranking,
+**Phase 3 — workload. ✅ Built.** `pg_stat_statements` ingestion, ranking,
 fingerprinting, trends. Plus workload-level index consolidation and write-cost analysis.
 *Query fingerprinting already exists in the agent (it is the privacy boundary), so the
 ingestion work starts from a normalised key rather than raw text.*
@@ -350,7 +350,10 @@ ingestion work starts from a normalised key rather than raw text.*
 explicit `semanticChange` field on every rewrite whose result set can differ, which is
 the honest position until sampling exists to verify it.*
 
-**Phase 5 — CI gate.** Shadow database, baselines, PR checks, migration analysis.
+**Phase 5 — CI gate. ✅ Built.** Baselines and PR checks via `querynot ci`. *The shadow
+database is still outstanding — the gate currently plans against whatever database it is
+pointed at, which is fine for a CI Postgres seeded from migrations and not a substitute
+for production statistics.*
 
 Teaching mode rode along with Phase 1 rather than being its own phase — it is narration
 over an IR we already have.
@@ -374,10 +377,12 @@ over an IR we already have.
 | Plan history + regression detection | `packages/agent/src/history.ts` |
 | Routing and pages | `packages/web/src/{router.tsx,pages/}` |
 | Operation reference + diagrams | `packages/web/src/{pages/ReferencePage,components/ScanDiagram}.tsx` |
+| Workload ingestion | `packages/agent/src/workload.ts` |
+| CLI + CI gate | `packages/agent/src/cli.ts` |
 | Web UI | `packages/web/` |
 | End-to-end suites | `e2e/` |
 
-**426 checks** — 189 unit, 107 API end-to-end, 130 browser end-to-end. Core's fixtures are
+**614 checks** — 208 unit, 116 API, 145 browser, plus the browser suite re-run against the production bundle. Core's fixtures are
 real `EXPLAIN` output from a seeded Postgres, including a before/after pair captured
 either side of a live HypoPG hypothetical index.
 

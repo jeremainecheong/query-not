@@ -17,7 +17,8 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "dev": "npm run dev --workspace @query-not/agent & npm run dev --workspace @query-not/web",
     "agent": "npm run dev --workspace @query-not/agent",
-    "web": "npm run dev --workspace @query-not/web"
+    "web": "npm run dev --workspace @query-not/web",
+    "cli": "node packages/agent/bin/querynot.mjs"
   },
   "engines": {
     "node": ">=20"

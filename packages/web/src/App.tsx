@@ -8,6 +8,9 @@ import { HistoryPage } from './pages/HistoryPage';
 import { LandingPage } from './pages/LandingPage';
 import { QueriesPage } from './pages/QueriesPage';
 import { ReferencePage } from './pages/ReferencePage';
+import { WorkloadPage } from './pages/WorkloadPage';
+import { DecisionsPage } from './pages/DecisionsPage';
+import { CommandPalette } from './components/CommandPalette';
 import { FlameGraph } from './components/FlameGraph';
 import { Findings } from './components/Findings';
 import { Hotspots } from './components/Hotspots';
@@ -124,6 +127,7 @@ export function App() {
 
   return (
     <div className="app">
+      <CommandPalette />
       <header className="header">
         <Link className="header__mark" to={{ name: 'home' }}>
           query<span>-not</span>
@@ -134,6 +138,12 @@ export function App() {
             to={{ name: 'analyse' }}
           >
             Analyse
+          </Link>
+          <Link
+            className={`header__link${route.name === 'workload' ? ' header__link--active' : ''}`}
+            to={{ name: 'workload' }}
+          >
+            Workload
           </Link>
           <Link
             className={`header__link${route.name === 'queries' || route.name === 'history' ? ' header__link--active' : ''}`}
@@ -183,6 +193,15 @@ export function App() {
           <LandingPage health={health} />
         ) : route.name === 'queries' ? (
           <QueriesPage />
+        ) : route.name === 'workload' ? (
+          <WorkloadPage
+            onAnalyse={(q) => {
+              setSql(q);
+              navigate({ name: 'analyse' });
+            }}
+          />
+        ) : route.name === 'decisions' ? (
+          <DecisionsPage />
         ) : route.name === 'reference' ? (
           <ReferencePage />
         ) : route.name === 'saved' ? (
@@ -356,6 +375,8 @@ export function App() {
                         suggestions={analysis.indexSuggestions}
                         sql={sql}
                         canProve={health?.capabilities.whatIfIndex ?? false}
+                        fingerprint={analysis.fingerprint}
+                        analysisSlug={analysis.slug ?? null}
                       />
                     </div>
                   )}

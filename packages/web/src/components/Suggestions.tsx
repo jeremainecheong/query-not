@@ -22,9 +22,11 @@ interface Props {
   suggestions: IndexSuggestion[];
   sql: string;
   canProve: boolean;
+  fingerprint: string;
+  analysisSlug: string | null;
 }
 
-export function Suggestions({ suggestions, sql, canProve }: Props) {
+export function Suggestions({ suggestions, sql, canProve, fingerprint, analysisSlug }: Props) {
   if (suggestions.length === 0) {
     return (
       <div className="empty">
@@ -37,7 +39,14 @@ export function Suggestions({ suggestions, sql, canProve }: Props) {
   return (
     <div>
       {suggestions.map((suggestion, i) => (
-        <SuggestionRow key={`${suggestion.relation}-${i}`} suggestion={suggestion} sql={sql} canProve={canProve} />
+        <SuggestionRow
+          key={`${suggestion.relation}-${i}`}
+          suggestion={suggestion}
+          sql={sql}
+          canProve={canProve}
+          fingerprint={fingerprint}
+          analysisSlug={analysisSlug}
+        />
       ))}
     </div>
   );
@@ -47,10 +56,14 @@ function SuggestionRow({
   suggestion,
   sql,
   canProve,
+  fingerprint,
+  analysisSlug,
 }: {
   suggestion: IndexSuggestion;
   sql: string;
   canProve: boolean;
+  fingerprint: string;
+  analysisSlug: string | null;
 }) {
   const [proof, setProof] = useState<ProofState>({ status: 'idle' });
 
@@ -60,7 +73,24 @@ function SuggestionRow({
       // CONCURRENTLY belongs on the real index someone runs later, not on the
       // hypothetical one — nothing is being built here.
       const ddl = suggestion.ddl.replace(/\s+CONCURRENTLY\b/i, '');
-      setProof({ status: 'done', result: await api.whatIfIndex(sql, ddl) });
+      const result = await api.whatIfIndex(sql, ddl);
+      setProof({ status: 'done', result });
+
+      // Record what was tested. Without this the decisions page only ever fills
+      // up if someone remembers to press an extra button, which nobody does.
+      void api
+        .recordDecision({
+          analysisSlug,
+          fingerprint,
+          kind: 'index',
+          change: suggestion.ddl,
+          verdict: result.diff.summary.verdict,
+          headline: result.diff.summary.headline,
+          costBefore: result.diff.summary.costBefore,
+          costAfter: result.diff.summary.costAfter,
+          costOnly: result.costOnly,
+        })
+        .catch(() => undefined);
     } catch (err) {
       setProof({
         status: 'error',

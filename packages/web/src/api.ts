@@ -98,6 +98,36 @@ export interface QueryGroup {
   regressions: number;
 }
 
+export interface WorkloadEntry {
+  queryId: string;
+  query: string;
+  calls: number;
+  totalMs: number;
+  meanMs: number;
+  stddevMs: number | null;
+  rows: number;
+  sharedHit: number;
+  sharedRead: number;
+  share: number;
+  flags: string[];
+  note: string | null;
+  explainable: boolean;
+  notExplainableReason: string | null;
+}
+
+export interface WorkloadResponse {
+  availability: { available: boolean; installed: boolean; reason: string | null; hint: string | null };
+  window: {
+    isDelta: boolean;
+    fromAt: string | null;
+    toAt: string;
+    resetDetected: boolean;
+    totalMs: number;
+    entries: WorkloadEntry[];
+  } | null;
+  snapshots: number;
+}
+
 export interface HistoryPoint {
   slug: string;
   createdAt: string;
@@ -236,6 +266,11 @@ export const api = {
     request<{ analyses: AnalysisSummary[] }>(`/api/analyses?limit=${limit}`),
 
   queries: () => request<{ queries: QueryGroup[] }>('/api/queries'),
+
+  workload: () => request<WorkloadResponse>('/api/workload'),
+
+  workloadSnapshot: () =>
+    request<{ id: number; takenAt: string; entries: number }>('/api/workload/snapshot', {}),
 
   listSaved: () => request<{ queries: SavedQuery[] }>('/api/saved'),
 
