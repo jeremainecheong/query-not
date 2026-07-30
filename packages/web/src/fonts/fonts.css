@@ -1,36 +1,25 @@
 /*
- * Apple SF Pro and SF Mono, vendored.
+ * Inter, vendored. SIL OFL 1.1 — LICENSE.txt in this directory — which permits
+ * exactly this: bundling the font and serving it to every visitor.
  *
- * See LICENSE-NOTE.md in this directory before shipping this publicly — Apple's
- * licence for these fonts is narrower than it looks.
+ * The design intent is still SF wherever Apple ships it: --sans leads with
+ * -apple-system, which renders genuine SF Pro straight from the OS — licensed,
+ * because nothing is redistributed. Vendoring SF itself is not an option
+ * (Apple's licence stops at UI mockups for Apple platforms), so this face
+ * carries every other platform, and Inter was drawn close enough to SF that
+ * the difference needs a side-by-side to see.
  *
- * SF Pro is the variable font: wdth pinned to normal, wght (1–1000) and opsz
- * (17–28) left variable, so weight and optical sizing both still work from CSS.
- * Subset to latin plus the punctuation, arrows and box-drawing glyphs the UI
- * renders — 21MB and 35,571 glyphs down to 79KB.
+ * InterVariable is the full face, not a subset: wght 100–900 and opsz 14–32
+ * in one 344KB file, so the declaration spans the whole weight range. Mono is
+ * deliberately not vendored — every platform ships a usable monospace, so
+ * --mono in styles.css is a pure system stack.
  */
 
 @font-face {
-  font-family: 'SF Pro';
-  src: url('./SF-Pro.woff2') format('woff2-variations'),
-       url('./SF-Pro.woff2') format('woff2');
-  font-weight: 1 1000;
-  font-style: normal;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: 'SF Mono';
-  src: url('./SF-Mono-Regular.woff2') format('woff2');
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: 'SF Mono';
-  src: url('./SF-Mono-Medium.woff2') format('woff2');
-  font-weight: 500 700;
+  font-family: 'Inter';
+  src: url('./InterVariable.woff2') format('woff2-variations'),
+       url('./InterVariable.woff2') format('woff2');
+  font-weight: 100 900;
   font-style: normal;
   font-display: swap;
 }

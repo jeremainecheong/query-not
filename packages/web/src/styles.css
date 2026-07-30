@@ -70,8 +70,8 @@
   --radius-lg: 18px;
   --radius-xl: 24px;
 
-  --sans: 'SF Pro', -apple-system, BlinkMacSystemFont, 'Inter Variable', system-ui, sans-serif;
-  --mono: 'SF Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Helvetica Neue', Arial, sans-serif;
+  --mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace;
 
   --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.04);
   --shadow: 0 4px 24px rgba(0, 0, 0, 0.06);

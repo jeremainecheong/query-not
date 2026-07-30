@@ -291,15 +291,14 @@ graph is still there, under the Plan tab, where nesting is what you actually wan
 
 ### Typography
 
-SF Pro and SF Mono are vendored under `packages/web/src/fonts` — the variable SF Pro
-subset to 79KB from 21MB, SF Mono at 13KB per weight.
-
-⚠️ **Read [`packages/web/src/fonts/LICENSE-NOTE.md`](packages/web/src/fonts/LICENSE-NOTE.md)
-before deploying this publicly.** Apple's licence for the SF fonts covers UI mockups for
-Apple-platform apps and does not grant redistribution — which is what serving them to a
-browser is. The note documents the compliant fallback (`-apple-system` plus Inter) and
-the two-line change to switch back; `@fontsource-variable/inter` is kept in
-`package.json` for exactly that reason.
+The interface is set in SF on Apple devices and [Inter](https://rsms.me/inter/)
+everywhere else — and nothing Apple-made ships in the repo. `-apple-system` at the
+front of the stack renders genuine SF Pro straight from the OS, which Apple's licence
+permits because nothing is redistributed; Inter (SIL OFL 1.1, licence vendored at
+`packages/web/src/fonts/LICENSE.txt`) is the single variable `InterVariable.woff2`
+and covers every other platform. Mono is a pure system stack — `ui-monospace`
+falling through to SF Mono, Menlo, Consolas or DejaVu — so no mono font is vendored
+at all.
 
 ## Prior art
 

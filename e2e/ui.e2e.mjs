@@ -5,7 +5,7 @@
  * tab, prove an index, run a settings what-if, open the plan diff, select nodes
  * from both the graph and the list, switch theme, and the failure paths. Also
  * checks the things only observable in a browser — layout overflow, console
- * errors, whether the vendored fonts actually applied, and measured colour
+ * errors, whether the vendored font actually applied, and measured colour
  * contrast.
  *
  *   node e2e/ui.e2e.mjs
@@ -109,29 +109,30 @@ section('Initial load');
     await document.fonts.ready;
     return [...document.fonts].map((f) => ({ family: f.family, status: f.status }));
   });
-  check('SF Pro loaded', fonts.some((f) => /SF Pro/i.test(f.family) && f.status === 'loaded'),
+  check('Inter loaded', fonts.some((f) => /Inter/i.test(f.family) && f.status === 'loaded'),
     JSON.stringify(fonts));
-  check('body renders in SF Pro',
-    await page.evaluate(() => getComputedStyle(document.body).fontFamily.startsWith('"SF Pro"')),
+  // The stack leads with -apple-system by design — Apple devices render SF from
+  // the OS — so on this Linux runner Inter is the first family that resolves,
+  // and webfonts only load on use, so 'loaded' means it is what rendered.
+  check('body renders in Inter', await page.evaluate(() =>
+    /\bInter\b/.test(getComputedStyle(document.body).fontFamily) && document.fonts.check('15px Inter')),
     await page.evaluate(() => getComputedStyle(document.body).fontFamily));
-  check('vendored subset covers the UI glyph set', await page.evaluate(async () => {
+  check('Inter answers for the UI glyph set', await page.evaluate(async () => {
     await document.fonts.ready;
-    return ['→', '—', '…', '×', '·', '▸', '▾'].every((g) => document.fonts.check('15px "SF Pro"', g));
+    return ['→', '—', '…', '×', '·', '▸', '▾'].every((g) => document.fonts.check('15px Inter', g));
   }));
 
-  // SF Mono has to be checked where mono text actually renders — webfonts load
-  // lazily on first use, so it is legitimately absent on a page with no code.
+  // Mono is deliberately not vendored — every platform ships a usable
+  // monospace — so Inter must be the only registered webfont, and the editor
+  // must draw its type from the system stack.
   await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
-  const monoFonts = await page.evaluate(async () => {
+  check('no webfont beyond Inter is registered', await page.evaluate(async () => {
     await document.fonts.ready;
-    return [...document.fonts].map((f) => ({ family: f.family, status: f.status }));
-  });
-  check('SF Mono loaded where code renders',
-    monoFonts.some((f) => /SF Mono/i.test(f.family) && f.status === 'loaded'),
-    JSON.stringify(monoFonts));
-  check('editor renders in SF Mono', await page.evaluate(() => {
+    return [...document.fonts].every((f) => /Inter/i.test(f.family));
+  }));
+  check('editor renders from the system mono stack', await page.evaluate(() => {
     const el = document.querySelector('.editor');
-    return el ? getComputedStyle(el).fontFamily.startsWith('"SF Mono"') : false;
+    return el ? getComputedStyle(el).fontFamily.startsWith('ui-monospace') : false;
   }));
 
   check('no console errors', errors.length === 0, errors.join('; '));
