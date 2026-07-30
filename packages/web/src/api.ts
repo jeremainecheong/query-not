@@ -28,6 +28,14 @@ export interface Health {
     hypopgHideIndex?: boolean;
     error: string | null;
   };
+  /** The opt-in DDL sandbox for statistics proofs. Null when not configured. */
+  sandbox?: {
+    configured: boolean;
+    connected: boolean;
+    database: string | null;
+    canDdl: boolean;
+    error: string | null;
+  } | null;
   capabilities: {
     whatIfIndex: boolean;
     whatIfSettings: boolean;
@@ -37,6 +45,8 @@ export interface Health {
     proveRewrite?: boolean;
     /** Drop proofs need hypopg 1.4+ (hypopg_hide_index) on the target. */
     dropIndex?: boolean;
+    /** Statistics proofs need the sandbox (connected, can DDL) and the parser. */
+    proveStatistics?: boolean;
     persistence: boolean;
   };
   store?: { analyses: number; savedQueries: number; decisions: number; queries: number };
@@ -100,7 +110,7 @@ export interface Decision {
   id: number;
   analysisSlug: string | null;
   fingerprint: string;
-  kind: 'index' | 'settings' | 'rewrite' | 'drop-index';
+  kind: 'index' | 'settings' | 'rewrite' | 'drop-index' | 'statistics';
   change: string;
   verdict: string;
   headline: string;
@@ -196,10 +206,32 @@ export interface HistoryReport {
   summary: string | null;
 }
 
+/** A CREATE STATISTICS suggestion, refined by the agent (AST + catalog probe). */
+export interface StatisticsFinding {
+  nodeId: string;
+  relation: string;
+  columns: string[];
+  statName: string;
+  ddl: string;
+  reason: string;
+  estimatedRows: number;
+  actualRows: number;
+  ratio: number;
+  confidence: 'high' | 'medium' | 'low';
+  caveat: string | null;
+  /** 'plan-text' means the AST could not confirm the columns — degraded. */
+  source: 'ast' | 'plan-text';
+  existingState: 'none' | 'not-analysed' | 'analysed' | 'wrong-kind' | 'not-visible' | 'unknown';
+  existing: { name: string; columns: string[]; kinds: string[] } | null;
+  existingAdvice: string | null;
+}
+
 export interface Analysis {
   plan: QueryPlan;
   findings: Finding[];
   indexSuggestions: IndexSuggestion[];
+  /** Absent on analyses recorded before the advisor existed. */
+  statisticsSuggestions?: StatisticsFinding[];
   rewrites: RewriteFinding[];
   narration: string;
   flame: FlameLayout;
@@ -233,7 +265,8 @@ export interface WhatIfResult {
   change:
     | { kind: 'index'; ddl: string }
     | { kind: 'settings'; settings: Record<string, string> }
-    | { kind: 'rewrite'; sql: string };
+    | { kind: 'rewrite'; sql: string }
+    | { kind: 'statistics'; ddl: string };
   findingsAfter: Finding[];
   costOnly: boolean;
   note: string | null;
@@ -345,6 +378,38 @@ export interface DropIndexProof {
   note: string;
 }
 
+export type StatisticsProofOutcome = 'estimates-fixed' | 'estimates-improved' | 'no-effect';
+
+export interface StatisticsAccuracySide {
+  estimatedRows: number;
+  actualRows: number;
+  ratio: number;
+}
+
+/** What a sandbox statistics proof measured. Claims are scoped to the sandbox. */
+export interface StatisticsProof {
+  /** The rolled-back statement that ran on the sandbox. */
+  ddl: string;
+  /** The durable form to actually ship: named object plus its ANALYZE. */
+  adviceDdl: string;
+  relation: string;
+  columns: string[];
+  outcome: StatisticsProofOutcome;
+  accuracy: {
+    before: StatisticsAccuracySide;
+    after: StatisticsAccuracySide;
+    nodeLabel: string;
+  } | null;
+  accuracyUnavailableReason: string | null;
+  dependency: {
+    pairs: Array<{ determinant: string[]; dependent: string; degree: number }>;
+    raw: string;
+  } | null;
+  planDiff: WhatIfResult;
+  sandbox: { database: string };
+  note: string;
+}
+
 export class ApiError extends Error {
   readonly hint: string | null;
   constructor(message: string, hint: string | null = null) {
@@ -406,6 +471,13 @@ export const api = {
   whatIfRewrite: (sql: string, kind: string, location: number | null) =>
     request<RewriteProof>('/api/whatif/rewrite', { sql, kind, location }),
 
+  /**
+   * Prove a CREATE STATISTICS suggestion on the opt-in sandbox. Coordinates
+   * only — the DDL is composed server-side and always rolled back.
+   */
+  whatIfStatistics: (sql: string, relation: string, columns: string[]) =>
+    request<StatisticsProof>('/api/whatif/statistics', { sql, relation, columns }),
+
   // ── Persistence ────────────────────────────────────────────────────────────
 
   /** Re-open a recorded analysis. This is what a shared link resolves to. */
@@ -450,7 +522,7 @@ export const api = {
   recordDecision: (input: {
     analysisSlug: string | null;
     fingerprint: string;
-    kind: 'index' | 'settings' | 'rewrite' | 'drop-index';
+    kind: 'index' | 'settings' | 'rewrite' | 'drop-index' | 'statistics';
     change: string;
     verdict: string;
     headline: string;
