@@ -85,6 +85,12 @@ itself tells you not to apply. The CI gate fails a build on camera.
   the functional dependency cited by degree from `pg_stats_ext.dependencies`.
   Nothing persists. Without the sandbox the suggestion stands as advice with
   exact DDL.
+- **Parameter sensitivity** — the same query planned along the column's own statistics:
+  constants drawn from the `pg_stats` histogram (p10/p50/p90 positions) or the
+  most_common_vals list, each re-planned with plain EXPLAIN, and the flip boundary
+  reported as a bracket between sweep points — planner estimates by declaration, with
+  the tool refusing (and saying why, citing `pg_stats`) when the statistics cannot
+  support a sweep.
 - **Plan diff** — structural tree alignment with access-method change detection,
   surfaced node by node in the UI.
 - **Collector agent** — holds the database connection, runs the what-if loop, and
