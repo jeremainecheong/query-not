@@ -100,7 +100,10 @@ export function FlameGraph({ layout, plan, selectedId, onSelect }: Props) {
                     className="flame__label"
                     x={x + 8}
                     y={y + ROW_HEIGHT / 2 + 4}
-                    fill={`var(--sev-${bucket}-ink)`}
+                    // Inline style, not the `fill` attribute: SVG presentation
+                    // attributes do not resolve var(), and a CSS rule would
+                    // override the attribute even if they did.
+                    style={{ fill: `var(--sev-${bucket}-ink)` }}
                   >
                     {truncate(cell.label, Math.floor((w - 16) / 6.2))}
                   </text>

@@ -345,9 +345,10 @@ fingerprinting, trends. Plus workload-level index consolidation and write-cost a
 *Query fingerprinting already exists in the agent (it is the privacy boundary), so the
 ingestion work starts from a normalised key rather than raw text.*
 
-**Phase 4 — rewrite advisor.** `libpg_query` AST analysis with empirical equivalence
-checking. *Predicate column extraction exists but works on plan output by regex; this
-phase replaces it with a real parser over the query text.*
+**Phase 4 — rewrite advisor. ✅ Built.** `libpg_query` AST analysis over the query text.
+*Empirical equivalence checking is still outstanding — see §9. What ships instead is an
+explicit `semanticChange` field on every rewrite whose result set can differ, which is
+the honest position until sampling exists to verify it.*
 
 **Phase 5 — CI gate.** Shadow database, baselines, PR checks, migration analysis.
 
@@ -367,10 +368,18 @@ over an IR we already have.
 | Admission control + fingerprinting | `packages/agent/src/safety.ts` |
 | Connection guard (READ ONLY, timeout, rollback) | `packages/agent/src/db.ts` |
 | What-if engine (HypoPG + GUCs) | `packages/agent/src/explain.ts` |
+| Rewrite advisor (AST) | `packages/agent/src/rewrite.ts` |
 | Web UI | `packages/web/` |
+| End-to-end suites | `e2e/` |
 
-132 tests. Core's fixtures are real `EXPLAIN` output from a seeded Postgres, including
-a before/after pair captured either side of a live HypoPG hypothetical index.
+**301 checks** — 161 unit, 78 API end-to-end, 62 browser end-to-end. Core's fixtures are
+real `EXPLAIN` output from a seeded Postgres, including a before/after pair captured
+either side of a live HypoPG hypothetical index.
+
+**Why the rewrite advisor lives in the agent, not core.** Core is pure, engine-neutral
+and imported directly by the browser. `libpg_query` is a wasm build of the actual
+Postgres parser — Postgres-specific by definition, and with no business in a browser
+bundle. The boundary holds: core analyses *plans*, the agent analyses *queries*.
 
 ### Corrections found while building
 
@@ -387,6 +396,17 @@ logic — the class of error that is hardest to notice and most damaging to trus
    function-wrapped column — so an index that cannot work would have shipped as
    high-confidence advice. Type names and non-function keywords are now separate lists.
 
+3. **Flame-graph labels rendered at 2.1:1 against a palette validated at 9.3:1.** The
+   colours were correct; the wiring was not. An SVG `fill` *attribute* cannot resolve
+   `var()`, and a blanket `fill: #fff` in the stylesheet was overriding it regardless.
+   Only a contrast measurement taken in a real browser could catch this — static palette
+   validation had already passed. It is why `e2e/ui.e2e.mjs` computes contrast from
+   rendered pixels rather than trusting the tokens.
+
+A pattern worth naming: all three were in *presentation*, not logic, and all three would
+have read as authoritative. For a tool whose entire proposition is "trust this because
+it was verified", that class of bug is the expensive one.
+
 ---
 
 ## 9. Open decisions
@@ -399,7 +419,11 @@ logic — the class of error that is hardest to notice and most damaging to trus
 3. **Baseline storage for CI** — committed to the repo (reviewable in diffs, noisy)
    or held service-side (clean, invisible)?
 4. **Equivalence-check sampling strategy** — how many rows, and how are they chosen so
-   that edge cases like NULL handling are actually exercised rather than missed?
+   that edge cases like NULL handling are actually exercised rather than missed? Random
+   sampling will systematically miss exactly the cases the riskiest rewrites turn on:
+   `NOT IN` → `NOT EXISTS` only differs when the subquery yields a NULL. Sampling has to
+   be adversarial against the predicate, not uniform. Until it exists, the rewrite
+   advisor states the semantic difference rather than claiming equivalence.
 5. **Multi-plan presentation** — when a query has several plan shapes across parameter
    sets, what is the primary view?
 

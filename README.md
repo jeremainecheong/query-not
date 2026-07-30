@@ -34,15 +34,22 @@ That second sentence is the point. The tool says what it proved and what it didn
   not a model: narration can't hallucinate an index.
 - **Index advisor** — columns extracted from predicates, ordered equality-first, with
   caveats for function-wrapped columns, pattern operators and implicit casts.
+- **Rewrite advisor** — structural anti-patterns found in the SQL itself, using
+  `libpg_query` (the real Postgres parser) rather than regex: function-wrapped columns,
+  `NOT IN` null semantics, deep `OFFSET`, leading-wildcard `LIKE`, `OR` across columns,
+  and scalar subqueries in the select list. Rewrites that change *results* rather than
+  just speed say so explicitly.
 - **What-if engine** — hypothetical indexes via HypoPG, and `work_mem` /
   planner-GUC changes. Every suggestion re-planned and diffed.
-- **Plan diff** — structural tree alignment with access-method change detection.
+- **Plan diff** — structural tree alignment with access-method change detection,
+  surfaced node by node in the UI.
 - **Collector agent** — holds the database connection, runs the what-if loop, and
   normalises query text before anything leaves the network.
-- **Web UI** — findings, exclusive-time flame graph, plan tree, and the proof loop.
+- **Web UI** — findings, exclusive-time flame graph, plan tree, rewrite advice, a
+  settings what-if panel, and the proof loop.
 
-Not yet built: workload ingestion (`pg_stat_statements` / `auto_explain`), the SQL
-rewrite advisor, and the CI gate. See [REQUIREMENTS.md](REQUIREMENTS.md).
+Not yet built: workload ingestion (`pg_stat_statements` / `auto_explain`) and the CI
+gate. See [REQUIREMENTS.md](REQUIREMENTS.md).
 
 ## Getting started
 
@@ -121,14 +128,38 @@ That's what keeps credentials and raw query text inside your network.
 ## Development
 
 ```bash
-npm test        # 132 tests across core and agent
+npm test          # 161 unit tests across core and agent
 npm run typecheck
+npm run test:e2e  # full stack: seeds, starts both servers, 140 checks, tears down
 ```
+
+**301 checks in total** — 161 unit, 78 API end-to-end, 62 browser end-to-end.
 
 Core's test fixtures are **real `EXPLAIN` output** captured from a seeded Postgres
 (`packages/core/test/fixtures/seed.sql`), not hand-written JSON — including a
 before/after pair captured either side of a real HypoPG hypothetical index. Hand-written
 JSON tends to agree with whatever the parser already does.
+
+The end-to-end suites go further, because some things are only observable in the real
+thing: `e2e/api.e2e.mjs` drives every agent endpoint over HTTP against a live database
+(including every refusal path, and a check that nothing was written), and
+`e2e/ui.e2e.mjs` drives the UI in a real browser — every flow, plus layout overflow at
+three viewports, console errors, whether the webfont actually applied, and measured
+colour contrast on the flame graph in both themes.
+
+That last check earned its place: it caught the flame labels rendering at 2.1:1 despite
+a palette validated at 9.3:1. The colours were right; an SVG `fill` attribute cannot
+resolve `var()`, and a CSS rule was overriding it anyway.
+
+### Typography
+
+`-apple-system` leads the font stack, so Apple devices render SF Pro from the OS.
+Everyone else gets [Inter](https://rsms.me/inter/), self-hosted and bundled — no runtime
+CDN request, so the app works offline and under a strict CSP.
+
+SF Pro is deliberately *not* vendored: Apple's licence covers UI mockups for
+Apple-platform apps and does not permit self-hosting the font on the web. Inter was
+designed as an SF-alike and is SIL OFL.
 
 ## Prior art
 

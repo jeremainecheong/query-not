@@ -23,6 +23,7 @@ import {
 
 import type { Database } from './db.ts';
 import { admitGucs, admitIndexDdl, admitQuery, fingerprint } from './safety.ts';
+import { analyzeRewrites, type RewriteFinding } from './rewrite.ts';
 
 export class AgentError extends Error {
   readonly hint: string | null;
@@ -48,6 +49,8 @@ export interface Analysis {
   plan: QueryPlan;
   findings: Finding[];
   indexSuggestions: IndexSuggestion[];
+  /** Structural anti-patterns found in the SQL text itself, via the AST. */
+  rewrites: RewriteFinding[];
   narration: string;
   flame: FlameLayout;
   fingerprint: string;
@@ -110,10 +113,23 @@ export async function analyzeQuery(
   opts: ExplainOptions = {},
 ): Promise<Analysis> {
   const plan = await runExplain(db, sql, opts);
+
+  // The rewrite advisor is independent of the plan — it reads the SQL. If its
+  // parser disagrees with the server (it is pinned to one Postgres major and
+  // the target may be another), that is not a reason to fail an analysis that
+  // otherwise succeeded.
+  let rewrites: RewriteFinding[] = [];
+  try {
+    rewrites = analyzeRewrites(sql);
+  } catch (err) {
+    console.warn('[agent] rewrite analysis skipped:', err instanceof Error ? err.message : err);
+  }
+
   return {
     plan,
     findings: analyze(plan),
     indexSuggestions: suggestIndexes(plan),
+    rewrites,
     narration: narratePlan(plan),
     flame: layoutFlame(plan),
     fingerprint: fingerprint(sql),
