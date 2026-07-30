@@ -4,7 +4,10 @@ A PostgreSQL query optimiser that doesn't just *show* you a slow plan — it pro
 would fix it.
 
 Status: **all five phases built**. This document captures decisions
-made, problems identified, and questions still open. See §8 for what exists today.
+made, problems identified, and questions still open. See §8 for what exists today,
+or watch the [narrated demo](docs/demo/query-not-demo.mp4) — four minutes of real,
+measured output, including a generated rewrite proven end-to-end and one the tool
+talks you out of.
 
 ---
 

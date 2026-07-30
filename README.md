@@ -22,6 +22,18 @@ rewrite the SQL — then re-plan and diff. Suggestions arrive with evidence atta
 
 That second sentence is the point. The tool says what it proved and what it didn't.
 
+## Demo
+
+[![query-not — narrated demo](docs/demo/poster.png)](docs/demo/query-not-demo.mp4)
+
+**[▶ Watch the demo](docs/demo/query-not-demo.mp4)** — 4 minutes, narrated and
+captioned ([subtitles](docs/demo/query-not-demo.srt)). Everything on screen is real,
+measured output against a seeded 4-million-row database: the hero query's
+87,748 → 422 index proof, the plan graph with its ringed hotspot, the operation
+reference, the generated `LEFT JOIN` rewrite proven with `customers_pkey` cited
+from the catalog and 19,999 rows compared — and the generated rewrite the tool
+itself tells you not to apply. The CI gate fails a build on camera.
+
 ## What works today
 
 - **Plan IR + parser** — engine-neutral, from `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`.
