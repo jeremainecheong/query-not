@@ -25,6 +25,7 @@ import {
 } from './explain.ts';
 import { fingerprint, TUNABLE_GUCS } from './safety.ts';
 import { analyzeRewrites, initParser, SqlParseError } from './rewrite.ts';
+import { consolidateWorkload } from './consolidate.ts';
 import { Store } from './store.ts';
 import { buildHistory } from './history.ts';
 import { listIndexInventory, proveDropIndex } from './dropindex.ts';
@@ -139,6 +140,9 @@ app.get('/api/health', async (_req, res) => {
       // parser, no extension — surfaced so the UI gates the sweep button
       // rather than offering a broken one.
       sensitivity: probe.connected && parserReady,
+      // Workload consolidation proves via hypothetical indexes, so it is
+      // gated by the same extension as whatIfIndex.
+      consolidateIndexes: probe.hypopgInstalled,
       persistence: true,
     },
   });
@@ -372,6 +376,31 @@ app.post('/api/whatif/drop-index', async (req, res) => {
       throw new AgentError('"schema" must be a string or null.');
     }
     res.json(await proveDropIndex(db, store, index, typeof schema === 'string' ? schema : null));
+/**
+ * Consolidate the workload's index demands into a few composite candidates and
+ * prove each one against every in-scope statement via hypothetical indexes.
+ *
+ * No SQL in the body: the scope is derived server-side from the workload
+ * window and the saved queries, the same way /api/whatif/rewrite derives its
+ * candidate — so the proof can only ever describe what the agent itself
+ * assembled.
+ */
+app.post('/api/workload/consolidate', async (req, res) => {
+  try {
+    const body = req.body ?? {};
+    const includeSaved = body.includeSaved === undefined ? true : body.includeSaved;
+    if (typeof includeSaved !== 'boolean') {
+      throw new AgentError('"includeSaved" must be a boolean.');
+    }
+    const limit = body.limit === undefined ? 12 : body.limit;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 25) {
+      throw new AgentError('"limit" must be an integer between 1 and 25.');
+    }
+    const maxCandidates = body.maxCandidates === undefined ? 5 : body.maxCandidates;
+    if (!Number.isInteger(maxCandidates) || maxCandidates < 1 || maxCandidates > 8) {
+      throw new AgentError('"maxCandidates" must be an integer between 1 and 8.');
+    }
+    res.json(await consolidateWorkload(db, store, { includeSaved, limit, maxCandidates }));
   } catch (err) {
     fail(res, err);
   }
