@@ -827,6 +827,43 @@ section('Workload page');
   await ctx.close();
 }
 
+section('Workload consolidation');
+{
+  const { ctx, page, errors } = await newPage();
+  // Deterministic setup through the same origin the browser uses (the dev
+  // server proxies /api to the agent): two saved stand-ins with a shared
+  // prefix demand, and a snapshot so a window exists even standalone.
+  const post = (path, body) => fetch(new globalThis.URL(path, URL), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  await post('/api/saved', { name: 'ui-wl-a', sql: "SELECT * FROM orders WHERE status = 'disputed' AND created_at > '2024-03-01'" });
+  await post('/api/saved', { name: 'ui-wl-b', sql: "SELECT * FROM orders WHERE status = 'disputed'" });
+  await post('/api/workload/snapshot', {});
+
+  await page.goto(new globalThis.URL('/workload', URL).toString(), { waitUntil: 'networkidle' });
+  await page.waitForSelector('.workload-row', { timeout: 60000 });
+
+  const button = page.locator('.consolidation button:has-text("Find one index for many queries")');
+  check('the consolidation section renders under the entries', (await button.count()) > 0);
+  check('the saved stand-in checkbox is on by default',
+    await page.locator('.consolidation .toggle input').isChecked());
+
+  await button.click();
+  await page.waitForSelector('.consolidation .proof__verdict', { timeout: 90000 });
+  check('a candidate card shows its verdict',
+    (await page.locator('.consolidation .proof__verdict').first().innerText()).trim().length > 0);
+  const consolidationText = await page.locator('.consolidation').innerText();
+  check('the merged orders index is among the candidates',
+    consolidationText.includes('CREATE INDEX CONCURRENTLY ON orders (status, created_at);'),
+    consolidationText.slice(0, 200));
+  check('per-query claims and sentinels are distinguishable',
+    (await page.locator('.consolidation .pill', { hasText: 'claimed' }).count()) > 0);
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-consolidation.png`, fullPage: true });
+  await ctx.close();
+}
+
 section('Decisions page');
 {
   const { ctx, page, errors } = await newPage();

@@ -1000,6 +1000,96 @@ check('equality on a unique column refuses with the n_distinct lesson',
   uniqueEq.status === 400 && /n_distinct/.test(uniqueEq.body.error ?? ''), uniqueEq.body.error);
 check('a write refuses through the same admission gate',
   (await call('/api/whatif/sensitivity', { sql: 'DELETE FROM orders WHERE id < 5' })).status === 400);
+// ── Workload consolidation ───────────────────────────────────────────────────
+
+section('Workload consolidation (one index proven against many queries)');
+check('consolidation is advertised as a capability',
+  (await call('/api/health')).body.capabilities?.consolidateIndexes === true);
+
+// Four saved queries with overlapping demands on orders: wl-b's status-only
+// demand must fold into wl-a's (status, created_at) as its prefix; wl-c fails
+// the selectivity gate (qty > 3 keeps a quarter of the table) and becomes a
+// regression sentinel; wl-d is a single-query demand that belongs to the
+// per-query advisor, not to consolidation.
+const WL_A = "SELECT * FROM orders WHERE status = 'disputed' AND created_at > '2024-03-01'";
+const WL_B = "SELECT * FROM orders WHERE status = 'disputed'";
+const WL_C = 'SELECT * FROM order_items WHERE qty > 3';
+const WL_D = 'SELECT * FROM orders WHERE customer_id = 4242';
+for (const [name, sql] of [['wl-a', WL_A], ['wl-b', WL_B], ['wl-c', WL_C], ['wl-d', WL_D]]) {
+  await call('/api/saved', { name, sql });
+}
+
+// A window must exist — consolidate never auto-snapshots.
+await call('/api/workload/snapshot', {});
+for (const sql of [WL_A, WL_B, WL_C, WL_D]) await call('/api/analyze', { sql, analyze: true });
+await call('/api/workload/snapshot', {});
+
+const cons = await call('/api/workload/consolidate', { includeSaved: true, limit: 25 });
+check('consolidate answers 200 with a delta window', cons.status === 200 && cons.body.window?.isDelta === true,
+  JSON.stringify(cons.body).slice(0, 160));
+
+// The agent's own traffic records as EXPLAIN utility statements and $n-normalised
+// internals, so the window entries are skipped with their reasons and the saved
+// queries join the scope as runnable stand-ins.
+check('unexplainable window entries are skipped with the normalised-form reason',
+  (cons.body.scope?.skipped ?? []).some((s) => /normalised form/.test(s.reason)),
+  (cons.body.scope?.skipped ?? []).map((s) => s.reason.slice(0, 40)).join(' | '));
+check('the report says how many entries were skipped as unexplainable',
+  /\d+ of the \d+ window entries considered were skipped as unexplainable/.test(cons.body.summary ?? ''),
+  cons.body.summary);
+
+const orders = (cons.body.candidates ?? []).find((c) => c.relation === 'orders');
+check('the status-only demand folds into one orders candidate', Boolean(orders),
+  JSON.stringify((cons.body.candidates ?? []).map((c) => [c.relation, c.columns])));
+check('columns are exactly (status, created_at) — equality first',
+  orders?.columns?.join(',') === 'status,created_at', orders?.columns?.join(','));
+check('roles mark created_at as the range column', orders?.roles?.join(',') === 'eq,range');
+check('the candidate claims both merged statements',
+  orders?.claims?.includes('select * from orders where status = ?') &&
+  orders?.claims?.includes('select * from orders where status = ? and created_at > ?'),
+  JSON.stringify(orders?.claims));
+check('it would replace the narrower status-only index',
+  JSON.stringify(orders?.replaces) === '[{"relation":"orders","columns":["status"]}]' &&
+  /replace 1 narrower single-query index/.test(orders?.summary ?? ''),
+  orders?.summary);
+
+const claimedRows = (orders?.perQuery ?? []).filter((r) => r.claimed);
+check('both claimed statements prove improved, cost measured lower',
+  claimedRows.length === 2 &&
+  claimedRows.every((r) => r.verdict === 'improved' && r.costAfter < r.costBefore),
+  JSON.stringify(claimedRows.map((r) => [r.savedName, r.verdict, r.costBefore, r.costAfter])));
+const sentinelC = (orders?.perQuery ?? []).find((r) => r.savedName === 'wl-c');
+check('the below-gate query rides along as an unclaimed sentinel',
+  sentinelC?.claimed === false && sentinelC?.verdict === 'unchanged',
+  JSON.stringify(sentinelC));
+check('the sentinel query is marked noDemand in scope',
+  cons.body.scope?.queries?.find((q) => q.savedName === 'wl-c')?.noDemand === true);
+check('nothing regressed and the portfolio verdict is improved',
+  orders?.regressed === 0 && orders?.verdict === 'improved');
+check('saved extras carry no window weight and the summary says so',
+  orders?.servedShare === 0 && /outside the measured window/.test(orders?.summary ?? ''),
+  orders?.summary);
+check('the result is cost-only with the isolation caveat',
+  orders?.costOnly === true && /planner cost estimates/.test(orders?.note ?? '') &&
+  /proven alone/.test(orders?.note ?? ''), orders?.note);
+
+check('the single-query customer_id demand is refused into standalone',
+  (cons.body.standalone ?? []).some((s) => s.relation === 'orders' && s.columns.join(',') === 'customer_id'),
+  JSON.stringify(cons.body.standalone));
+
+check('a decision was auto-recorded with the candidate DDL', typeof orders?.decisionId === 'number' &&
+  (await call('/api/decisions')).body.decisions.some(
+    (d) => d.kind === 'index' && d.change === orders?.ddl && d.costOnly === true),
+  String(orders?.decisionId));
+
+const consNoSaved = await call('/api/workload/consolidate', { includeSaved: false });
+check('includeSaved:false leaves saved queries out — no orders candidate',
+  consNoSaved.status === 200 &&
+  !(consNoSaved.body.candidates ?? []).some((c) => c.relation === 'orders'),
+  JSON.stringify((consNoSaved.body.candidates ?? []).map((c) => c.relation)));
+check('a zero limit is rejected', (await call('/api/workload/consolidate', { limit: 0 })).status === 400);
+check('a non-boolean includeSaved is rejected',
+  (await call('/api/workload/consolidate', { includeSaved: 'yes' })).status === 400);
 
 // ── Verify the database was never mutated ────────────────────────────────────
 
