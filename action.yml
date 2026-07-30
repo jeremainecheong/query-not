@@ -1,0 +1,99 @@
+# The `querynot ci` plan-regression gate, packaged so a consumer repository can
+# run it with one `uses:` line. Two checkouts share the runner: the consumer's
+# repository at github.workspace, and this repository at github.action_path.
+# The CLI is installed and built in the second and reads queries and baseline
+# from the first — every path below says which checkout it means.
+name: query-not plan gate
+description: >-
+  Plan queries against a CI Postgres and fail the build when a plan regresses
+  against a committed baseline — an index no longer used, or estimated cost
+  risen past the allowed threshold.
+
+inputs:
+  database-url:
+    description: >-
+      Connection string for the Postgres the queries are planned against,
+      typically a service container seeded by the consumer's migrations. The
+      gate only plans — plain EXPLAIN inside a read-only transaction, nothing
+      executed.
+    required: true
+  queries:
+    description: >-
+      Path to the query file — a JSON object of { name: sql } — relative to
+      the consumer repository root.
+    required: false
+    default: queries.json
+  baseline:
+    description: >-
+      Path to the committed baseline, relative to the consumer repository
+      root.
+    required: false
+    default: .querynot/baseline.json
+  max-cost-increase:
+    description: >-
+      Fractional rise in estimated cost tolerated before failing (0.20 = 20%).
+    required: false
+    default: '0.20'
+  record-baseline:
+    description: >-
+      When 'true', run `querynot baseline` instead of the gate — plan every
+      query and write the baseline file for the workflow to commit. For the
+      bootstrap workflow on the default branch.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    # Installed and built inside the action's own checkout, not the consumer
+    # workspace — npm ci must see this repository's lockfile, not theirs. Only
+    # core is compiled; the CLI runs from source under
+    # --experimental-strip-types.
+    - name: Build query-not
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        # This repository's e2e dependency would otherwise download browsers
+        # the gate never uses.
+        PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      run: |
+        npm ci
+        npm run build --workspace @query-not/core
+
+    # Both CLI steps address the consumer's files by absolute path built from
+    # github.workspace, so nothing depends on the step's working directory.
+    - name: Record plan baselines
+      if: inputs.record-baseline == 'true'
+      shell: bash
+      env:
+        QUERYNOT_DATABASE_URL: ${{ inputs.database-url }}
+        QUERIES: ${{ inputs.queries }}
+        BASELINE: ${{ inputs.baseline }}
+      run: |
+        node "${{ github.action_path }}/packages/agent/bin/querynot.mjs" baseline \
+          "$GITHUB_WORKSPACE/$QUERIES" \
+          --baseline "$GITHUB_WORKSPACE/$BASELINE"
+
+    # The CLI's exit code becomes the step's: 1 on a regression, 2 on a
+    # missing baseline or database error. Either fails the job.
+    - name: Check plans against the baseline
+      if: inputs.record-baseline != 'true'
+      shell: bash
+      env:
+        QUERYNOT_DATABASE_URL: ${{ inputs.database-url }}
+        QUERIES: ${{ inputs.queries }}
+        BASELINE: ${{ inputs.baseline }}
+        MAX_COST_INCREASE: ${{ inputs.max-cost-increase }}
+      run: |
+        node "${{ github.action_path }}/packages/agent/bin/querynot.mjs" ci \
+          "$GITHUB_WORKSPACE/$QUERIES" \
+          --baseline "$GITHUB_WORKSPACE/$BASELINE" \
+          --max-cost-increase "$MAX_COST_INCREASE"
+
+branding:
+  icon: database
+  color: blue
