@@ -396,8 +396,10 @@ app.post('/api/whatif/rewrite', async (req, res) => {
   try {
     const sql = requireSql(req.body);
     const kind = req.body?.kind;
-    if (kind !== 'not-in-subquery' && kind !== 'not-in-list' && kind !== 'function-on-column') {
-      throw new AgentError('kind must be "not-in-subquery", "not-in-list" or "function-on-column".');
+    const provable = ['not-in-subquery', 'not-in-list', 'function-on-column',
+                      'or-across-columns', 'correlated-subquery-in-select'] as const;
+    if (!provable.includes(kind)) {
+      throw new AgentError(`kind must be one of ${provable.map((k) => `"${k}"`).join(', ')}.`);
     }
     const location = req.body?.location ?? null;
     if (location !== null && typeof location !== 'number') {
