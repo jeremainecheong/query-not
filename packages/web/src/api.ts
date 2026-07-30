@@ -31,12 +31,35 @@ export interface Health {
     whatIfSettings: boolean;
     measuredAnalysis: boolean;
     rewriteAdvisor: boolean;
+    /** Generated rewrites can be proven — needs a connection and the parser. */
+    proveRewrite?: boolean;
     persistence: boolean;
   };
   store?: { analyses: number; savedQueries: number; decisions: number; queries: number };
 }
 
 export type RewriteSeverity = 'critical' | 'warning' | 'info';
+
+/** A schema fact a generated rewrite depends on, established at prove time. */
+export interface RewritePrecondition {
+  kind: string;
+  relation: string[];
+  column: string;
+  why: string;
+}
+
+/** A ready-to-run rewritten statement, generated and structurally validated. */
+export interface CandidateRewrite {
+  kind: string;
+  sql: string;
+  byteSpan: { start: number; end: number };
+  /** The replaced region in UTF-16 units, for highlighting. */
+  charSpan: { start: number; end: number };
+  replaced: string;
+  replacement: string;
+  preconditions: RewritePrecondition[];
+  rationale: string;
+}
 
 export interface RewriteFinding {
   kind: string;
@@ -48,6 +71,10 @@ export interface RewriteFinding {
   semanticChange: string | null;
   location: number | null;
   snippet: string | null;
+  /** Present when the agent generated the optimised statement itself. */
+  candidate?: CandidateRewrite | null;
+  /** Why no candidate was generated, when the kind supports one. */
+  candidateBlocked?: string | null;
 }
 
 export interface SavedQuery {
@@ -195,10 +222,47 @@ export interface WhatIfResult {
   before: QueryPlan;
   after: QueryPlan;
   diff: PlanDiff;
-  change: { kind: 'index'; ddl: string } | { kind: 'settings'; settings: Record<string, string> };
+  change:
+    | { kind: 'index'; ddl: string }
+    | { kind: 'settings'; settings: Record<string, string> }
+    | { kind: 'rewrite'; sql: string };
   findingsAfter: Finding[];
   costOnly: boolean;
   note: string | null;
+}
+
+/** A precondition verdict from the catalog, with citable evidence. */
+export interface PreconditionCheck {
+  spec: RewritePrecondition & { role?: string; oneOf?: string[] };
+  established: boolean;
+  evidence: string;
+}
+
+export interface EquivalenceResult {
+  status: 'match' | 'mismatch' | 'not-checkable' | 'too-many-rows';
+  rowsOriginal: number | null;
+  rowsRewritten: number | null;
+  onlyInOriginal: number | null;
+  onlyInRewritten: number | null;
+  comparedAs: 'native' | 'text' | null;
+  note: string;
+}
+
+export type RewriteProofOutcome =
+  | 'proven'
+  | 'improved-unverified'
+  | 'no-effect'
+  | 'regressed'
+  | 'differed'
+  | 'advice-only';
+
+export interface RewriteProof {
+  candidate: CandidateRewrite;
+  preconditions: PreconditionCheck[];
+  outcome: RewriteProofOutcome;
+  planDiff: WhatIfResult | null;
+  equivalence: EquivalenceResult | null;
+  note: string;
 }
 
 export class ApiError extends Error {
@@ -254,6 +318,14 @@ export const api = {
   /** Rewrite advice alone — needs no database connection. */
   rewrite: (sql: string) => request<{ rewrites: RewriteFinding[] }>('/api/rewrite', { sql }),
 
+  /**
+   * Prove a generated rewrite. Only the finding's coordinates are sent — the
+   * candidate is re-derived server-side, so the proof always describes the
+   * agent's own transform of this SQL.
+   */
+  whatIfRewrite: (sql: string, kind: string, location: number | null) =>
+    request<RewriteProof>('/api/whatif/rewrite', { sql, kind, location }),
+
   // ── Persistence ────────────────────────────────────────────────────────────
 
   /** Re-open a recorded analysis. This is what a shared link resolves to. */
@@ -287,7 +359,7 @@ export const api = {
   recordDecision: (input: {
     analysisSlug: string | null;
     fingerprint: string;
-    kind: 'index' | 'settings';
+    kind: 'index' | 'settings' | 'rewrite';
     change: string;
     verdict: string;
     headline: string;

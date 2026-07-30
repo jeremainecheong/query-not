@@ -346,9 +346,12 @@ fingerprinting, trends. Plus workload-level index consolidation and write-cost a
 ingestion work starts from a normalised key rather than raw text.*
 
 **Phase 4 — rewrite advisor. ✅ Built.** `libpg_query` AST analysis over the query text.
-*Empirical equivalence checking is still outstanding — see §9. What ships instead is an
-explicit `semanticChange` field on every rewrite whose result set can differ, which is
-the honest position until sampling exists to verify it.*
+*Extended: for three kinds — `NOT IN (SELECT …)`, `NOT IN (list)`, `date(col)` ranges —
+the advisor now generates the optimised statement itself and proves it: schema
+preconditions established from the catalog (nullability, column types), the rewrite
+re-planned and diffed, and both forms' complete result sets compared in one statement.
+Every other kind keeps the explicit `semanticChange` field and stays advice — see §9.4
+for how the equivalence question was actually resolved.*
 
 **Phase 5 — CI gate. ✅ Built.** Baselines and PR checks via `querynot ci`. *The shadow
 database is still outstanding — the gate currently plans against whatever database it is
@@ -436,12 +439,17 @@ it was verified", that class of bug is the expensive one.
    only the agent can see production statistics?
 3. **Baseline storage for CI** — committed to the repo (reviewable in diffs, noisy)
    or held service-side (clean, invisible)?
-4. **Equivalence-check sampling strategy** — how many rows, and how are they chosen so
-   that edge cases like NULL handling are actually exercised rather than missed? Random
-   sampling will systematically miss exactly the cases the riskiest rewrites turn on:
-   `NOT IN` → `NOT EXISTS` only differs when the subquery yields a NULL. Sampling has to
-   be adversarial against the predicate, not uniform. Until it exists, the rewrite
-   advisor states the semantic difference rather than claiming equivalence.
+4. **Equivalence-check sampling strategy** — ✅ *resolved for the generated rewrites, by
+   sidestepping it.* The worry was that random sampling systematically misses exactly the
+   cases the riskiest rewrites turn on — `NOT IN` → `NOT EXISTS` only differs when a NULL
+   appears. The shipped answer does not sample. It establishes the *structural
+   precondition* from the catalog first (`attnotnull` on both columns is what removes the
+   NULL divergence entirely), refuses to run anything when it cannot, and then compares
+   the **complete** result sets of both forms with `EXCEPT ALL` in one statement, up to a
+   row cap — refusing honestly, rather than extrapolating, above the cap or under LIMIT,
+   where tie-breaking makes any row-level claim unsound. Adversarial sampling remains the
+   open question only for rewrites whose safety has no catalog-decidable precondition,
+   which is precisely why those stay advice.
 5. **Multi-plan presentation** — when a query has several plan shapes across parameter
    sets, what is the primary view?
 

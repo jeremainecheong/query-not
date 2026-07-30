@@ -396,6 +396,118 @@ if (wl0.body.availability?.installed) {
     typeof wl0.body.availability?.reason === 'string' && typeof wl0.body.availability?.hint === 'string');
 }
 
+// ── Generated rewrites, proven ───────────────────────────────────────────────
+
+section('Prove a generated rewrite');
+
+// Small enough to stay under the equivalence row cap, big enough to mean it.
+const NOT_IN_SQL =
+  'SELECT o.id FROM orders o WHERE o.id < 30000 AND o.id NOT IN (SELECT oi.order_id FROM order_items oi WHERE oi.qty > 3)';
+const genRw = await call('/api/rewrite', { sql: NOT_IN_SQL });
+const genFinding = (genRw.body.rewrites ?? []).find((r) => r.kind === 'not-in-subquery');
+check('the finding carries the generated statement',
+  typeof genFinding?.candidate?.sql === 'string' && genFinding.candidate.sql.includes('NOT EXISTS'),
+  genFinding?.candidateBlocked ?? 'no candidate');
+
+const smellyRw = (rewrite.body.rewrites ?? []).find((r) => r.kind === 'not-in-subquery');
+check('the smelly query gets one too', typeof smellyRw?.candidate?.sql === 'string',
+  smellyRw?.candidateBlocked ?? '');
+
+const proof = await call('/api/whatif/rewrite', {
+  sql: NOT_IN_SQL, kind: 'not-in-subquery', location: genFinding?.location ?? null,
+  // Must be ignored: the server derives its own candidate from the SQL.
+  candidateSql: 'SELECT 1',
+});
+check('the proof endpoint answers', proof.status === 200, JSON.stringify(proof.body).slice(0, 200));
+check('both NOT NULL preconditions are established with cited evidence',
+  proof.body.preconditions?.length === 2 &&
+  proof.body.preconditions.every((p) => p.established && /NOT NULL/.test(p.evidence)),
+  JSON.stringify(proof.body.preconditions ?? []).slice(0, 200));
+check('rows were compared and matched',
+  proof.body.equivalence?.status === 'match' &&
+  proof.body.equivalence.rowsOriginal === proof.body.equivalence.rowsRewritten,
+  JSON.stringify(proof.body.equivalence ?? {}).slice(0, 160));
+check('the note claims equivalence on this data, not in general',
+  /on this data/.test(proof.body.note ?? ''), proof.body.note);
+check('the injected candidate SQL was ignored',
+  proof.body.candidate?.sql !== 'SELECT 1' && /NOT EXISTS/.test(proof.body.candidate?.sql ?? ''));
+check('a plan diff is attached with the rewrite as the change',
+  proof.body.planDiff?.change?.kind === 'rewrite' &&
+  ['proven', 'no-effect'].includes(proof.body.outcome),
+  `outcome ${proof.body.outcome}`);
+
+// The date() range rewrite against an indexed timestamp column: the range form
+// can use the index, date() cannot, so this one should prove outright.
+const day = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+const DATE_SQL = `SELECT id, applied_at FROM promotions WHERE date(applied_at) = '${day}'`;
+const dateRw = await call('/api/rewrite', { sql: DATE_SQL });
+const dateFinding = (dateRw.body.rewrites ?? []).find((r) => r.kind === 'function-on-column');
+const dateProof = await call('/api/whatif/rewrite', {
+  sql: DATE_SQL, kind: 'function-on-column', location: dateFinding?.location ?? null,
+});
+check('the date() rewrite proves end to end', dateProof.body.outcome === 'proven',
+  `outcome ${dateProof.body.outcome}: ${dateProof.body.note}`);
+check('the plan verdict behind it is improved',
+  dateProof.body.planDiff?.diff?.summary?.verdict === 'improved');
+check('a plain timestamp column does not hedge about TimeZone',
+  !/TimeZone/.test(dateProof.body.note ?? ''), dateProof.body.note);
+
+// The negative case the whole design exists for: a genuinely nullable column.
+const NULLABLE_SQL =
+  'SELECT o.id FROM orders o WHERE o.id < 30000 AND o.id NOT IN (SELECT p.order_id FROM promotions p)';
+const nullProof = await call('/api/whatif/rewrite', {
+  sql: NULLABLE_SQL, kind: 'not-in-subquery',
+  location: (await call('/api/rewrite', { sql: NULLABLE_SQL }))
+    .body.rewrites?.find((r) => r.kind === 'not-in-subquery')?.location ?? null,
+});
+check('a nullable column downgrades to advice-only', nullProof.body.outcome === 'advice-only',
+  `outcome ${nullProof.body.outcome}`);
+check('nothing was executed for it',
+  nullProof.body.planDiff === null && nullProof.body.equivalence === null);
+check('the refusal names the nullable column',
+  nullProof.body.preconditions?.some((p) => !p.established && /order_id.*nullable/.test(p.evidence)),
+  JSON.stringify(nullProof.body.preconditions ?? []).slice(0, 200));
+
+// LIMIT makes row-level claims unsound however carefully they are executed; a
+// naive implementation reports "proven" here, and this check forbids that.
+const LIMIT_SQL = `SELECT id FROM promotions WHERE date(applied_at) = '${day}' ORDER BY id LIMIT 5`;
+const limitProof = await call('/api/whatif/rewrite', {
+  sql: LIMIT_SQL, kind: 'function-on-column',
+  location: (await call('/api/rewrite', { sql: LIMIT_SQL }))
+    .body.rewrites?.find((r) => r.kind === 'function-on-column')?.location ?? null,
+});
+check('LIMIT refuses row verification with the tie-breaking reason',
+  limitProof.body.equivalence?.status === 'not-checkable' &&
+  /tie-breaking/.test(limitProof.body.equivalence?.note ?? ''),
+  JSON.stringify(limitProof.body.equivalence ?? {}).slice(0, 160));
+// Which outcome the planner picks here is its own business — with LIMIT the
+// original's date() form has no statistics and its estimate can be wrongly
+// optimistic, so even `regressed` is a legitimate cost-only verdict. The
+// invariant is narrower and absolute: no proof without row verification.
+check('and the outcome is never proven',
+  limitProof.body.outcome !== 'proven' && limitProof.body.outcome !== 'differed',
+  `outcome ${limitProof.body.outcome}`);
+
+section('Prove endpoint refusals');
+const badKind = await call('/api/whatif/rewrite', { sql: NOT_IN_SQL, kind: 'select-star', location: 0 });
+check('a kind outside Tier A is refused', badKind.status === 400);
+const staleLoc = await call('/api/whatif/rewrite', { sql: NOT_IN_SQL, kind: 'not-in-subquery', location: 424242 });
+check('a stale location is a conflict, not a guess', staleLoc.status === 409);
+const lowerRw = await call('/api/rewrite', { sql: "SELECT id FROM orders WHERE lower(status) = 'x'" });
+const lowerLoc = lowerRw.body.rewrites?.find((r) => r.kind === 'function-on-column')?.location ?? null;
+const lowerProof = await call('/api/whatif/rewrite', {
+  sql: "SELECT id FROM orders WHERE lower(status) = 'x'", kind: 'function-on-column', location: lowerLoc,
+});
+check('a blocked candidate explains itself instead of running',
+  lowerProof.status === 409 && /no range equivalent/.test(lowerProof.body.error ?? ''),
+  JSON.stringify(lowerProof.body).slice(0, 160));
+
+const rwDecision = await call('/api/decisions', {
+  kind: 'rewrite', change: proof.body.candidate?.sql ?? 'x', verdict: proof.body.outcome ?? 'proven',
+  headline: proof.body.note ?? '', fingerprint: 'e2e-rewrite', costOnly: false,
+});
+check('decisions accept kind rewrite', rwDecision.status === 200, JSON.stringify(rwDecision.body).slice(0, 120));
+
 // ── Verify the database was never mutated ────────────────────────────────────
 
 section('Nothing was written');

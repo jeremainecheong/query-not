@@ -39,6 +39,16 @@ That second sentence is the point. The tool says what it proved and what it didn
   `NOT IN` null semantics, deep `OFFSET`, leading-wildcard `LIKE`, `OR` across columns,
   and scalar subqueries in the select list. Rewrites that change *results* rather than
   just speed say so explicitly.
+- **Generated rewrites, proven** — for three kinds, the advisor writes the optimised
+  statement itself: `NOT IN (SELECT …)` → `NOT EXISTS`, `NOT IN (list)` → a VALUES
+  anti-join, `date(col) = 'D'` → a half-open range an index can serve. "Prove it" then
+  establishes the schema facts that make the rewrite safe (`NOT IN` and `NOT EXISTS`
+  only diverge where a NULL can appear — so both columns' `attnotnull` is checked, in
+  your database, and cited), re-plans both forms and diffs them, and compares the
+  complete result sets in a single statement. A nullable column downgrades the whole
+  thing to advice; `LIMIT` refuses row verification outright, because which rows survive
+  a limit depends on tie-breaking and the rewrite changes the plan doing the breaking.
+  **Proven** means all three legs held — and the verdict sentence cites them.
 - **What-if engine** — hypothetical indexes via HypoPG, and `work_mem` /
   planner-GUC changes. Every suggestion re-planned and diffed.
 - **Plan diff** — structural tree alignment with access-method change detection,
@@ -200,12 +210,12 @@ rests on.
 ## Development
 
 ```bash
-npm test          # 208 unit tests across core and agent
+npm test          # 250 unit tests across core and agent
 npm run typecheck
-npm run test:e2e  # full stack, cold: 406 checks plus a production-bundle run
+npm run test:e2e  # full stack, cold: 442 checks plus a production-bundle run
 ```
 
-**614 checks in total** — 208 unit, 116 API end-to-end, 145 browser end-to-end, and the
+**692 checks in total** — 250 unit, 136 API end-to-end, 153 browser end-to-end, and the
 whole browser suite again against the production bundle served by the agent. The dev
 server and the built artifact are different things; verifying only the first ships a
 build nobody ran.

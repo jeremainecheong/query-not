@@ -216,6 +216,14 @@ async function cmdRewrite(args: Args): Promise<number> {
       console.log(`${mark} ${c(BOLD, r.title)}`);
       console.log(`  ${r.detail}`);
       console.log(`  ${c(DIM, `→ ${r.suggestion}`)}`);
+      if (r.candidate) {
+        // Generated but unproven: the CLI has no database, so the label says
+        // exactly which half is missing rather than implying none is.
+        console.log(`  ${c(BOLD, 'Generated rewrite')} ${c(DIM, '(unproven — prove it against a database)')}`);
+        for (const line of r.candidate.sql.split('\n')) console.log(`    ${line}`);
+      } else if (r.candidateBlocked) {
+        console.log(`  ${c(DIM, `No generated rewrite: ${r.candidateBlocked}.`)}`);
+      }
       if (r.semanticChange) console.log(`  ${c(YELLOW, `⚠ Changes results: ${r.semanticChange}`)}`);
       console.log();
     }

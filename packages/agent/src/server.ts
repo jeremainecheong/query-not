@@ -18,6 +18,7 @@ import {
   analyzeQuery,
   verifySuggestions,
   whatIfIndex,
+  whatIfRewrite,
   whatIfSettings,
 } from './explain.ts';
 import { fingerprint, TUNABLE_GUCS } from './safety.ts';
@@ -87,6 +88,9 @@ app.get('/api/health', async (_req, res) => {
       whatIfSettings: probe.connected,
       measuredAnalysis: probe.connected,
       rewriteAdvisor: parserReady,
+      // The one what-if that can be executed rather than just costed — it
+      // needs a connection and the parser, and no extension at all.
+      proveRewrite: probe.connected && parserReady,
       persistence: true,
     },
   });
@@ -325,8 +329,8 @@ app.delete('/api/saved/:name', (req, res) => {
 app.post('/api/decisions', (req, res) => {
   try {
     const body = req.body ?? {};
-    if (body.kind !== 'index' && body.kind !== 'settings') {
-      throw new AgentError('kind must be "index" or "settings".');
+    if (body.kind !== 'index' && body.kind !== 'settings' && body.kind !== 'rewrite') {
+      throw new AgentError('kind must be "index", "settings" or "rewrite".');
     }
     if (typeof body.change !== 'string' || body.change.trim().length === 0) {
       throw new AgentError('Provide the "change" that was tested.');
@@ -375,6 +379,31 @@ app.post('/api/whatif/index', async (req, res) => {
       throw new AgentError('Provide a "ddl" string containing a CREATE INDEX statement.');
     }
     res.json(await whatIfIndex(db, sql, ddl));
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+/**
+ * Prove a generated rewrite.
+ *
+ * The client sends the finding's coordinates, never candidate SQL — the
+ * candidate is re-derived from the submitted statement server-side, so a proof
+ * can only describe this agent's own transform. Anything else in the body is
+ * ignored on purpose.
+ */
+app.post('/api/whatif/rewrite', async (req, res) => {
+  try {
+    const sql = requireSql(req.body);
+    const kind = req.body?.kind;
+    if (kind !== 'not-in-subquery' && kind !== 'not-in-list' && kind !== 'function-on-column') {
+      throw new AgentError('kind must be "not-in-subquery", "not-in-list" or "function-on-column".');
+    }
+    const location = req.body?.location ?? null;
+    if (location !== null && typeof location !== 'number') {
+      throw new AgentError('Provide the finding\'s numeric "location", or null.');
+    }
+    res.json(await whatIfRewrite(db, sql, kind, location, { analyze: req.body?.analyze === true }));
   } catch (err) {
     fail(res, err);
   }

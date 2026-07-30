@@ -19,6 +19,10 @@
 
 import { loadModule, parseSync } from 'libpg-query';
 
+import { byteToCharIndex, generateCandidates, type CandidateRewrite } from './transform.ts';
+
+export type { CandidateRewrite } from './transform.ts';
+
 export type RewriteKind =
   | 'function-on-column'
   | 'not-in-subquery'
@@ -49,6 +53,15 @@ export interface RewriteFinding {
   location: number | null;
   /** The fragment of SQL this is about. */
   snippet: string | null;
+  /**
+   * The rewritten statement, generated and structurally validated, when this
+   * finding's kind supports Tier A and the query's shape is within scope. The
+   * preconditions it carries are schema facts to be established at prove time,
+   * never assumed — an unproven candidate is a draft, not advice.
+   */
+  candidate: CandidateRewrite | null;
+  /** Why no candidate was generated, when the kind supports one. */
+  candidateBlocked: string | null;
 }
 
 // ── Parser bootstrap ─────────────────────────────────────────────────────────
@@ -151,8 +164,13 @@ function constInt(node: unknown): number | null {
  * cut off. Backing up to a word boundary first restores the keyword that makes
  * the fragment recognisable.
  */
-function snippetAt(sql: string, location: number | null, span = 60, lead = 16): string | null {
-  if (location === null || location < 0 || location >= sql.length) return null;
+function snippetAt(sql: string, byteLocation: number | null, span = 60, lead = 16): string | null {
+  if (byteLocation === null || byteLocation < 0) return null;
+  // The parser reports byte offsets; everything below indexes a JS string. On
+  // any non-ASCII query those are different numbers, and slicing with the wrong
+  // one shifts the snippet off the token it is supposed to show.
+  const location = byteToCharIndex(sql, byteLocation);
+  if (location >= sql.length) return null;
 
   let start = Math.max(0, location - lead);
   if (start > 0) {
@@ -191,19 +209,31 @@ export function analyzeRewrites(sql: string): RewriteFinding[] {
 
   const findings: RewriteFinding[] = [];
   const seen = new Set<string>();
+  const candidates = new Map<string, ReturnType<typeof generateCandidates>[number]['result']>();
 
-  const push = (finding: RewriteFinding): void => {
+  const push = (finding: Omit<RewriteFinding, 'candidate' | 'candidateBlocked'>): void => {
     // One finding per kind per location; the same pattern often appears in
     // several branches of one tree.
     const key = `${finding.kind}:${finding.location ?? ''}:${finding.snippet ?? ''}`;
     if (seen.has(key)) return;
     seen.add(key);
-    findings.push(finding);
+    findings.push({ ...finding, candidate: null, candidateBlocked: null });
   };
 
   for (const stmtWrapper of (tree['stmts'] as Node[] | undefined) ?? []) {
     const stmt = stmtWrapper?.['stmt'];
     if (!stmt) continue;
+
+    // Generate Tier A candidates for this statement, keyed the way findings
+    // are located, so the two pair up below. Generation failing must never
+    // take the advisor down with it — the prose advice stands on its own.
+    try {
+      for (const site of generateCandidates(sql, stmt)) {
+        candidates.set(`${site.kind}:${site.location ?? ''}`, site.result);
+      }
+    } catch {
+      // Findings keep candidate: null, which renders as advice-only.
+    }
 
     checkSelectStar(stmt, sql, push);
     checkLargeOffset(stmt, sql, push);
@@ -216,10 +246,17 @@ export function analyzeRewrites(sql: string): RewriteFinding[] {
     });
   }
 
+  for (const f of findings) {
+    const site = candidates.get(`${f.kind}:${f.location ?? ''}`);
+    if (!site) continue;
+    if (site.ok) f.candidate = site.candidate;
+    else f.candidateBlocked = site.blocked;
+  }
+
   return findings;
 }
 
-type Push = (finding: RewriteFinding) => void;
+type Push = (finding: Omit<RewriteFinding, 'candidate' | 'candidateBlocked'>) => void;
 
 /** `WHERE date(created_at) = …` — a b-tree on created_at cannot serve this. */
 function checkAExpr(expr: Node, sql: string, push: Push): void {
