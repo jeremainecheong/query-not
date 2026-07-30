@@ -346,12 +346,19 @@ fingerprinting, trends. Plus workload-level index consolidation and write-cost a
 ingestion work starts from a normalised key rather than raw text.*
 
 **Phase 4 — rewrite advisor. ✅ Built.** `libpg_query` AST analysis over the query text.
-*Extended: for three kinds — `NOT IN (SELECT …)`, `NOT IN (list)`, `date(col)` ranges —
-the advisor now generates the optimised statement itself and proves it: schema
-preconditions established from the catalog (nullability, column types), the rewrite
-re-planned and diffed, and both forms' complete result sets compared in one statement.
-Every other kind keeps the explicit `semanticChange` field and stays advice — see §9.4
-for how the equivalence question was actually resolved.*
+*Extended: for five kinds the advisor now generates the optimised statement itself and
+proves it. Three splice in place — `NOT IN (SELECT …)`, `NOT IN (list)`, `date(col)`
+ranges — with schema preconditions from the catalog (nullability, column types). Two
+restructure the statement: `WHERE a OR b` splits into `UNION ALL` arms guarded by
+`AND (earlier arm) IS NOT TRUE`, which makes the arms an exact partition and needs no
+schema fact at all; a correlated scalar subquery in the select list hoists into a
+`LEFT JOIN` whose fan-out impossibility is a `pg_index` fact — a unique index whose key
+sits inside the equality-pinned columns — established and cited before anything runs.
+The restructurings validate by expected-tree reconstruction rather than splice
+containment, and aggregate-ness of called functions (invisible in the parse tree)
+is itself a checked precondition via `pg_proc.prokind`. Every other kind keeps the
+explicit `semanticChange` field and stays advice — see §9.4 for how the equivalence
+question was actually resolved.*
 
 **Phase 5 — CI gate. ✅ Built.** Baselines and PR checks via `querynot ci`. *The shadow
 database is still outstanding — the gate currently plans against whatever database it is
@@ -449,7 +456,10 @@ it was verified", that class of bug is the expensive one.
    row cap — refusing honestly, rather than extrapolating, above the cap or under LIMIT,
    where tie-breaking makes any row-level claim unsound. Adversarial sampling remains the
    open question only for rewrites whose safety has no catalog-decidable precondition,
-   which is precisely why those stay advice.
+   which is precisely why those stay advice. *The boundary has since moved twice: the OR
+   split needs no schema fact at all — its `IS NOT TRUE` guards make the arms an exact
+   partition by construction — and the correlated-subquery join found its catalog fact in
+   `pg_index` uniqueness. What stays advice is what still has neither.*
 5. **Multi-plan presentation** — when a query has several plan shapes across parameter
    sets, what is the primary view?
 

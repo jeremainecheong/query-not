@@ -39,16 +39,25 @@ That second sentence is the point. The tool says what it proved and what it didn
   `NOT IN` null semantics, deep `OFFSET`, leading-wildcard `LIKE`, `OR` across columns,
   and scalar subqueries in the select list. Rewrites that change *results* rather than
   just speed say so explicitly.
-- **Generated rewrites, proven** — for three kinds, the advisor writes the optimised
+- **Generated rewrites, proven** — for five kinds, the advisor writes the optimised
   statement itself: `NOT IN (SELECT …)` → `NOT EXISTS`, `NOT IN (list)` → a VALUES
-  anti-join, `date(col) = 'D'` → a half-open range an index can serve. "Prove it" then
-  establishes the schema facts that make the rewrite safe (`NOT IN` and `NOT EXISTS`
-  only diverge where a NULL can appear — so both columns' `attnotnull` is checked, in
-  your database, and cited), re-plans both forms and diffs them, and compares the
-  complete result sets in a single statement. A nullable column downgrades the whole
-  thing to advice; `LIMIT` refuses row verification outright, because which rows survive
-  a limit depends on tie-breaking and the rewrite changes the plan doing the breaking.
-  **Proven** means all three legs held — and the verdict sentence cites them.
+  anti-join, `date(col) = 'D'` → a half-open range an index can serve, `WHERE a OR b`
+  → `UNION ALL` arms guarded with `AND (earlier arm) IS NOT TRUE` so they partition
+  the result exactly, and a correlated scalar subquery in the select list — the hidden
+  N+1 — → a `LEFT JOIN`. "Prove it" then establishes the schema facts that make the
+  rewrite safe (`attnotnull` for the NOT IN pair; for the subquery-to-join, a unique
+  index over the correlated columns — the fact that makes fan-out impossible — cited
+  by name from `pg_index`), re-plans both forms and diffs them, and compares the
+  complete result sets in a single statement. A failed fact downgrades the whole
+  thing to advice with nothing executed; `LIMIT` refuses row verification outright,
+  because which rows survive a limit depends on tie-breaking and the rewrite changes
+  the plan doing the breaking. **Proven** means all three legs held — and the verdict
+  sentence cites them. The splice-based kinds validate by reparse-and-containment;
+  the restructuring kinds validate harder: the expected parse tree is built from the
+  original tree by the same structural operation, and the candidate must parse to
+  exactly it. On the seeded database the subquery-to-join proves with a 99% estimated
+  cost drop, while the unindexed OR split honestly reports **regressed — do not
+  apply** with its rows still matching: the tool argues from evidence either way.
 - **What-if engine** — hypothetical indexes via HypoPG, and `work_mem` /
   planner-GUC changes. Every suggestion re-planned and diffed.
 - **Plan diff** — structural tree alignment with access-method change detection,
@@ -210,12 +219,12 @@ rests on.
 ## Development
 
 ```bash
-npm test          # 250 unit tests across core and agent
+npm test          # 317 unit tests across core and agent
 npm run typecheck
-npm run test:e2e  # full stack, cold: 442 checks plus a production-bundle run
+npm run test:e2e  # full stack, cold: 474 checks plus a production-bundle run
 ```
 
-**692 checks in total** — 250 unit, 136 API end-to-end, 153 browser end-to-end, and the
+**791 checks in total** — 317 unit, 152 API end-to-end, 161 browser end-to-end, and the
 whole browser suite again against the production bundle served by the agent. The dev
 server and the built artifact are different things; verifying only the first ships a
 build nobody ran.
