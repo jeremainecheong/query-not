@@ -67,8 +67,10 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run typecheck
+      # Core builds first: the agent typechecks and the tests both resolve
+      # @query-not/core through its build output.
       - run: npm run build --workspace @query-not/core
+      - run: npm run typecheck
       - run: npm test
 
       - name: Install a browser for the UI suite
