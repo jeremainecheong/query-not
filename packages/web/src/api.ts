@@ -43,10 +43,15 @@ export interface Health {
     rewriteAdvisor: boolean;
     /** Generated rewrites can be proven — needs a connection and the parser. */
     proveRewrite?: boolean;
+<<<<<<< HEAD
     /** Drop proofs need hypopg 1.4+ (hypopg_hide_index) on the target. */
     dropIndex?: boolean;
     /** Statistics proofs need the sandbox (connected, can DDL) and the parser. */
     proveStatistics?: boolean;
+=======
+    /** Parameter sensitivity — needs a connection and the parser, no extension. */
+    sensitivity?: boolean;
+>>>>>>> 09220a6 (feat(web): sensitivity panel on the analysis page)
     persistence: boolean;
   };
   store?: { analyses: number; savedQueries: number; decisions: number; queries: number };
@@ -378,6 +383,72 @@ export interface DropIndexProof {
   note: string;
 }
 
+// ── Parameter sensitivity (mirrored from the agent's sensitivity.ts) ─────────
+
+export interface PredicateCandidate {
+  column: string | null;
+  operator: string | null;
+  value: string | null;
+  location: number;
+  chosen: boolean;
+  skipped: string | null;
+}
+
+export interface FlipBoundary {
+  fromLabel: string;
+  toLabel: string;
+  fromValue: string;
+  toValue: string;
+  before: string[];
+  after: string[];
+  costFrom: number;
+  costTo: number;
+  headline: string;
+}
+
+export interface SensitivityVariant {
+  label: string;
+  value: string;
+  sql: string;
+  frequency: number | null;
+  /** Diff verdict against the as-written baseline; null on the baseline itself. */
+  verdict: 'improved' | 'regressed' | 'unchanged' | 'restructured' | null;
+  totalCost: number;
+  estimatedRows: number;
+  scanRows: number | null;
+  signature: string[];
+  /** Full plan only for the two points flanking the first flip; baseline carries it when no flip. */
+  plan: QueryPlan | null;
+  diff: PlanDiff | null;
+}
+
+export interface SensitivityResult {
+  predicate: {
+    column: string;
+    relation: string[];
+    operator: string;
+    originalValue: string;
+    location: number;
+    charSpan: { start: number; end: number };
+    why: string;
+  };
+  candidates: PredicateCandidate[];
+  basis: {
+    kind: 'histogram' | 'mcv';
+    evidence: string;
+    nDistinct: number | null;
+    nullFrac: number | null;
+    reltuples: number;
+  };
+  baseline: SensitivityVariant;
+  variants: SensitivityVariant[];
+  flips: FlipBoundary[];
+  baselineMatchesLabel: string | null;
+  narrative: string;
+  costOnly: true;
+  note: string;
+}
+
 export type StatisticsProofOutcome = 'estimates-fixed' | 'estimates-improved' | 'no-effect';
 
 export interface StatisticsAccuracySide {
@@ -477,6 +548,13 @@ export const api = {
    */
   whatIfStatistics: (sql: string, relation: string, columns: string[]) =>
     request<StatisticsProof>('/api/whatif/statistics', { sql, relation, columns }),
+
+  /**
+   * Parameter sensitivity: re-plan the query at constants drawn from pg_stats
+   * and report where the plan flips. Estimate-only by design — nothing runs.
+   */
+  sensitivity: (sql: string, location: number | null = null) =>
+    request<SensitivityResult>('/api/whatif/sensitivity', { sql, location }),
 
   // ── Persistence ────────────────────────────────────────────────────────────
 

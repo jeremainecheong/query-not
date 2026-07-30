@@ -19,6 +19,7 @@ import { NodeDetail, PlanTree } from './components/PlanTree';
 import { PlanGraph } from './components/PlanGraph';
 import { Rewrites } from './components/Rewrites';
 import { StatisticsAdvice } from './components/StatisticsAdvice';
+import { Sensitivity } from './components/Sensitivity';
 import { Suggestions } from './components/Suggestions';
 import { WhatIfSettings } from './components/WhatIfSettings';
 
@@ -35,7 +36,7 @@ GROUP BY c.country
 ORDER BY cents DESC`;
 
 type Theme = 'system' | 'light' | 'dark';
-type Tab = 'graph' | 'findings' | 'rewrites' | 'indexes' | 'settings' | 'plan';
+type Tab = 'graph' | 'findings' | 'rewrites' | 'indexes' | 'settings' | 'sensitivity' | 'plan';
 
 export function App() {
   const [sql, setSql] = useState(SAMPLE);
@@ -338,6 +339,7 @@ export function App() {
                     count={analysis.indexSuggestions.length + (analysis.statisticsSuggestions?.length ?? 0)}
                   />
                   <Segment id="settings" tab={tab} setTab={setTab} label="What-if" />
+                  <Segment id="sensitivity" tab={tab} setTab={setTab} label="Sensitivity" />
                   <Segment id="plan" tab={tab} setTab={setTab} label="Plan" />
                 </div>
 
@@ -432,6 +434,12 @@ export function App() {
                   {tab === 'settings' && (
                     <div className="group">
                       <WhatIfSettings sql={sql} measure={measure} />
+                    </div>
+                  )}
+
+                  {tab === 'sensitivity' && (
+                    <div className="group">
+                      <Sensitivity sql={sql} canRun={health?.capabilities.sensitivity ?? false} />
                     </div>
                   )}
 
