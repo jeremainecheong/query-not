@@ -70,6 +70,13 @@ itself tells you not to apply. The CI gate fails a build on camera.
   exactly it. On the seeded database the subquery-to-join proves with a 99% estimated
   cost drop, while the unindexed OR split honestly reports **regressed — do not
   apply** with its rows still matching: the tool argues from evidence either way.
+  Two further correlated shapes generate too: `ORDER BY … LIMIT 1` (top-1-per-key)
+  hoists verbatim into a `LEFT JOIN LATERAL` — deterministic only under a unique
+  index within the correlation and sort columns, with NOT NULL established on the
+  sort keys because a unique index leaves NULLs tied — and a bare aggregate call
+  becomes a `GROUP BY` derived table (`COALESCE(…, 0)` restoring count's zero),
+  where the fact to prove is that the call *is* an aggregate (`pg_proc.prokind`),
+  the mirror image of the check the other kinds already make.
 - **What-if engine** — hypothetical indexes via HypoPG, and `work_mem` /
   planner-GUC changes. Every suggestion re-planned and diffed.
 - **Extended-statistics advisor** — when a node underestimates badly and its
@@ -112,6 +119,12 @@ itself tells you not to apply. The CI gate fails a build on camera.
   **total** time. The 4ms query running two million times a day costs more than the
   eight-second report, and only one of those shows up in a slow-query log. Handles
   counter resets and entry eviction, both of which produce plausible nonsense if ignored.
+- **Index consolidation** — one index proven against many queries: the workload
+  window's demands merge per relation (equality columns first, range column
+  pinned last), and each consolidated candidate is proven with a hypothetical
+  index against every statement it claims to serve — per-query verdicts, the
+  share of window time covered, and the narrower suggestions it would replace.
+  Candidates are proven in isolation, and the response says so.
 - **CI gate** — `querynot ci` plans your queries against a committed baseline and fails
   the build when an index stops being used or cost jumps. Baselines record plan *shape*,
   not timing, because a committed baseline gets compared on someone else's machine.
@@ -295,12 +308,12 @@ rests on.
 ## Development
 
 ```bash
-npm test          # 317 unit tests across core and agent
+npm test          # 492 unit tests across core and agent
 npm run typecheck
-npm run test:e2e  # full stack, cold: 476 checks plus a production-bundle run
+npm run test:e2e  # full stack, cold: 651 checks plus a production-bundle run
 ```
 
-**793 checks in total** — 317 unit, 152 API end-to-end, 162 browser end-to-end, and the
+**1,143 checks in total** — 492 unit, 267 API end-to-end, 192 browser end-to-end, and the
 whole browser suite again against the production bundle served by the agent. The dev
 server and the built artifact are different things; verifying only the first ships a
 build nobody ran.
