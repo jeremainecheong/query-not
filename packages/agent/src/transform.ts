@@ -1374,10 +1374,19 @@ export function generateLateralTop1(
       }
     }
   }
+  // Sort keys join the pin set only when they are demonstrably INNER columns —
+  // bare, or qualified by the inner name. An outer-qualified sort key is
+  // constant within each group and contributes nothing to determinism, and
+  // adding its name to the probe would ask pg_index about a column that may
+  // not exist on the inner table at all.
+  const sortCols = new Set<string>();
   const sorts = Array.isArray(sub['sortClause']) ? (sub['sortClause'] as unknown[]) : [];
   for (const s of sorts) {
     const parts = columnParts(node(node(s)?.['SortBy'])?.['node']);
-    if (parts) pinned.add(parts.at(-1)!);
+    if (parts && (parts.length === 1 || parts.at(-2) === innerName)) {
+      pinned.add(parts.at(-1)!);
+      sortCols.add(parts.at(-1)!);
+    }
   }
   if (pinned.size === 0) {
     return { ok: false, blocked: 'no plain columns pin the top-1 choice — nothing for a unique index to cover' };
@@ -1443,14 +1452,27 @@ export function generateLateralTop1(
       charSpan: { start: byteToCharIndex(sql, open), end: byteToCharIndex(sql, close + 1) },
       replaced: buf.subarray(open, close + 1).toString('utf8'),
       replacement: replacementExpr,
-      preconditions: [{
-        kind: 'unique-key-covers',
-        relation: innerRelParts,
-        columns: [...pinned].sort(),
-        why: 'With a tie in the ORDER BY, both forms pick an arbitrary row — possibly different ' +
-             'ones — so equality of results cannot even be tested honestly. A unique index within ' +
-             'the correlation and sort columns makes the pick deterministic.',
-      }],
+      preconditions: [
+        {
+          kind: 'unique-key-covers',
+          relation: innerRelParts,
+          columns: [...pinned].sort(),
+          why: 'With a tie in the ORDER BY, both forms pick an arbitrary row — possibly different ' +
+               'ones — so equality of results cannot even be tested honestly. A unique index within ' +
+               'the correlation and sort columns makes the pick deterministic.',
+        },
+        // NULLs sort as a single group, and a unique index does not collapse
+        // them (NULLS DISTINCT is the default) — so a nullable sort column
+        // reintroduces exactly the tie the unique index was supposed to break.
+        ...[...sortCols].sort().map((column): PreconditionSpec => ({
+          kind: 'column-not-null',
+          relation: innerRelParts,
+          column,
+          role: 'subquery',
+          why: 'a unique index leaves NULLs tied — several rows can carry NULL in this sort ' +
+               'column, and the top-1 pick among them is arbitrary in both forms.',
+        })),
+      ],
       rationale:
         'The lateral join is the same per-row top-1 the subquery was, stated where the planner ' +
         'can drive it from an index on the sort column — one ordered probe per row instead of ' +
@@ -1585,6 +1607,20 @@ export function generateGroupedJoin(
   scopeCheck(sub['whereClause']);
   if (scopeProblem) return { ok: false, blocked: scopeProblem };
 
+  // The aggregate's argument moves into the uncorrelated derived table, where
+  // an outer reference no longer resolves — count(o.id) passes the scope check
+  // (o is a real outer name) and still cannot be rewritten.
+  if (!call['agg_star']) {
+    const argParts = columnParts((callArgs as unknown[])[0]);
+    if (argParts && argParts.length >= 2 && argParts.at(-2) !== innerName) {
+      return {
+        ok: false,
+        blocked: "the aggregate's argument references the outer query — it cannot move into " +
+          'an uncorrelated derived table',
+      };
+    }
+  }
+
   // Conjunct classification: correlation pins move to GROUP BY + ON and must
   // be plain inner-column = plain outer-column; inner-only residuals stay in
   // the derived table's WHERE; anything else cannot move into an uncorrelated
@@ -1695,9 +1731,11 @@ export function generateGroupedJoin(
   const residualText = residualIdx.map(i => texts[i]).join(' AND ');
 
   const alias = freshAlias(sql);
-  const aggAlias = 'agg';
-  const innerQ = quoteIdent(innerName);
   const pinCols = [...new Set(pins.map(p => p.inner))];
+  // A pinned column named `agg` would collide with the aggregate's output
+  // label inside the derived table, making qn.agg ambiguous at plan time.
+  const aggAlias = pinCols.includes('agg') ? freshAlias(sql, 'agg') : 'agg';
+  const innerQ = quoteIdent(innerName);
   const pinRefs = pinCols.map(c => `${innerQ}.${quoteIdent(c)}`);
   const derived =
     `(SELECT ${pinRefs.join(', ')}, ${aggText} AS ${aggAlias} FROM ${relText}` +

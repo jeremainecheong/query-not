@@ -580,6 +580,18 @@ describe('lateral top-1 (ORDER BY + LIMIT 1 subquery)', () => {
       assert.deepEqual(p.columns, ['order_id', 'qty']);
       assert.match(p.why, /tie/i);
     }
+    // NULLs stay tied under a unique index, so every sort column also needs
+    // NOT NULL established.
+    const nn = c.preconditions.filter(x => x.kind === 'column-not-null');
+    assert.deepEqual(nn.map(x => x.kind === 'column-not-null' ? x.column : ''), ['qty']);
+  });
+
+  test('an outer-qualified sort key contributes nothing to the pin set', () => {
+    const c = ok(correlated(
+      'SELECT o.id, (SELECT i.sku FROM order_items i WHERE i.order_id = o.id ORDER BY o.id, i.qty LIMIT 1) FROM orders o',
+    ));
+    const p = c.preconditions[0];
+    assert.ok(p.kind === 'unique-key-covers' && p.columns.join(',') === 'order_id,qty');
   });
 
   test('an AS alias names the hoisted reference', () => {
@@ -687,6 +699,25 @@ describe('grouped join (aggregate subquery)', () => {
       )),
       /FILTER/,
     );
+  });
+
+  test('an aggregate argument referencing the outer query refuses', () => {
+    // count(o.id) passes the scope check — o is a real outer name — but the
+    // argument cannot survive the move into an uncorrelated derived table.
+    assert.match(
+      blocked(correlated(
+        'SELECT o.id, (SELECT count(o.id) FROM order_items i WHERE i.order_id = o.id) FROM orders o',
+      )),
+      /outer query/,
+    );
+  });
+
+  test('a pinned column named agg forces a fresh aggregate alias', () => {
+    const c = ok(correlated(
+      'SELECT o.id, (SELECT count(*) FROM order_items agg_t WHERE agg_t.agg = o.id) FROM orders o',
+    ));
+    assert.ok(!/AS agg\b.*\bagg\b.*AS agg\b/.test(c.sql));
+    assert.match(c.sql, /AS agg_\d/);
   });
 
   test('multi-column correlation groups by all pins', () => {
