@@ -6,6 +6,8 @@ import { FlameGraph } from './components/FlameGraph';
 import { Findings } from './components/Findings';
 import { NodeDetail, PlanTree } from './components/PlanTree';
 import { Suggestions } from './components/Suggestions';
+import { Rewrites } from './components/Rewrites';
+import { WhatIfSettings } from './components/WhatIfSettings';
 
 const SAMPLE = `SELECT *
 FROM orders
@@ -204,6 +206,28 @@ export function App() {
                 sql={sql}
                 canProve={health?.capabilities.whatIfIndex ?? false}
               />
+            </section>
+
+            <section className="card">
+              <div className="card__header">
+                <span className="card__title">Rewrite the query</span>
+                <div className="card__spacer" />
+                <span className="card__sub">
+                  {analysis.rewrites.length > 0
+                    ? `${analysis.rewrites.length} from the SQL itself`
+                    : 'from the SQL, not the plan'}
+                </span>
+              </div>
+              <Rewrites rewrites={analysis.rewrites} />
+            </section>
+
+            <section className="card">
+              <div className="card__header">
+                <span className="card__title">What if the settings were different?</span>
+                <div className="card__spacer" />
+                <span className="card__sub">re-plans under each change</span>
+              </div>
+              <WhatIfSettings sql={sql} measure={measure} />
             </section>
 
             <section className="card">

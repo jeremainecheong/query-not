@@ -18,10 +18,16 @@ import {
   whatIfSettings,
 } from './explain.ts';
 import { TUNABLE_GUCS } from './safety.ts';
+import { analyzeRewrites, initParser, SqlParseError } from './rewrite.ts';
 
 const config = configFromEnv();
 const db = new Database(config);
 const app = express();
+
+// The rewrite advisor's parser loads a wasm module once at startup. Tracked as
+// a capability rather than assumed, so a load failure degrades that one feature
+// instead of taking the agent down.
+let parserReady = false;
 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
@@ -56,8 +62,34 @@ app.get('/api/health', async (_req, res) => {
       whatIfIndex: probe.hypopgInstalled,
       whatIfSettings: probe.connected,
       measuredAnalysis: probe.connected,
+      rewriteAdvisor: parserReady,
     },
   });
+});
+
+/**
+ * Rewrite analysis on its own — no database needed.
+ *
+ * Useful in CI and in an editor, where you want the structural advice without
+ * a connection to anything.
+ */
+app.post('/api/rewrite', async (req, res) => {
+  try {
+    const sql = requireSql(req.body);
+    if (!parserReady) {
+      throw new AgentError('The SQL parser failed to load; rewrite analysis is unavailable.', null, 503);
+    }
+    res.json({ rewrites: analyzeRewrites(sql) });
+  } catch (err) {
+    if (err instanceof SqlParseError) {
+      res.status(400).json({
+        error: err.message,
+        hint: err.cursorPosition !== null ? `Parser stopped at character ${err.cursorPosition}.` : null,
+      });
+      return;
+    }
+    fail(res, err);
+  }
 });
 
 /** Explain and analyse one query. */
@@ -133,6 +165,14 @@ app.post('/api/analyze/verified', async (req, res) => {
     fail(res, err);
   }
 });
+
+await initParser()
+  .then(() => {
+    parserReady = true;
+  })
+  .catch((err: unknown) => {
+    console.warn('[agent] SQL parser unavailable, rewrite advice disabled:', err);
+  });
 
 const port = Number(process.env['QUERYNOT_PORT'] ?? 5174);
 const server = app.listen(port, () => {

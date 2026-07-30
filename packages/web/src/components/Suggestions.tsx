@@ -183,7 +183,54 @@ export function Proof({ result }: { result: WhatIfResult }) {
         </ul>
       )}
 
+      <PlanDiffView diff={result.diff} />
+
       {result.note && <div className="proof__note">{result.note}</div>}
+    </div>
+  );
+}
+
+/**
+ * Node-by-node plan diff.
+ *
+ * Collapsed by default: the verdict and the access-method change answer "did it
+ * work", and this answers "what exactly changed" for the person who does not
+ * take the headline on trust. Unchanged nodes are hidden — a diff that shows
+ * everything shows nothing.
+ */
+function PlanDiffView({ diff }: { diff: WhatIfResult['diff'] }) {
+  const [open, setOpen] = useState(false);
+  const changed = diff.nodes.filter((n) => n.status !== 'unchanged');
+
+  if (changed.length === 0) return null;
+
+  return (
+    <div className="diff">
+      <button className="btn btn--ghost btn--small diff__toggle" onClick={() => setOpen(!open)}>
+        {open ? '▾' : '▸'} {changed.length} node{changed.length === 1 ? '' : 's'} changed
+      </button>
+
+      {open && (
+        <div className="diff__body">
+          {changed.map((node, i) => (
+            <div className="diff__row" key={`${node.beforeId ?? ''}-${node.afterId ?? ''}-${i}`}>
+              <span className={`diff__badge diff__badge--${node.status}`}>
+                {node.status === 'added' ? '+' : node.status === 'removed' ? '−' : '~'}
+              </span>
+              <div style={{ minWidth: 0 }}>
+                <div className="diff__label" style={{ paddingLeft: node.depth * 12 }}>
+                  {node.label}
+                </div>
+                <ul className="changes">
+                  {node.changes.map((change, j) => (
+                    <li key={j}>{change}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

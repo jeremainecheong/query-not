@@ -30,13 +30,29 @@ export interface Health {
     whatIfIndex: boolean;
     whatIfSettings: boolean;
     measuredAnalysis: boolean;
+    rewriteAdvisor: boolean;
   };
+}
+
+export type RewriteSeverity = 'critical' | 'warning' | 'info';
+
+export interface RewriteFinding {
+  kind: string;
+  severity: RewriteSeverity;
+  title: string;
+  detail: string;
+  suggestion: string;
+  /** Set when the rewrite changes results, not just performance. */
+  semanticChange: string | null;
+  location: number | null;
+  snippet: string | null;
 }
 
 export interface Analysis {
   plan: QueryPlan;
   findings: Finding[];
   indexSuggestions: IndexSuggestion[];
+  rewrites: RewriteFinding[];
   narration: string;
   flame: FlameLayout;
   fingerprint: string;
@@ -116,4 +132,7 @@ export const api = {
 
   whatIfSettings: (sql: string, settings: Record<string, string>, analyze: boolean) =>
     request<WhatIfResult>('/api/whatif/settings', { sql, settings, analyze }),
+
+  /** Rewrite advice alone — needs no database connection. */
+  rewrite: (sql: string) => request<{ rewrites: RewriteFinding[] }>('/api/rewrite', { sql }),
 };
