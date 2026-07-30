@@ -227,15 +227,18 @@ function RewriteProofView({ proof }: { proof: RewriteProof }) {
       </div>
 
       {/* The schema facts, each with its verdict — this list is the argument,
-          the row comparison below is only the backstop. */}
-      <ul className="changes preconditions">
-        {proof.preconditions.map((p, i) => (
-          <li key={i}>
-            <span className={`dot dot--${p.established ? 'good' : 'critical'}`} aria-hidden="true" />{' '}
-            {p.evidence}
-          </li>
-        ))}
-      </ul>
+          the row comparison below is only the backstop. The OR split is exact
+          by construction and declares none, so nothing renders here for it. */}
+      {proof.preconditions.length > 0 && (
+        <ul className="changes preconditions">
+          {proof.preconditions.map((p, i) => (
+            <li key={i}>
+              <span className={`dot dot--${p.established ? 'good' : 'critical'}`} aria-hidden="true" />{' '}
+              {p.evidence}
+            </li>
+          ))}
+        </ul>
+      )}
 
       {proof.planDiff && <Proof result={proof.planDiff} hideVerdict />}
 

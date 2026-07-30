@@ -1167,11 +1167,15 @@ export function generateOrSplit(sql: string, sel: Node, orExpr: Node): Candidate
   const prefix = buf.subarray(0, whereTok.end).toString('utf8');
   const tail = buf.subarray(whereEnd, stmtEnd).toString('utf8').trim();
 
+  // Arms are deliberately not parenthesised: none carries its own ORDER BY or
+  // LIMIT (those hoist to the set operation, where the grammar binds a trailing
+  // clause anyway), and a statement that starts with `(` fails the read-only
+  // admission gate every query must pass before it is EXPLAINed.
   const armSql = armTexts.map((text, i) => {
     const guards = armTexts.slice(0, i).map(g => ` AND (${g}) IS NOT TRUE`);
     return `${prefix} ${text}${guards.join('')}`;
   });
-  const rewritten = armSql.map(s => `(${s})`).join('\nUNION ALL\n') + (tail ? `\n${tail}` : '');
+  const rewritten = armSql.join('\nUNION ALL\n') + (tail ? `\n${tail}` : '');
 
   // The tree this text must parse to, built from the original tree by the same
   // operation: clone the SELECT per arm, replace the WHERE, hoist the tail.
