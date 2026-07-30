@@ -1,0 +1,189 @@
+/**
+ * Index suggestions, and the proof loop.
+ *
+ * A suggestion here is a *hypothesis* — columns pulled out of predicate text by
+ * heuristic. "Prove it" builds the index hypothetically and re-plans, so a wrong
+ * guess shows up as a plan that did not change rather than as advice someone
+ * acts on. That is the entire argument for this product, so the UI never shows a
+ * suggestion as settled until it has been tested.
+ */
+
+import { useState } from 'react';
+import type { IndexSuggestion } from '@query-not/core';
+import { api, ApiError, type WhatIfResult } from '../api';
+
+type ProofState =
+  | { status: 'idle' }
+  | { status: 'running' }
+  | { status: 'done'; result: WhatIfResult }
+  | { status: 'error'; message: string; hint: string | null };
+
+interface Props {
+  suggestions: IndexSuggestion[];
+  sql: string;
+  canProve: boolean;
+}
+
+export function Suggestions({ suggestions, sql, canProve }: Props) {
+  if (suggestions.length === 0) {
+    return (
+      <div className="empty">
+        No index suggestions. Either the scans are already using indexes, or the filters
+        aren’t selective enough for one to help.
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {suggestions.map((suggestion, i) => (
+        <SuggestionRow key={`${suggestion.relation}-${i}`} suggestion={suggestion} sql={sql} canProve={canProve} />
+      ))}
+    </div>
+  );
+}
+
+function SuggestionRow({
+  suggestion,
+  sql,
+  canProve,
+}: {
+  suggestion: IndexSuggestion;
+  sql: string;
+  canProve: boolean;
+}) {
+  const [proof, setProof] = useState<ProofState>({ status: 'idle' });
+
+  async function prove() {
+    setProof({ status: 'running' });
+    try {
+      // CONCURRENTLY belongs on the real index someone runs later, not on the
+      // hypothetical one — nothing is being built here.
+      const ddl = suggestion.ddl.replace(/\s+CONCURRENTLY\b/i, '');
+      setProof({ status: 'done', result: await api.whatIfIndex(sql, ddl) });
+    } catch (err) {
+      setProof({
+        status: 'error',
+        message: err instanceof Error ? err.message : String(err),
+        hint: err instanceof ApiError ? err.hint : null,
+      });
+    }
+  }
+
+  return (
+    <div className="suggestion">
+      <div className="suggestion__head">
+        <code className="suggestion__ddl">{suggestion.ddl}</code>
+        <button
+          className="btn btn--small"
+          onClick={prove}
+          disabled={!canProve || proof.status === 'running'}
+          title={
+            canProve
+              ? 'Create this index hypothetically and re-plan the query'
+              : 'Requires the hypopg extension on the target database'
+          }
+        >
+          {proof.status === 'running' ? (
+            <>
+              <span className="spinner" aria-hidden="true" /> Proving
+            </>
+          ) : (
+            'Prove it'
+          )}
+        </button>
+      </div>
+
+      <div className="suggestion__reason">
+        {suggestion.reason}{' '}
+        <span style={{ color: 'var(--ink-muted)' }}>Confidence: {suggestion.confidence}.</span>
+      </div>
+
+      {suggestion.caveat && (
+        <div className="suggestion__caveat">
+          <strong>Caveat.</strong> {suggestion.caveat}
+        </div>
+      )}
+
+      {!canProve && proof.status === 'idle' && (
+        <div className="suggestion__reason" style={{ color: 'var(--ink-muted)' }}>
+          Install the hypopg extension to test this without building it.
+        </div>
+      )}
+
+      {proof.status === 'error' && (
+        <div className="proof">
+          <div className="proof__verdict">
+            <span className="dot dot--critical" aria-hidden="true" />
+            Could not test
+          </div>
+          <div className="proof__headline">{proof.message}</div>
+          {proof.hint && <div className="proof__note">{proof.hint}</div>}
+        </div>
+      )}
+
+      {proof.status === 'done' && <Proof result={proof.result} />}
+    </div>
+  );
+}
+
+export function Proof({ result }: { result: WhatIfResult }) {
+  const { summary } = result.diff;
+  const improved = summary.verdict === 'improved';
+  const regressed = summary.verdict === 'regressed';
+
+  const worst = Math.max(summary.costBefore, summary.costAfter, 1);
+  const beforePct = (summary.costBefore / worst) * 100;
+  const afterPct = (summary.costAfter / worst) * 100;
+
+  return (
+    <div className="proof">
+      <div className="proof__verdict">
+        <span
+          className={`dot dot--${improved ? 'good' : regressed ? 'critical' : 'muted'}`}
+          aria-hidden="true"
+        />
+        {improved ? 'Proven' : regressed ? 'Made it worse' : 'No effect'}
+      </div>
+
+      <div className="proof__headline">{summary.headline}</div>
+
+      <div className="compare">
+        <div className="compare__bar">
+          <div className="compare__label">
+            <span>Before</span>
+            <span>{summary.costBefore.toFixed(0)}</span>
+          </div>
+          <div className="compare__track">
+            <div className="compare__fill" style={{ width: `${beforePct}%`, background: 'var(--ink-muted)' }} />
+          </div>
+        </div>
+        <div className="compare__bar">
+          <div className="compare__label">
+            <span>After</span>
+            <span>{summary.costAfter.toFixed(0)}</span>
+          </div>
+          <div className="compare__track">
+            <div
+              className="compare__fill"
+              style={{
+                width: `${afterPct}%`,
+                background: improved ? 'var(--status-good)' : regressed ? 'var(--status-critical)' : 'var(--ink-muted)',
+              }}
+            />
+          </div>
+        </div>
+      </div>
+
+      {summary.accessChanges.length > 0 && (
+        <ul className="changes">
+          {summary.accessChanges.slice(0, 4).map((change, i) => (
+            <li key={i}>{change}</li>
+          ))}
+        </ul>
+      )}
+
+      {result.note && <div className="proof__note">{result.note}</div>}
+    </div>
+  );
+}

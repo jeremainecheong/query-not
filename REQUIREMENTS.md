@@ -3,8 +3,8 @@
 A PostgreSQL query optimiser that doesn't just *show* you a slow plan — it proves what
 would fix it.
 
-Status: **ideation**. This document captures decisions made, problems identified, and
-questions still open. Nothing here is built yet.
+Status: **Phases 1–2 built**, Phases 3–5 not started. This document captures decisions
+made, problems identified, and questions still open. See §8 for what exists today.
 
 ---
 
@@ -334,23 +334,58 @@ means storing that.
 
 Ordered so each phase is independently useful and de-risks the next.
 
-**Phase 1 — the spine.** Read-only connection, plan IR, flame graph, misestimate
-heat, teaching mode. Single query. This is the demo, and it validates the IR.
+**Phase 1 — the spine. ✅ Built.** Read-only connection, plan IR, flame graph,
+misestimate heat, teaching mode. Single query.
 
-**Phase 2 — the differentiator.** Tree diff + what-if (HypoPG indexes, GUC changes).
-Suggestions become proven rather than guessed. *Prototype the diff algorithm early —
-it is the hardest algorithmic piece and every later feature is downstream of it.*
+**Phase 2 — the differentiator. ✅ Built.** Tree diff + what-if (HypoPG indexes, GUC
+changes). Suggestions are proven rather than guessed.
 
 **Phase 3 — workload.** `pg_stat_statements` + `auto_explain` ingestion, ranking,
 fingerprinting, trends. Plus workload-level index consolidation and write-cost analysis.
+*Query fingerprinting already exists in the agent (it is the privacy boundary), so the
+ingestion work starts from a normalised key rather than raw text.*
 
 **Phase 4 — rewrite advisor.** `libpg_query` AST analysis with empirical equivalence
-checking.
+checking. *Predicate column extraction exists but works on plan output by regex; this
+phase replaces it with a real parser over the query text.*
 
 **Phase 5 — CI gate.** Shadow database, baselines, PR checks, migration analysis.
 
-Teaching mode rides along with Phase 1 rather than being its own phase — it is
-narration over an IR we already have.
+Teaching mode rode along with Phase 1 rather than being its own phase — it is narration
+over an IR we already have.
+
+### What Phases 1–2 delivered
+
+| Piece | Where |
+|---|---|
+| Plan IR + `EXPLAIN` parser | `packages/core/src/parse.ts` |
+| Findings engine (13 rules) | `packages/core/src/analyze.ts` |
+| Index advisor + predicate extraction | `packages/core/src/{analyze,predicates}.ts` |
+| Teaching-mode narrator | `packages/core/src/narrate.ts` |
+| Structural plan diff | `packages/core/src/diff.ts` |
+| Flame layout (exclusive time) | `packages/core/src/flame.ts` |
+| Admission control + fingerprinting | `packages/agent/src/safety.ts` |
+| Connection guard (READ ONLY, timeout, rollback) | `packages/agent/src/db.ts` |
+| What-if engine (HypoPG + GUCs) | `packages/agent/src/explain.ts` |
+| Web UI | `packages/web/` |
+
+132 tests. Core's fixtures are real `EXPLAIN` output from a seeded Postgres, including
+a before/after pair captured either side of a live HypoPG hypothetical index.
+
+### Corrections found while building
+
+Two bugs worth recording, because both were in *user-facing numbers* rather than in
+logic — the class of error that is hardest to notice and most damaging to trust.
+
+1. **Parallel plans reported shares above 100%.** Per-worker times summed to more than
+   wall-clock, so dividing node time by elapsed time produced "202% of runtime". Share
+   calculations now divide by total *work* (`QueryPlan.totalWorkMs`), and the narration
+   explains the distinction rather than hiding it.
+
+2. **`date` was both a type name and a function name.** Because both lived in one
+   reserved-word list, `WHERE date(created_at) = …` was not recognised as a
+   function-wrapped column — so an index that cannot work would have shipped as
+   high-confidence advice. Type names and non-function keywords are now separate lists.
 
 ---
 
