@@ -28,6 +28,12 @@ jobs:
       # The agent connects as a role that cannot write — layer 4 of the safety
       # design, and asserted by the API suite.
       QUERYNOT_DATABASE_URL: postgres://querynot_ro:querynot@127.0.0.1:5432/querynot
+      # The statistics sandbox connects as the superuser, which owns the seeded
+      # tables — CREATE STATISTICS and in-transaction ANALYZE both require
+      # ownership. Deliberately the SAME database as the read-only target (the
+      # sanctioned dev-DB mode), so the suite's nothing-persisted checks are
+      # real; the read-only main connection above is untouched.
+      QUERYNOT_SANDBOX_URL: postgres://postgres:postgres@127.0.0.1:5432/querynot
 
     steps:
       - uses: actions/checkout@v4
@@ -64,6 +70,11 @@ jobs:
           sudo -u postgres psql -c 'GRANT CONNECT ON DATABASE querynot TO querynot_ro'
           sudo -u postgres psql -d querynot -c 'GRANT USAGE ON SCHEMA public TO querynot_ro'
           sudo -u postgres psql -d querynot -c 'GRANT SELECT ON ALL TABLES IN SCHEMA public TO querynot_ro'
+
+          # The statistics sandbox (QUERYNOT_SANDBOX_URL) connects over TCP as
+          # postgres, so the superuser needs a password — peer auth only covers
+          # local socket connections.
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres'"
 
       - run: npm ci
 

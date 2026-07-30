@@ -774,6 +774,123 @@ const dropDecision = await call('/api/decisions', {
 check('decisions accept kind drop-index', dropDecision.status === 200 &&
   dropDecision.body.kind === 'drop-index', JSON.stringify(dropDecision.body).slice(0, 120));
 
+// ── Extended statistics: detect, prove on the sandbox, nothing persists ──────
+
+section('Extended statistics advisor');
+
+// The seed's flagship case: country and currency are perfectly correlated, so
+// the conjunction estimate lands a factor of ~5 under reality (measured 4.9x —
+// ANALYZE samples, so the true 5.0x wobbles a few percent run to run).
+const STATS_SQL = "SELECT count(*) FROM customers WHERE country = 'US' AND currency = 'USD'";
+const corrStats = await call('/api/analyze', { sql: STATS_SQL, analyze: true });
+const statsSuggestions = corrStats.body.statisticsSuggestions ?? [];
+check('the correlated pair produces exactly one statistics suggestion', statsSuggestions.length === 1,
+  JSON.stringify(statsSuggestions).slice(0, 160));
+const statsSug = statsSuggestions[0] ?? {};
+check('the DDL is the dependencies+ndistinct object on both columns',
+  /^CREATE STATISTICS \w+ \(dependencies, ndistinct\) ON country, currency FROM customers;$/.test(statsSug.ddl ?? ''),
+  statsSug.ddl);
+check('the columns were confirmed against the SQL, not just plan text', statsSug.source === 'ast');
+check('no covering object exists yet', statsSug.existingState === 'none');
+check('the measured ratio sits in the 5x band and is cited in the evidence',
+  statsSug.ratio >= 4.5 && statsSug.ratio <= 5.5 && /\dx under/.test(statsSug.reason ?? ''),
+  `ratio ${statsSug.ratio}`);
+check('the evidence cites both columns, backticked',
+  /`country`/.test(statsSug.reason ?? '') && /`currency`/.test(statsSug.reason ?? ''));
+check('the underestimate itself is pinned: ~2.0K estimated, exactly 10000 actual',
+  statsSug.estimatedRows > 1500 && statsSug.estimatedRows < 2500 && statsSug.actualRows === 10000,
+  `est ${statsSug.estimatedRows}, actual ${statsSug.actualRows}`);
+const corrReopened = await call(`/api/analysis/${corrStats.body.slug}`);
+check('the reopened slug carries the statistics suggestions',
+  (corrReopened.body.statisticsSuggestions ?? []).length === 1);
+
+const noActuals = await call('/api/analyze', { sql: STATS_SQL, analyze: false });
+check('no actuals, no suggestion — misestimates need measurements',
+  (noActuals.body.statisticsSuggestions ?? []).length === 0);
+const oneCol = await call('/api/analyze', { sql: "SELECT count(*) FROM customers WHERE country = 'US'", analyze: true });
+check('a single equality column is refused', (oneCol.body.statisticsSuggestions ?? []).length === 0);
+const orCase = await call('/api/analyze', {
+  sql: "SELECT count(*) FROM customers WHERE country = 'US' OR currency = 'USD'", analyze: true,
+});
+check('an OR is refused — a disjunction is not a conjunction',
+  (orCase.body.statisticsSuggestions ?? []).length === 0);
+
+const statsHealth = await call('/api/health');
+if (statsHealth.body.capabilities?.proveStatistics) {
+  check('the sandbox advertises DDL rights on the named database',
+    statsHealth.body.sandbox?.canDdl === true && typeof statsHealth.body.sandbox?.database === 'string',
+    JSON.stringify(statsHealth.body.sandbox));
+
+  const statsProof = await call('/api/whatif/statistics', {
+    sql: STATS_SQL, relation: 'customers', columns: ['country', 'currency'],
+    // Must be ignored: every statement is composed server-side.
+    ddl: 'DROP TABLE customers',
+  });
+  check('the proof endpoint answers', statsProof.status === 200, JSON.stringify(statsProof.body).slice(0, 200));
+  const acc = statsProof.body.accuracy ?? {};
+  check('before: the estimate sits ~5x under the 10000 actual',
+    acc.before?.ratio >= 4.5 && acc.before?.ratio <= 5.5 && acc.before?.actualRows === 10000,
+    JSON.stringify(acc.before));
+  check('after: the estimate lands on reality (measured 2036 → ~10.1K estimated)',
+    acc.after?.ratio <= 2 && acc.after?.estimatedRows > 9000 && acc.after?.estimatedRows < 11000,
+    JSON.stringify(acc.after));
+  check('outcome is estimates-fixed', statsProof.body.outcome === 'estimates-fixed', statsProof.body.outcome);
+  check('the plan diff records a statistics change, measured not cost-only',
+    statsProof.body.planDiff?.change?.kind === 'statistics' && statsProof.body.planDiff?.costOnly === false);
+  check('the functional dependency is cited with degree ~1',
+    (statsProof.body.dependency?.pairs ?? []).length >= 1 &&
+    statsProof.body.dependency.pairs.every((p) => p.degree >= 0.99),
+    JSON.stringify(statsProof.body.dependency));
+  check('the note says rolled back and names the sandbox database',
+    /rolled back/.test(statsProof.body.note ?? '') &&
+    (statsProof.body.note ?? '').includes(`\`${statsProof.body.sandbox?.database}\``),
+    (statsProof.body.note ?? '').slice(0, 120));
+  check('the advice DDL is the durable named object plus its ANALYZE',
+    /^CREATE STATISTICS \w+ \(dependencies, ndistinct\)/.test(statsProof.body.adviceDdl ?? '') &&
+    /ANALYZE customers;$/.test(statsProof.body.adviceDdl ?? ''));
+
+  // Nothing persisted: a second proof starts from the same bad estimate, the
+  // definition catalog stays empty even read through the sandbox's own
+  // database (the read-only main connection), and re-analysis agrees.
+  const statsProof2 = await call('/api/whatif/statistics', {
+    sql: STATS_SQL, relation: 'customers', columns: ['country', 'currency'],
+  });
+  check('a second proof starts from nothing — the object did not persist',
+    statsProof2.body.accuracy?.before?.ratio >= 4.5, JSON.stringify(statsProof2.body.accuracy?.before));
+  const statsCatalog = await call('/api/analyze', {
+    sql: "SELECT stxname FROM pg_statistic_ext WHERE stxrelid = 'customers'::regclass", analyze: true,
+  });
+  check('pg_statistic_ext holds nothing for customers afterwards',
+    statsCatalog.body.plan?.root?.actualRowsTotal === 0,
+    `rows ${statsCatalog.body.plan?.root?.actualRowsTotal}`);
+  const reAnalysed = await call('/api/analyze', { sql: STATS_SQL, analyze: true });
+  check('re-analysis still reports no existing object',
+    (reAnalysed.body.statisticsSuggestions ?? [])[0]?.existingState === 'none');
+
+  const staleStats = await call('/api/whatif/statistics', {
+    sql: STATS_SQL, relation: 'customers', columns: ['country', 'signed_up_at'],
+  });
+  check('columns the SQL does not pin are a conflict, not a guess', staleStats.status === 409,
+    `status ${staleStats.status}`);
+  const oneColProof = await call('/api/whatif/statistics', {
+    sql: STATS_SQL, relation: 'customers', columns: ['country'],
+  });
+  check('a single column is rejected up front', oneColProof.status === 400, `status ${oneColProof.status}`);
+} else {
+  const refused = await call('/api/whatif/statistics', {
+    sql: STATS_SQL, relation: 'customers', columns: ['country', 'currency'],
+  });
+  check('without a sandbox the proof refuses with the recipe', refused.status === 412 &&
+    /QUERYNOT_SANDBOX_URL/.test(refused.body.hint ?? ''), JSON.stringify(refused.body).slice(0, 160));
+}
+
+const statsDecision = await call('/api/decisions', {
+  kind: 'statistics', change: statsSug.ddl ?? 'CREATE STATISTICS x', verdict: 'estimates-fixed',
+  headline: 'estimate matched reality on the sandbox', fingerprint: 'e2e-statistics', costOnly: false,
+});
+check('decisions accept kind statistics', statsDecision.status === 200,
+  JSON.stringify(statsDecision.body).slice(0, 120));
+
 // ── Verify the database was never mutated ────────────────────────────────────
 
 section('Nothing was written');

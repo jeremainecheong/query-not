@@ -14,6 +14,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PGURL="${QUERYNOT_DATABASE_URL:-postgres://querynot_ro:test@127.0.0.1:5432/querynot}"
+# The statistics sandbox: the local superuser, pointed at the SAME seeded
+# database as the read-only target. That is deliberate — it is what makes the
+# suite's nothing-persisted checks real. CREATE STATISTICS and in-transaction
+# ANALYZE require table ownership, which postgres has on the seeded tables.
+SANDBOX_URL="${QUERYNOT_SANDBOX_URL:-postgres://postgres:postgres@127.0.0.1:5432/querynot}"
 AGENT_PORT="${QUERYNOT_PORT:-5174}"
 WEB_PORT="${QUERYNOT_WEB_PORT:-5173}"
 LOGS="$(mktemp -d)"
@@ -59,7 +64,7 @@ step "Unit tests"
 node --test --experimental-strip-types "packages/*/test/**/*.test.ts" || fail "unit tests"
 
 step "Starting the agent"
-QUERYNOT_DATABASE_URL="$PGURL" QUERYNOT_PORT="$AGENT_PORT" \
+QUERYNOT_DATABASE_URL="$PGURL" QUERYNOT_SANDBOX_URL="$SANDBOX_URL" QUERYNOT_PORT="$AGENT_PORT" \
   node --experimental-strip-types packages/agent/src/server.ts >"$LOGS/agent.log" 2>&1 &
 AGENT_PID=$!
 wait_for "http://localhost:$AGENT_PORT/api/health" "agent" || { cat "$LOGS/agent.log"; exit 1; }
@@ -81,7 +86,7 @@ step "Production bundle"
 npm run build --workspace @query-not/web >/dev/null 2>&1 || fail "web build"
 kill "$AGENT_PID" 2>/dev/null; AGENT_PID=""
 sleep 1
-QUERYNOT_DATABASE_URL="$PGURL" QUERYNOT_PORT="$AGENT_PORT" \
+QUERYNOT_DATABASE_URL="$PGURL" QUERYNOT_SANDBOX_URL="$SANDBOX_URL" QUERYNOT_PORT="$AGENT_PORT" \
   node --experimental-strip-types packages/agent/src/server.ts >"$LOGS/agent-prod.log" 2>&1 &
 AGENT_PID=$!
 if wait_for "http://localhost:$AGENT_PORT/api/health" "agent (serving UI)"; then

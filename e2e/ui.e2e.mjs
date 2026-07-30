@@ -319,6 +319,40 @@ section('Proof loop (hypothetical index)');
   await ctx.close();
 }
 
+// ── Extended statistics (sandbox proof) ──────────────────────────────────────
+
+section('Extended statistics advisor');
+{
+  const { ctx, page, errors } = await newPage();
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
+  // The seeded correlated pair: the estimate lands ~5x under and the advisor
+  // must offer CREATE STATISTICS with a sandbox proof behind it.
+  await setSql(page, "SELECT count(*) FROM customers WHERE country = 'US' AND currency = 'USD'");
+  await analyse(page);
+  await tab(page, 'Indexes');
+
+  check('the Extended statistics section renders',
+    (await page.locator('.section-label', { hasText: 'Extended statistics' }).count()) > 0);
+  const statsRow = page.locator('.suggestion', { has: page.locator('.code', { hasText: 'CREATE STATISTICS' }) }).first();
+  check('the DDL names dependencies and ndistinct',
+    /\(dependencies, ndistinct\)/.test(await statsRow.locator('.code').first().innerText()));
+  check('the evidence cites the measured ratio',
+    /\d\.\dx under/.test(await statsRow.innerText()));
+
+  await statsRow.locator('button:has-text("Prove it")').click();
+  await page.waitForSelector('.proof__verdict', { timeout: 90000 });
+
+  const statsPanel = await statsRow.locator('.proof').first().innerText();
+  check('the estimate verdict is Estimates fixed', /Estimates fixed/.test(statsPanel), statsPanel.slice(0, 80));
+  check('the accuracy line reports estimated against actual',
+    /estimated against [\d,]+ actual/.test(statsPanel), statsPanel.slice(0, 160));
+  check('the note says everything rolled back', /rolled back/.test(statsPanel));
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-statistics.png`, fullPage: true });
+  await ctx.close();
+}
+
 // ── Settings what-if ─────────────────────────────────────────────────────────
 
 section('Settings what-if');
