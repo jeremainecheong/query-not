@@ -365,7 +365,13 @@ export function App() {
 
                   {tab === 'rewrites' && (
                     <div className="group">
-                      <Rewrites rewrites={analysis.rewrites} />
+                      <Rewrites
+                        rewrites={analysis.rewrites}
+                        sql={sql}
+                        canProve={health?.capabilities.proveRewrite ?? false}
+                        fingerprint={analysis.fingerprint}
+                        analysisSlug={analysis.slug ?? null}
+                      />
                     </div>
                   )}
 

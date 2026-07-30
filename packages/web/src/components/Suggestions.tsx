@@ -157,7 +157,7 @@ function SuggestionRow({
   );
 }
 
-export function Proof({ result }: { result: WhatIfResult }) {
+export function Proof({ result, hideVerdict = false }: { result: WhatIfResult; hideVerdict?: boolean }) {
   const { summary } = result.diff;
   const improved = summary.verdict === 'improved';
   const regressed = summary.verdict === 'regressed';
@@ -168,13 +168,18 @@ export function Proof({ result }: { result: WhatIfResult }) {
 
   return (
     <div className="proof">
-      <div className="proof__verdict">
-        <span
-          className={`dot dot--${improved ? 'good' : regressed ? 'critical' : 'muted'}`}
-          aria-hidden="true"
-        />
-        {improved ? 'Proven' : regressed ? 'Made it worse' : 'No effect'}
-      </div>
+      {/* The rewrite proof panel embeds this under its own overall verdict;
+          two verdict lines in one panel read as a contradiction waiting to
+          happen, so the host can suppress this one. */}
+      {!hideVerdict && (
+        <div className="proof__verdict">
+          <span
+            className={`dot dot--${improved ? 'good' : regressed ? 'critical' : 'muted'}`}
+            aria-hidden="true"
+          />
+          {improved ? 'Proven' : regressed ? 'Made it worse' : 'No effect'}
+        </div>
+      )}
 
       <div className="proof__headline">{summary.headline}</div>
 
