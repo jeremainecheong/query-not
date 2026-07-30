@@ -14,6 +14,7 @@
  */
 
 import { chromium } from 'playwright';
+import { existsSync } from 'node:fs';
 
 const URL = process.env.QUERYNOT_WEB_URL ?? 'http://127.0.0.1:5173/';
 const ANALYSE = '/analyse';
@@ -47,7 +48,15 @@ ORDER BY id OFFSET 100000 LIMIT 20`;
 const SORT_QUERY = 'SELECT customer_id, total_cents FROM orders ORDER BY total_cents, customer_id';
 const SEQ_QUERY = "SELECT * FROM orders WHERE status = 'disputed' AND created_at > now() - interval '30 days'";
 
-const browser = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium' });
+/*
+ * Some sandboxes preinstall Chromium at a fixed path and skip the download;
+ * CI runners use Playwright's own managed location. Pointing at a path that
+ * does not exist fails to launch, so only pass it when it is really there.
+ */
+const PINNED_CHROMIUM = '/opt/pw-browsers/chromium';
+const browser = await chromium.launch(
+  existsSync(PINNED_CHROMIUM) ? { executablePath: PINNED_CHROMIUM } : {},
+);
 
 async function newPage(colorScheme = 'light', viewport = { width: 1280, height: 1000 }) {
   const ctx = await browser.newContext({ viewport, colorScheme, deviceScaleFactor: 1 });

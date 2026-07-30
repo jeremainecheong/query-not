@@ -1,37 +1,33 @@
 # Full verification: unit tests, then both end-to-end suites against a real
 # Postgres with hypopg and pg_stat_statements — the same stack the agent talks
-# to in production. A suite that only runs against fixtures would not have
-# caught most of the bugs this project has already found.
+# to in production. A suite that only ran against fixtures would not have caught
+# most of the bugs this project has already found.
+#
+# Postgres is installed on the runner rather than used as a service container,
+# because the agent needs two extensions and a read-only role. No published
+# image carries both, and the read-only role is not optional: the E2E asserts
+# the agent connects as a role that cannot write, which a superuser fails.
 name: CI
 
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
+
+# A PR branch triggers push and pull_request both; without this the same commit
+# is verified twice in parallel.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        # HypoPG and pg_stat_statements preinstalled; the index what-if and the
-        # workload view are both unavailable without them.
-        image: ghcr.io/hypopg/hypopg:16
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: querynot
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-        ports:
-          - 5432:5432
+    runs-on: ubuntu-24.04
 
     env:
-      PGPASSWORD: postgres
-      QUERYNOT_DATABASE_URL: postgres://postgres:postgres@localhost:5432/querynot
+      # The agent connects as a role that cannot write — layer 4 of the safety
+      # design, and asserted by the API suite.
+      QUERYNOT_DATABASE_URL: postgres://querynot_ro:querynot@127.0.0.1:5432/querynot
 
     steps:
       - uses: actions/checkout@v4
@@ -41,12 +37,35 @@ jobs:
           node-version: 22
           cache: npm
 
-      - run: npm ci
-
-      - name: Seed the test database
+      - name: Install PostgreSQL with hypopg and pg_stat_statements
         run: |
-          psql -h localhost -U postgres -d querynot -c 'CREATE EXTENSION IF NOT EXISTS hypopg'
-          psql -h localhost -U postgres -d querynot -f packages/core/test/fixtures/seed.sql
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-16 postgresql-contrib-16 postgresql-16-hypopg
+
+          # The runner image may already have a cluster listening; make sure the
+          # one we configure is the one on 5432.
+          sudo pg_ctlcluster 16 main start || sudo pg_ctlcluster 16 main restart
+
+          # pg_stat_statements only collects when preloaded, which needs a restart.
+          sudo -u postgres psql -c "ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements'"
+          sudo pg_ctlcluster 16 main restart
+
+      - name: Create the database, extensions and read-only role
+        run: |
+          set -euxo pipefail
+          sudo -u postgres createdb querynot
+          sudo -u postgres psql -d querynot -c 'CREATE EXTENSION IF NOT EXISTS hypopg'
+          sudo -u postgres psql -d querynot -c 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements'
+          sudo -u postgres psql -d querynot -f packages/core/test/fixtures/seed.sql
+
+          sudo -u postgres psql -c "CREATE ROLE querynot_ro LOGIN PASSWORD 'querynot'"
+          sudo -u postgres psql -c 'GRANT CONNECT ON DATABASE querynot TO querynot_ro'
+          sudo -u postgres psql -d querynot -c 'GRANT USAGE ON SCHEMA public TO querynot_ro'
+          sudo -u postgres psql -d querynot -c 'GRANT SELECT ON ALL TABLES IN SCHEMA public TO querynot_ro'
+
+      - run: npm ci
 
       - run: npm run typecheck
       - run: npm run build --workspace @query-not/core
@@ -57,3 +76,11 @@ jobs:
 
       - name: End to end
         run: npm run test:e2e
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-log
+          path: /var/log/postgresql/
+          if-no-files-found: ignore
