@@ -31,6 +31,16 @@ export { layoutFlame, hotspots } from './flame.ts';
 export type { FlameLayout, FlameCell } from './flame.ts';
 export { extractColumns, orderForIndex, quoteIdent } from './predicates.ts';
 export type { ExtractedColumn, PredicateOp } from './predicates.ts';
+export { consolidateDemands, extractIndexDemands, serves } from './consolidate.ts';
+export type {
+  ConsolidateOptions,
+  ConsolidatedIndex,
+  ConsolidationResult,
+  DemandExtractionOptions,
+  DroppedColumn,
+  IndexDemand,
+  WeightedDemand,
+} from './consolidate.ts';
 export {
   formatMs,
   formatRows,
