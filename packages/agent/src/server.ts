@@ -376,6 +376,11 @@ app.post('/api/whatif/drop-index', async (req, res) => {
       throw new AgentError('"schema" must be a string or null.');
     }
     res.json(await proveDropIndex(db, store, index, typeof schema === 'string' ? schema : null));
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
 /**
  * Consolidate the workload's index demands into a few composite candidates and
  * prove each one against every in-scope statement via hypothetical indexes.
