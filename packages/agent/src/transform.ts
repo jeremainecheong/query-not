@@ -76,6 +76,19 @@ export type PreconditionSpec =
       kind: 'function-not-aggregate';
       functions: string[];
       why: string;
+    }
+  | {
+      /**
+       * The mirror image: the call must BE an aggregate. The grouped-join
+       * rewrite moves the call into a GROUP BY derived table, which only
+       * computes the same thing if the function aggregates its group — a
+       * schema's ordinary function named `count` would make the two forms
+       * mean different things, so the name has to be proven in pg_proc
+       * before anything executes.
+       */
+      kind: 'function-is-aggregate';
+      functions: string[];
+      why: string;
     };
 
 export interface CandidateRewrite {
@@ -1247,6 +1260,544 @@ export function generateOrSplit(sql: string, sel: Node, orExpr: Node): Candidate
   };
 }
 
+// ── transform: top-1-per-key subquery → LEFT JOIN LATERAL ────────────────────
+
+/**
+ * `(SELECT x FROM i WHERE i.k = o.k ORDER BY s LIMIT 1)` in the select list
+ *   → `LEFT JOIN LATERAL (SELECT x FROM i WHERE i.k = o.k ORDER BY s LIMIT 1) qn ON true`.
+ *
+ * The lateral body is the ORIGINAL subquery text verbatim, parentheses and
+ * all — a lateral subquery is its own scope exactly like the scalar subquery
+ * was, so nothing inside needs re-slicing, re-qualifying or alias policing.
+ * That is why this path carries far fewer guards than the plain-join one.
+ *
+ * Both forms return NULL on no match and at most one row (the LIMIT). What
+ * neither form fixes is a TIE in the ORDER BY: each picks an arbitrary tied
+ * row, and possibly different ones — so the precondition is a unique index
+ * within (correlation columns ∪ sort columns), which is what makes the pick
+ * deterministic and the two forms comparable at all.
+ */
+export function generateLateralTop1(
+  sql: string,
+  sel: Node,
+  link: Node,
+  sub: Node,
+  targetIndex: number,
+): CandidateResult {
+  for (const [key, why] of [
+    ['groupClause', 'the outer query groups — the joined value would itself need grouping'],
+    ['havingClause', 'the outer query groups — the joined value would itself need grouping'],
+    ['lockingClause', 'FOR UPDATE cannot lock the nullable side of an outer join'],
+    ['intoClause', 'SELECT INTO'],
+  ] as const) {
+    if (hasClause(sel, key)) return { ok: false, blocked: why };
+  }
+
+  const subTargets = sub['targetList'];
+  if (!Array.isArray(subTargets) || subTargets.length !== 1) {
+    return { ok: false, blocked: 'the subquery returns more than one column' };
+  }
+  const target = node(node(subTargets[0])?.['ResTarget']);
+  const val = target?.['val'];
+  // The hoisted reference needs a name the join can address. An AS alias or a
+  // plain column keeps its name; an anonymous expression becomes `?column?`,
+  // which is not a name anyone should generate references to.
+  const explicitName = typeof target?.['name'] === 'string' ? (target['name'] as string) : null;
+  const columnName = (() => {
+    const parts = columnParts(val);
+    return parts ? parts.at(-1)! : null;
+  })();
+  const outName = explicitName ?? columnName;
+  if (!outName) {
+    return {
+      ok: false,
+      blocked: 'the subquery selects an anonymous expression — give it a name with AS so the ' +
+        'join can reference it',
+    };
+  }
+
+  // Determinism argument needs a single inner table to pin.
+  const subFrom = sub['fromClause'];
+  const rv = Array.isArray(subFrom) && subFrom.length === 1 ? node(node(subFrom[0])?.['RangeVar']) : null;
+  if (!rv) {
+    return {
+      ok: false,
+      blocked: 'the subquery reads more than one table — no single unique index can make its ' +
+        'top-1 choice deterministic',
+    };
+  }
+  const innerRelParts = [rv['schemaname'], rv['relname']].filter(x => typeof x === 'string') as string[];
+  const innerName = (node(rv['alias'])?.['aliasname'] as string) ?? (rv['relname'] as string);
+
+  const outerNames = fromClauseNames(sel['fromClause']);
+  const refsOuter = contains(sub, (type, n) => {
+    if (type !== 'ColumnRef') return false;
+    const fields = n['fields'];
+    if (!Array.isArray(fields) || fields.length < 2) return false;
+    const qual = node(node(fields[fields.length - 2])?.['String'])?.['sval'];
+    return typeof qual === 'string' && qual !== innerName && outerNames.has(qual);
+  });
+  if (!refsOuter) {
+    return {
+      ok: false,
+      blocked: 'the subquery is not correlated — Postgres already runs it once, not per row ' +
+        '(or the correlation uses unqualified names; qualify them)',
+    };
+  }
+
+  const outerFrom = sel['fromClause'];
+  if (!Array.isArray(outerFrom) || outerFrom.length !== 1) {
+    return {
+      ok: false,
+      blocked: 'the outer FROM is a comma-separated list — a LEFT JOIN attaches to the last item ' +
+        'only, which is not where the correlation may point',
+    };
+  }
+
+  // Pinned columns for the determinism precondition: correlated equality
+  // conjuncts (inner column = something with no inner reference), plus every
+  // plain-column sort key. Unclassifiable conjuncts just contribute nothing —
+  // fewer pins make the precondition harder to establish, never easier.
+  const whereBool = node(node(sub['whereClause'])?.['BoolExpr']);
+  const conjuncts = whereBool && whereBool['boolop'] === 'AND_EXPR' && Array.isArray(whereBool['args'])
+    ? (whereBool['args'] as unknown[])
+    : sub['whereClause'] ? [sub['whereClause']] : [];
+  const pinned = new Set<string>();
+  for (const c of conjuncts) {
+    const ex = node(node(c)?.['A_Expr']);
+    if (!ex || ex['kind'] !== 'AEXPR_OP' || lastSval(ex['name']) !== '=') continue;
+    for (const [colSide, otherSide] of [['lexpr', 'rexpr'], ['rexpr', 'lexpr']] as const) {
+      const parts = columnParts(ex[colSide]);
+      if (parts && parts.length >= 2 && parts.at(-2) === innerName &&
+          !referencesQualifier(ex[otherSide], innerName)) {
+        pinned.add(parts.at(-1)!);
+      }
+    }
+  }
+  const sorts = Array.isArray(sub['sortClause']) ? (sub['sortClause'] as unknown[]) : [];
+  for (const s of sorts) {
+    const parts = columnParts(node(node(s)?.['SortBy'])?.['node']);
+    if (parts) pinned.add(parts.at(-1)!);
+  }
+  if (pinned.size === 0) {
+    return { ok: false, blocked: 'no plain columns pin the top-1 choice — nothing for a unique index to cover' };
+  }
+
+  // ── text: verbatim body, fresh alias, reference swap ───────────────────────
+  const buf = Buffer.from(sql, 'utf8');
+  const linkLoc = typeof link['location'] === 'number' ? link['location'] : -1;
+  const open = linkLoc >= 0 && buf[linkLoc] === OPEN ? linkLoc : nextOpenParen(buf, Math.max(linkLoc, 0));
+  const close = open >= 0 ? matchParen(buf, open) : -1;
+  if (close < 0) return { ok: false, blocked: 'could not find the subquery parentheses' };
+
+  const alias = freshAlias(sql);
+  const bodyText = buf.subarray(open, close + 1).toString('utf8');
+  const replacementExpr = `${quoteIdent(alias)}.${quoteIdent(outName)}`;
+
+  const outerFromStart = minLocation(outerFrom);
+  const globalToks = wordTokens(buf);
+  const stmtEnd = statementEnd(buf);
+  const boundary = globalToks.find(
+    t => t.depth === 0 && t.start > outerFromStart && (t.upper === 'WHERE' || CLAUSE_KEYWORDS.has(t.upper)),
+  );
+  const insertAt = boundary ? boundary.start : stmtEnd;
+  if (insertAt <= close) return { ok: false, blocked: 'the outer FROM ends before the subquery — unexpected shape' };
+
+  const joinText = ` LEFT JOIN LATERAL ${bodyText} ${quoteIdent(alias)} ON true `;
+  const rewritten = (
+    buf.subarray(0, open).toString('utf8') +
+    replacementExpr +
+    buf.subarray(close + 1, insertAt).toString('utf8') +
+    joinText +
+    buf.subarray(insertAt).toString('utf8')
+  ).trimEnd();
+
+  const expected = clone(sel);
+  (node(node((expected['targetList'] as unknown[])[targetIndex])?.['ResTarget']) as Node)['val'] = {
+    ColumnRef: { fields: [{ String: { sval: alias } }, { String: { sval: outName } }] },
+  };
+  expected['fromClause'] = [{
+    JoinExpr: {
+      jointype: 'JOIN_LEFT',
+      larg: clone(outerFrom[0]),
+      rarg: {
+        RangeSubselect: {
+          lateral: true,
+          subquery: clone(link['subselect']),
+          alias: { aliasname: alias },
+        },
+      },
+      quals: { A_Const: { boolval: { boolval: true } } },
+    },
+  }];
+
+  const problem = validateReconstruction(rewritten, { SelectStmt: expected });
+  if (problem) return { ok: false, blocked: problem };
+
+  return {
+    ok: true,
+    candidate: {
+      kind: 'correlated-subquery-in-select',
+      sql: rewritten,
+      byteSpan: { start: open, end: close + 1 },
+      charSpan: { start: byteToCharIndex(sql, open), end: byteToCharIndex(sql, close + 1) },
+      replaced: buf.subarray(open, close + 1).toString('utf8'),
+      replacement: replacementExpr,
+      preconditions: [{
+        kind: 'unique-key-covers',
+        relation: innerRelParts,
+        columns: [...pinned].sort(),
+        why: 'With a tie in the ORDER BY, both forms pick an arbitrary row — possibly different ' +
+             'ones — so equality of results cannot even be tested honestly. A unique index within ' +
+             'the correlation and sort columns makes the pick deterministic.',
+      }],
+      rationale:
+        'The lateral join is the same per-row top-1 the subquery was, stated where the planner ' +
+        'can drive it from an index on the sort column — one ordered probe per row instead of ' +
+        'a filtered sort. Without such an index, expect the honest verdict to be no effect.',
+    },
+  };
+}
+
+// ── transform: aggregate subquery → grouped LEFT JOIN ────────────────────────
+
+/** Aggregates whose empty-group value this transform can state exactly. */
+const GROUPABLE_AGGREGATES = new Set(['count', 'sum', 'min', 'max', 'avg']);
+
+/**
+ * `(SELECT count(*) FROM i WHERE i.k = o.k)` in the select list
+ *   → `LEFT JOIN (SELECT i.k, count(*) AS agg FROM i GROUP BY i.k) qn ON qn.k = o.k`,
+ *     selecting `COALESCE(qn.agg, 0)`.
+ *
+ * The derived table groups by the correlation columns, so it has at most one
+ * row per key BY CONSTRUCTION — no unique-index precondition, and no fan-out
+ * to rule out. What must be proven instead is that the call IS an aggregate
+ * (pg_proc, prokind = 'a'): a schema's ordinary function named `count` would
+ * make the grouped form compute something else entirely.
+ *
+ * Value mapping on no match: count returns 0 where the join produces NULL —
+ * hence the COALESCE — while sum/min/max/avg return NULL over an empty group,
+ * which is exactly the join's NULL already.
+ */
+export function generateGroupedJoin(
+  sql: string,
+  sel: Node,
+  link: Node,
+  sub: Node,
+  targetIndex: number,
+): CandidateResult {
+  for (const [key, why] of [
+    ['groupClause', 'the outer query groups — the joined value would itself need grouping'],
+    ['havingClause', 'the outer query groups — the joined value would itself need grouping'],
+    ['lockingClause', 'FOR UPDATE cannot lock the nullable side of an outer join'],
+    ['intoClause', 'SELECT INTO'],
+  ] as const) {
+    if (hasClause(sel, key)) return { ok: false, blocked: why };
+  }
+  for (const [key, why] of [
+    ['withClause', 'the subquery has its own WITH clause'],
+    ['distinctClause', 'the subquery uses DISTINCT'],
+    ['groupClause', 'the subquery already groups'],
+    ['havingClause', 'the subquery already groups'],
+    ['windowClause', 'the subquery uses a window clause'],
+    ['sortClause', 'ORDER BY changes nothing under a plain aggregate — and under an ordered-set one it changes everything'],
+    ['limitCount', 'LIMIT under an aggregate subquery is a no-op the rewrite should not launder'],
+    ['limitOffset', 'OFFSET under an aggregate subquery changes what it returns'],
+    ['lockingClause', 'the subquery locks rows'],
+  ] as const) {
+    if (hasClause(sub, key)) return { ok: false, blocked: why };
+  }
+
+  const subTargets = sub['targetList'];
+  if (!Array.isArray(subTargets) || subTargets.length !== 1) {
+    return { ok: false, blocked: 'the subquery returns more than one column' };
+  }
+  const val = node(node(subTargets[0])?.['ResTarget'])?.['val'];
+  const call = node(node(val)?.['FuncCall']);
+  if (!call) return { ok: false, blocked: 'the subquery value is not a bare aggregate call' };
+  if (call['agg_filter'] || call['agg_order'] || call['agg_within_group'] || call['over']) {
+    return { ok: false, blocked: 'FILTER, WITHIN GROUP and window forms are out of scope for the grouped join' };
+  }
+  const aggName = lastSval(call['funcname'])?.toLowerCase() ?? null;
+  if (!aggName || !GROUPABLE_AGGREGATES.has(aggName)) {
+    return {
+      ok: false,
+      blocked: `the grouped join knows the empty-group value for count, sum, min, max and avg — ` +
+        `not for \`${aggName ?? '?'}\``,
+    };
+  }
+  const callArgs = call['args'];
+  if (!call['agg_star']) {
+    if (!Array.isArray(callArgs) || callArgs.length !== 1 || !columnParts(callArgs[0])) {
+      return { ok: false, blocked: 'the aggregate must be over * or a plain column' };
+    }
+  }
+
+  const subFrom = Array.isArray(sub['fromClause']) ? (sub['fromClause'] as unknown[]) : [];
+  const rv = subFrom.length === 1 ? node(node(subFrom[0])?.['RangeVar']) : null;
+  if (!rv) return { ok: false, blocked: 'the subquery reads more than one table' };
+  const innerRelParts = [rv['schemaname'], rv['relname']].filter(x => typeof x === 'string') as string[];
+  const innerName = (node(rv['alias'])?.['aliasname'] as string) ?? (rv['relname'] as string);
+  if (!sub['whereClause']) {
+    return { ok: false, blocked: 'the subquery is not correlated — Postgres already runs it once, not per row' };
+  }
+
+  const outerNames = fromClauseNames(sel['fromClause']);
+  if (outerNames.has(innerName)) {
+    return {
+      ok: false,
+      blocked: `the subquery's table is addressed as \`${innerName}\`, which the outer FROM already ` +
+        'uses — hoisting it would collide, and re-aliasing would change what the preserved ' +
+        'references mean',
+    };
+  }
+
+  // The derived table is REBUILT, not preserved verbatim, so every reference
+  // must be scopable — same discipline as the plain-join path.
+  let scopeProblem: string | null = null;
+  const scopeCheck = (value: unknown): void => {
+    if (scopeProblem) return;
+    if (Array.isArray(value)) { for (const v of value) scopeCheck(v); return; }
+    const n = node(value);
+    if (!n) return;
+    for (const [k, v] of Object.entries(n)) {
+      if (k === 'ColumnRef') {
+        const fields = node(v)?.['fields'];
+        if (!Array.isArray(fields)) continue;
+        if (fields.some(f => node(f)?.['A_Star'] !== undefined)) continue; // count(*) itself
+        const parts = fields.map(f => node(node(f)?.['String'])?.['sval']).filter(s => typeof s === 'string') as string[];
+        if (parts.length !== fields.length) continue;
+        if (parts.length < 2) {
+          scopeProblem = `\`${parts[0] ?? '?'}\` is unqualified — which table it belongs to is a catalog ` +
+            'question, so qualify every column inside the subquery';
+          return;
+        }
+        const qual = parts.at(-2)!;
+        if (qual !== innerName && !outerNames.has(qual)) {
+          scopeProblem = `\`${qual}\` names neither the subquery table nor an outer table`;
+          return;
+        }
+      }
+      scopeCheck(v);
+    }
+  };
+  scopeCheck(subTargets);
+  scopeCheck(sub['whereClause']);
+  if (scopeProblem) return { ok: false, blocked: scopeProblem };
+
+  // Conjunct classification: correlation pins move to GROUP BY + ON and must
+  // be plain inner-column = plain outer-column; inner-only residuals stay in
+  // the derived table's WHERE; anything else cannot move into an uncorrelated
+  // derived table and refuses.
+  const whereBool = node(node(sub['whereClause'])?.['BoolExpr']);
+  if (whereBool && whereBool['boolop'] !== 'AND_EXPR') {
+    return { ok: false, blocked: 'the subquery WHERE is not a plain conjunction' };
+  }
+  const conjuncts = whereBool && Array.isArray(whereBool['args'])
+    ? (whereBool['args'] as unknown[])
+    : [sub['whereClause']];
+
+  const refsInner = (v: unknown): boolean => referencesQualifier(v, innerName);
+  const refsOuterQual = (v: unknown): boolean =>
+    contains(v, (type, n) => {
+      if (type !== 'ColumnRef') return false;
+      const fields = n['fields'];
+      if (!Array.isArray(fields) || fields.length < 2) return false;
+      const qual = node(node(fields[fields.length - 2])?.['String'])?.['sval'];
+      return typeof qual === 'string' && qual !== innerName && outerNames.has(qual);
+    });
+
+  const pins: Array<{ inner: string; outer: string[] }> = [];
+  const residualIdx: number[] = [];
+  for (let i = 0; i < conjuncts.length; i += 1) {
+    const c = conjuncts[i];
+    if (!refsOuterQual(c)) { residualIdx.push(i); continue; }
+    const ex = node(node(c)?.['A_Expr']);
+    if (ex && ex['kind'] === 'AEXPR_OP' && lastSval(ex['name']) === '=') {
+      let pinned = false;
+      for (const [colSide, otherSide] of [['lexpr', 'rexpr'], ['rexpr', 'lexpr']] as const) {
+        const innerParts = columnParts(ex[colSide]);
+        const outerParts = columnParts(ex[otherSide]);
+        if (innerParts && innerParts.length >= 2 && innerParts.at(-2) === innerName &&
+            outerParts && outerParts.length >= 2 && outerParts.at(-2) !== innerName) {
+          pins.push({ inner: innerParts.at(-1)!, outer: outerParts });
+          pinned = true;
+          break;
+        }
+      }
+      if (pinned) continue;
+    }
+    return {
+      ok: false,
+      blocked: 'an outer-referencing condition is not a plain column equality — it cannot move ' +
+        'into an uncorrelated derived table',
+    };
+  }
+  if (pins.length === 0) {
+    return { ok: false, blocked: 'no equality between a subquery column and the outer query — nothing to group by' };
+  }
+
+  const outerFrom = sel['fromClause'];
+  if (!Array.isArray(outerFrom) || outerFrom.length !== 1) {
+    return {
+      ok: false,
+      blocked: 'the outer FROM is a comma-separated list — a LEFT JOIN attaches to the last item ' +
+        'only, which is not where the correlation may point',
+    };
+  }
+
+  // ── text assembly ──────────────────────────────────────────────────────────
+  const buf = Buffer.from(sql, 'utf8');
+  const linkLoc = typeof link['location'] === 'number' ? link['location'] : -1;
+  const open = linkLoc >= 0 && buf[linkLoc] === OPEN ? linkLoc : nextOpenParen(buf, Math.max(linkLoc, 0));
+  const close = open >= 0 ? matchParen(buf, open) : -1;
+  if (close < 0) return { ok: false, blocked: 'could not find the subquery parentheses' };
+
+  const localToks = wordTokens(buf, open + 1, close, 0);
+  const whereTok = localToks.find(t => t.depth === 0 && t.upper === 'WHERE');
+  if (!whereTok) return { ok: false, blocked: 'could not locate the subquery WHERE keyword' };
+
+  // Verbatim slices: the aggregate call and the inner relation.
+  const callLoc = typeof call['location'] === 'number' ? call['location'] : -1;
+  const callOpen = callLoc >= 0 ? nextOpenParen(buf, callLoc) : -1;
+  const callClose = callOpen >= 0 ? matchParen(buf, callOpen) : -1;
+  const relStart = typeof rv['location'] === 'number' ? rv['location'] : -1;
+  if (callClose < 0 || relStart < 0) {
+    return { ok: false, blocked: 'the parser reported no usable positions inside the subquery' };
+  }
+  const aggText = buf.subarray(callLoc, callClose + 1).toString('utf8');
+  const relText = buf.subarray(relStart, whereTok.start).toString('utf8').trim();
+
+  // Residual conjunct texts, sliced between AND separators like the OR arms.
+  const locs = conjuncts.map(minLocation);
+  if (locs.some(l => l < 0) || locs.some((l, i) => i > 0 && l <= locs[i - 1])) {
+    return { ok: false, blocked: 'the parser reported no usable positions for the WHERE conjuncts' };
+  }
+  const texts: string[] = [];
+  for (let i = 0; i < conjuncts.length; i += 1) {
+    let end: number;
+    if (i < conjuncts.length - 1) {
+      const sep = localToks
+        .filter(t => t.upper === 'AND' && t.start >= locs[i] && t.end <= locs[i + 1] &&
+                     gapIsOpeners(buf, t.end, locs[i + 1]))
+        .at(-1);
+      if (!sep) return { ok: false, blocked: 'could not locate the AND separating the conditions' };
+      end = sep.start;
+    } else {
+      end = close;
+    }
+    const text = stripUnbalancedTail(buf.subarray(locs[i], end).toString('utf8'));
+    if (text === null || text.length === 0) {
+      return { ok: false, blocked: 'a condition could not be sliced out cleanly' };
+    }
+    texts.push(text);
+  }
+  const residualText = residualIdx.map(i => texts[i]).join(' AND ');
+
+  const alias = freshAlias(sql);
+  const aggAlias = 'agg';
+  const innerQ = quoteIdent(innerName);
+  const pinCols = [...new Set(pins.map(p => p.inner))];
+  const pinRefs = pinCols.map(c => `${innerQ}.${quoteIdent(c)}`);
+  const derived =
+    `(SELECT ${pinRefs.join(', ')}, ${aggText} AS ${aggAlias} FROM ${relText}` +
+    `${residualText ? ` WHERE ${residualText}` : ''} GROUP BY ${pinRefs.join(', ')})`;
+  const onText = pins
+    .map(p => `${quoteIdent(alias)}.${quoteIdent(p.inner)} = ${p.outer.map(quoteIdent).join('.')}`)
+    .join(' AND ');
+  const replacementExpr = aggName === 'count'
+    ? `COALESCE(${quoteIdent(alias)}.${aggAlias}, 0)`
+    : `${quoteIdent(alias)}.${aggAlias}`;
+
+  const outerFromStart = minLocation(outerFrom);
+  const globalToks = wordTokens(buf);
+  const stmtEnd = statementEnd(buf);
+  const boundary = globalToks.find(
+    t => t.depth === 0 && t.start > outerFromStart && (t.upper === 'WHERE' || CLAUSE_KEYWORDS.has(t.upper)),
+  );
+  const insertAt = boundary ? boundary.start : stmtEnd;
+  if (insertAt <= close) return { ok: false, blocked: 'the outer FROM ends before the subquery — unexpected shape' };
+
+  const joinText = ` LEFT JOIN ${derived} ${quoteIdent(alias)} ON ${onText} `;
+  const rewritten = (
+    buf.subarray(0, open).toString('utf8') +
+    replacementExpr +
+    buf.subarray(close + 1, insertAt).toString('utf8') +
+    joinText +
+    buf.subarray(insertAt).toString('utf8')
+  ).trimEnd();
+
+  // Expected tree: derived-table SelectStmt built node by node from reused
+  // subtrees; the COALESCE wrapper; the flat AND of pin equalities.
+  const colRef = (...parts: string[]): Node => ({
+    ColumnRef: { fields: parts.map(s => ({ String: { sval: s } })) },
+  });
+  const derivedSelect: Node = {
+    targetList: [
+      ...pinCols.map(c => ({ ResTarget: { val: colRef(innerName, c) } })),
+      { ResTarget: { name: aggAlias, val: clone(val) } },
+    ],
+    fromClause: [clone(subFrom[0])],
+    groupClause: pinCols.map(c => colRef(innerName, c)),
+    limitOption: 'LIMIT_OPTION_DEFAULT',
+    op: 'SETOP_NONE',
+  };
+  if (residualIdx.length === 1) derivedSelect['whereClause'] = clone(conjuncts[residualIdx[0]]);
+  else if (residualIdx.length > 1) {
+    derivedSelect['whereClause'] = {
+      BoolExpr: { boolop: 'AND_EXPR', args: residualIdx.map(i => clone(conjuncts[i])) },
+    };
+  }
+  const pinQuals = pins.map(p => ({
+    A_Expr: {
+      kind: 'AEXPR_OP', name: [{ String: { sval: '=' } }],
+      lexpr: colRef(alias, p.inner), rexpr: colRef(...p.outer),
+    },
+  }));
+  const quals = pinQuals.length === 1
+    ? pinQuals[0]
+    : { BoolExpr: { boolop: 'AND_EXPR', args: pinQuals } };
+
+  const expected = clone(sel);
+  (node(node((expected['targetList'] as unknown[])[targetIndex])?.['ResTarget']) as Node)['val'] =
+    aggName === 'count'
+      ? { CoalesceExpr: { args: [colRef(alias, aggAlias), { A_Const: { ival: {} } }] } }
+      : colRef(alias, aggAlias);
+  expected['fromClause'] = [{
+    JoinExpr: {
+      jointype: 'JOIN_LEFT',
+      larg: clone(outerFrom[0]),
+      rarg: { RangeSubselect: { subquery: { SelectStmt: derivedSelect }, alias: { aliasname: alias } } },
+      quals,
+    },
+  }];
+
+  const problem = validateReconstruction(rewritten, { SelectStmt: expected });
+  if (problem) return { ok: false, blocked: problem };
+
+  return {
+    ok: true,
+    candidate: {
+      kind: 'correlated-subquery-in-select',
+      sql: rewritten,
+      byteSpan: { start: open, end: close + 1 },
+      charSpan: { start: byteToCharIndex(sql, open), end: byteToCharIndex(sql, close + 1) },
+      replaced: buf.subarray(open, close + 1).toString('utf8'),
+      replacement: replacementExpr,
+      preconditions: [{
+        kind: 'function-is-aggregate',
+        functions: [aggName],
+        why: 'The grouped form only computes the same thing if this call aggregates its group; ' +
+             'an ordinary function of the same name would make the two forms mean different things.',
+      }],
+      rationale:
+        'One grouped pass over the inner table instead of an aggregate subplan per outer row — ' +
+        'the planner can hash it. The derived table has at most one row per key by construction, ' +
+        `so the join cannot fan out${aggName === 'count' ? '; COALESCE restores count()’s 0 on no match where the join produces NULL' : ''}.`,
+    },
+  };
+}
+
 // ── transform: correlated scalar subquery in SELECT → LEFT JOIN ──────────────
 
 /**
@@ -1293,6 +1844,23 @@ export function generateCorrelatedSelect(sql: string, sel: Node, link: Node): Ca
   const sub = node(node(link['subselect'])?.['SelectStmt']);
   if (!sub) return { ok: false, blocked: 'the subquery is not a plain SELECT' };
   if (sub['op'] !== 'SETOP_NONE') return { ok: false, blocked: 'the subquery is a set operation' };
+
+  // Route the specialised shapes before the plain-join guards refuse them:
+  // ORDER BY + LIMIT 1 is the top-1-per-key idiom (the lateral generator),
+  // and a bare aggregate call is the grouped-join shape. Everything else
+  // falls through to the plain join below.
+  const limitConst = node(node(node(sub['limitCount'])?.['A_Const'])?.['ival']);
+  if (hasClause(sub, 'sortClause') && limitConst?.['ival'] === 1 && !hasClause(sub, 'limitOffset')) {
+    return generateLateralTop1(sql, sel, link, sub, targetIndex);
+  }
+  const subVal = node(node(node((Array.isArray(sub['targetList']) ? sub['targetList'][0] : null) as Node | null)?.['ResTarget'])?.['val']);
+  const subCall = node(subVal?.['FuncCall']);
+  const subCallName = subCall ? (lastSval(subCall['funcname'])?.toLowerCase() ?? null) : null;
+  if (subCall && (subCall['agg_star'] || subCall['agg_distinct'] ||
+                  (subCallName !== null && GROUPABLE_AGGREGATES.has(subCallName)))) {
+    return generateGroupedJoin(sql, sel, link, sub, targetIndex);
+  }
+
   for (const [key, why] of [
     ['withClause', 'the subquery has its own WITH clause'],
     ['distinctClause', 'the subquery uses DISTINCT'],

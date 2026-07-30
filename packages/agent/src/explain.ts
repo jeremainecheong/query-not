@@ -33,10 +33,12 @@ import {
   buildVolatilityProbe,
   interpretAggregateChecks,
   interpretChecks,
+  interpretIsAggregateChecks,
   interpretUniqueChecks,
   type AggregatePrecondition,
   type CatalogRow,
   type ColumnPrecondition,
+  type IsAggregatePrecondition,
   type PreconditionCheck,
   type UniqueIndexRow,
   type UniqueKeyPrecondition,
@@ -401,6 +403,9 @@ export async function whatIfRewrite(
     const aggSpecs = candidate.preconditions.filter(
       (p): p is AggregatePrecondition => p.kind === 'function-not-aggregate',
     );
+    const isAggSpecs = candidate.preconditions.filter(
+      (p): p is IsAggregatePrecondition => p.kind === 'function-is-aggregate',
+    );
 
     const tz =
       (await client.query<{ tz: string }>(`SELECT current_setting('TimeZone') AS tz`)).rows[0]?.tz ?? 'UTC';
@@ -416,10 +421,14 @@ export async function whatIfRewrite(
       const rows = (await client.query<UniqueIndexRow>(probe.text, probe.values)).rows;
       for (const c of interpretUniqueChecks(uniqueSpecs, rows)) bySpec.set(c.spec, c);
     }
-    if (aggSpecs.length > 0) {
-      const probe = buildAggregateProbe([...new Set(aggSpecs.flatMap((s) => s.functions))]);
+    if (aggSpecs.length > 0 || isAggSpecs.length > 0) {
+      // One probe serves both directions of the aggregate question.
+      const names = [...new Set([...aggSpecs, ...isAggSpecs].flatMap((s) => s.functions))];
+      const probe = buildAggregateProbe(names);
       const rows = (await client.query<{ proname: string }>(probe.text, probe.values)).rows;
-      for (const c of interpretAggregateChecks(aggSpecs, rows.map((r) => r.proname))) bySpec.set(c.spec, c);
+      const aggNames = rows.map((r) => r.proname);
+      for (const c of interpretAggregateChecks(aggSpecs, aggNames)) bySpec.set(c.spec, c);
+      for (const c of interpretIsAggregateChecks(isAggSpecs, aggNames)) bySpec.set(c.spec, c);
     }
     const preconditions = candidate.preconditions
       .map((p) => bySpec.get(p))
