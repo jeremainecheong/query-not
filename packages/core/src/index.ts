@@ -10,7 +10,12 @@
 
 export * from './types.ts';
 export { parseExplainJson, findNode, describeNode, PlanParseError } from './parse.ts';
-export { analyze, suggestIndexes } from './analyze.ts';
+export {
+  analyze,
+  composeExtendedStatisticsDdl,
+  suggestExtendedStatistics,
+  suggestIndexes,
+} from './analyze.ts';
 export type { AnalyzeOptions } from './analyze.ts';
 export {
   narratePlan,

@@ -220,6 +220,40 @@ export interface Finding {
   evidence: Record<string, string | number>;
 }
 
+// ── Extended-statistics advice ───────────────────────────────────────────────
+
+/**
+ * A CREATE STATISTICS candidate for a correlated-column misestimate.
+ *
+ * Produced when one node underestimates badly and its predicate is a plain
+ * equality conjunction over several columns of one table — the exact shape
+ * per-column statistics cannot represent and `dependencies` statistics fix.
+ */
+export interface ExtStatsSuggestion {
+  /** Node whose misestimate motivated this suggestion. */
+  nodeId: string;
+  relation: string;
+  /** Predicate order, as the equality columns appear in the node's quals. */
+  columns: string[];
+  /** The name the DDL creates, truncated to Postgres's 63-byte limit. */
+  statName: string;
+  /** Ready-to-run DDL. */
+  ddl: string;
+  /** The measured evidence, citing the ratio — see the composing rule. */
+  reason: string;
+  estimatedRows: number;
+  actualRows: number;
+  /** The measured estimate-vs-actual ratio that fired this suggestion. */
+  ratio: number;
+  /**
+   * Columns come from deparsed predicate text, like index suggestions — a
+   * heuristic to be confirmed (the agent re-checks against the SQL's AST) and
+   * then proven on a sandbox, never presented as certain.
+   */
+  confidence: 'high' | 'medium' | 'low';
+  caveat: string | null;
+}
+
 // ── Index advice ─────────────────────────────────────────────────────────────
 
 export interface IndexSuggestion {

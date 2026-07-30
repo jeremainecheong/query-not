@@ -21,12 +21,22 @@ import {
   formatRows,
   suggestWorkMem,
 } from './format.ts';
-import type { Finding, IndexSuggestion, PlanNode, QueryPlan, Severity } from './types.ts';
+import type { ExtStatsSuggestion, Finding, IndexSuggestion, PlanNode, QueryPlan, Severity } from './types.ts';
 
 export interface AnalyzeOptions {
   /** Ratio at or above which a cardinality error is worth reporting. */
   misestimateWarn?: number;
   misestimateCritical?: number;
+  /**
+   * Ratio at or above which a correlated-column underestimate earns a
+   * CREATE STATISTICS suggestion. Deliberately its own bar, below
+   * misestimateWarn: a conjunction of k equality predicates under a full
+   * functional dependency understates by 1/selectivity of the determined
+   * column, so the canonical two-column case with five values (the seed's
+   * country ⟷ currency) sits at exactly 5.0x — which the general 10x bar
+   * would miss — while the 1–3x band is just per-column imprecision.
+   */
+  statisticsMisestimateWarn?: number;
   /** Fraction of a node's rows discarded by a filter before we flag it. */
   filterWasteFraction?: number;
   /** Absolute row floor, so tiny tables don't generate noise. */
@@ -38,6 +48,7 @@ export interface AnalyzeOptions {
 const DEFAULTS: Required<AnalyzeOptions> = {
   misestimateWarn: 10,
   misestimateCritical: 100,
+  statisticsMisestimateWarn: 5,
   filterWasteFraction: 0.9,
   minRowsForNoise: 100,
   hotspotFraction: 0.3,
@@ -126,7 +137,7 @@ function analyzeNode(
             : 'Underestimating is the more dangerous direction: the planner picks strategies that are cheap for a few rows and catastrophic for many, such as a nested loop.'),
         suggestion:
           'Start with statistics: run ANALYZE on the underlying table. If the columns in this predicate are correlated, ' +
-          'plain per-column statistics cannot represent that — CREATE STATISTICS (dependencies, mcv) teaches the planner the relationship.',
+          'plain per-column statistics cannot represent that — CREATE STATISTICS (dependencies, ndistinct) teaches the planner the relationship.',
         impactMs: inclusive,
         evidence: {
           estimated: formatRows(node.estimatedRowsTotal),
@@ -499,6 +510,185 @@ export function suggestIndexes(plan: QueryPlan, options: AnalyzeOptions = {}): I
         `Columns ordered equality-first, which is what lets a composite index use more than its leading column.`,
       confidence,
       caveat,
+    });
+  }
+
+  return out;
+}
+
+// ── Extended statistics ──────────────────────────────────────────────────────
+
+/** CREATE STATISTICS accepts at most eight columns. */
+const STATISTICS_MAX_COLUMNS = 8;
+
+/**
+ * ANALYZE samples, so a true 5x dependency reads as ~4.75–5.25x from run to
+ * run (the seeded demo measures 4.9x on a 30k-row sample). The gate admits
+ * that sampling error rather than letting the flagship case flap in and out
+ * of advice between ANALYZE runs; the bar itself stays the documented 5.
+ */
+const STATISTICS_SAMPLING_TOLERANCE = 0.95;
+
+/** Scan shapes whose quals are table predicates the statistics object can inform. */
+const STATISTICS_SCAN_TYPES = new Set([
+  'Seq Scan',
+  'Index Scan',
+  'Index Only Scan',
+  'Bitmap Heap Scan',
+]);
+
+/** UTF-8 byte length, dependency-free — Postgres truncates identifiers at 63 *bytes*. */
+function utf8Length(text: string): number {
+  let bytes = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0;
+    bytes += cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
+  }
+  return bytes;
+}
+
+/** Longest prefix of `text` that fits in `maxBytes` of UTF-8. */
+function truncateUtf8(text: string, maxBytes: number): string {
+  let out = '';
+  let bytes = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0;
+    bytes += cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
+    if (bytes > maxBytes) break;
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * FNV-1a in hex. Not cryptographic and does not need to be — it only keeps two
+ * truncated statistics names from silently colliding.
+ */
+function shortHash(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Compose the durable statistics object name and its DDL.
+ *
+ * Exported so the agent's prove endpoint can hand back exactly the DDL the
+ * advisor suggested — two composers would eventually disagree. The kinds are
+ * deliberate: `dependencies` is the mechanism that fixes WHERE-conjunction
+ * selectivity, `ndistinct` future-proofs GROUP BY over the same columns, and
+ * `mcv` is omitted as the heavier next lever rather than a default.
+ */
+export function composeExtendedStatisticsDdl(
+  relation: string,
+  columns: string[],
+): { statName: string; ddl: string } {
+  const raw = `${relation}_${columns.join('_')}_stats`;
+  let statName = raw;
+  if (utf8Length(raw) > 63) {
+    // Truncate to make room for `_` + an 8-hex-char hash of the full name, so
+    // two long candidates never share one truncated identifier.
+    statName = `${truncateUtf8(raw, 63 - 9)}_${shortHash(raw)}`;
+  }
+  const names = columns.map((c) => quoteIdent(c));
+  return {
+    statName,
+    ddl: `CREATE STATISTICS ${quoteIdent(statName)} (dependencies, ndistinct) ON ${names.join(', ')} FROM ${quoteIdent(relation)};`,
+  };
+}
+
+/** Mirrors stripLiterals in predicates.ts: literal contents must not read as keywords. */
+function withoutLiterals(text: string): string {
+  return text.replace(/'(?:[^']|'')*'/g, "''");
+}
+
+/** "`a` and `b`" / "`a`, `b` and `c`" — backticked, house citation style. */
+function citeColumns(columns: string[]): string {
+  const ticked = columns.map((c) => `\`${c}\``);
+  if (ticked.length === 2) return `both ${ticked[0]} and ${ticked[1]}`;
+  return `${ticked.slice(0, -1).join(', ')} and ${ticked[ticked.length - 1]}`;
+}
+
+/**
+ * Propose CREATE STATISTICS for correlated-column misestimates.
+ *
+ * Fires only on ANALYZEd plans — without actuals there is no misestimate, and
+ * the not-analyzed finding already explains why cardinality errors are
+ * invisible. Direction must be 'under': `dependencies` statistics can only
+ * *raise* a conjunction estimate toward the dependent case, so an overestimate
+ * would get a wrong suggestion and instead gets none.
+ *
+ * Like index suggestions these are hypotheses read from deparsed predicate
+ * text; the agent confirms them against the SQL's AST and can prove them on an
+ * opt-in sandbox. Where the text cannot be scoped — an OR anywhere in the
+ * quals — the rule refuses rather than guesses.
+ */
+export function suggestExtendedStatistics(
+  plan: QueryPlan,
+  options: AnalyzeOptions = {},
+): ExtStatsSuggestion[] {
+  const opts = { ...DEFAULTS, ...options };
+  const out: ExtStatsSuggestion[] = [];
+  const seen = new Set<string>();
+
+  if (!plan.analyzed) return out;
+
+  for (const node of plan.nodes) {
+    if (node.neverExecuted || !node.relation) continue;
+    if (!STATISTICS_SCAN_TYPES.has(node.nodeType)) continue;
+    if (node.misestimate === null || node.misestimateDirection !== 'under') continue;
+    if (node.misestimate < opts.statisticsMisestimateWarn * STATISTICS_SAMPLING_TOLERANCE) continue;
+
+    // Same significance test the misestimate finding applies.
+    const significant =
+      Math.max(node.actualRowsTotal ?? 0, node.estimatedRowsTotal) >= opts.minRowsForNoise ||
+      (node.inclusiveMs ?? 0) >= 1;
+    if (!significant) continue;
+
+    const predicate = [node.filter, node.indexCond, node.recheckCond]
+      .filter((p): p is string => p !== null && p.length > 0)
+      .join(' AND ');
+    if (!predicate) continue;
+
+    // A disjunction is not a conjunction: once an OR appears, the text gives
+    // no way to know which equalities are actually ANDed together.
+    if (/\bOR\b/i.test(withoutLiterals(predicate))) continue;
+
+    // Plain equality columns only — a wrapped or cast column is not the
+    // predicate the dependency statistics would be consulted for.
+    const columns = extractColumns(predicate)
+      .filter((c) => c.op === 'eq' && c.wrappedIn === null && c.castTo === null)
+      .map((c) => c.name);
+    if (columns.length < 2 || columns.length > STATISTICS_MAX_COLUMNS) continue;
+
+    const key = `${node.relation}(${[...columns].sort().join(',')})`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const { statName, ddl } = composeExtendedStatisticsDdl(node.relation, columns);
+    const estimated = node.estimatedRowsTotal;
+    const actual = node.actualRowsTotal ?? 0;
+
+    out.push({
+      nodeId: node.id,
+      relation: node.relation,
+      columns,
+      statName,
+      ddl,
+      reason:
+        `Planner expected ${formatRows(estimated)} rows from \`${node.relation}\` but ${formatRows(actual)} arrived ` +
+        `(${formatRatio(node.misestimate)} under, this plan's measured rows). The ${node.filter ? 'filter' : 'condition'} pins ` +
+        `${citeColumns(columns)}; per-column statistics multiply their selectivities as if independent, which understates ` +
+        `exactly when one column functionally determines another. \`CREATE STATISTICS (dependencies, ndistinct)\` teaches ` +
+        `the planner that relationship (pg_statistic_ext).`,
+      estimatedRows: estimated,
+      actualRows: actual,
+      ratio: node.misestimate,
+      confidence: 'high',
+      caveat: null,
     });
   }
 
