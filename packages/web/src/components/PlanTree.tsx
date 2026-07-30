@@ -179,7 +179,7 @@ export function NodeDetail({ node, plan }: { node: PlanNode; plan: QueryPlan }) 
           {predicates.map(([k, v]) => (
             <div key={k}>
               <div style={{ color: 'var(--ink-muted)', fontSize: 12, marginBottom: 3 }}>{k}</div>
-              <div className="suggestion__ddl">{v}</div>
+              <div className="code">{v}</div>
             </div>
           ))}
         </div>

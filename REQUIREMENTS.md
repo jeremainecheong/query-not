@@ -369,10 +369,11 @@ over an IR we already have.
 | Connection guard (READ ONLY, timeout, rollback) | `packages/agent/src/db.ts` |
 | What-if engine (HypoPG + GUCs) | `packages/agent/src/explain.ts` |
 | Rewrite advisor (AST) | `packages/agent/src/rewrite.ts` |
+| Plan graph + ranked hotspots | `packages/web/src/components/{PlanGraph,Hotspots}.tsx` |
 | Web UI | `packages/web/` |
 | End-to-end suites | `e2e/` |
 
-**301 checks** — 161 unit, 78 API end-to-end, 62 browser end-to-end. Core's fixtures are
+**326 checks** — 161 unit, 78 API end-to-end, 87 browser end-to-end. Core's fixtures are
 real `EXPLAIN` output from a seeded Postgres, including a before/after pair captured
 either side of a live HypoPG hypothetical index.
 

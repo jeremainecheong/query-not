@@ -1,20 +1,30 @@
 import { useEffect, useMemo, useState } from 'react';
-import { formatMs, formatRows } from '@query-not/core';
+import { formatMs, formatPercent, formatRows, type Finding } from '@query-not/core';
 
 import { api, ApiError, type Analysis, type Health } from './api';
 import { FlameGraph } from './components/FlameGraph';
 import { Findings } from './components/Findings';
+import { Hotspots } from './components/Hotspots';
 import { NodeDetail, PlanTree } from './components/PlanTree';
-import { Suggestions } from './components/Suggestions';
+import { PlanGraph } from './components/PlanGraph';
 import { Rewrites } from './components/Rewrites';
+import { Suggestions } from './components/Suggestions';
 import { WhatIfSettings } from './components/WhatIfSettings';
 
-const SAMPLE = `SELECT *
-FROM orders
-WHERE status = 'disputed'
-  AND created_at > now() - interval '30 days'`;
+/*
+ * A join and an aggregate rather than a single scan: a two-node plan makes any
+ * plan visualisation look pointless, and the row-flow encoding only means
+ * something when there is flow to show.
+ */
+const SAMPLE = `SELECT c.country, count(*) AS orders, sum(o.total_cents) AS cents
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+WHERE o.status = 'complete'
+GROUP BY c.country
+ORDER BY cents DESC`;
 
 type Theme = 'system' | 'light' | 'dark';
+type Tab = 'graph' | 'findings' | 'rewrites' | 'indexes' | 'settings' | 'plan';
 
 export function App() {
   const [sql, setSql] = useState(SAMPLE);
@@ -25,6 +35,7 @@ export function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [theme, setTheme] = useState<Theme>('system');
+  const [tab, setTab] = useState<Tab>('graph');
 
   useEffect(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
@@ -43,6 +54,7 @@ export function App() {
       const result = await api.analyze(sql, measure);
       setAnalysis(result);
       setSelectedId(null);
+      setTab('graph');
     } catch (err) {
       setAnalysis(null);
       setError({
@@ -67,7 +79,6 @@ export function App() {
         <div className="header__mark">
           query<span>-not</span>
         </div>
-
         <div className="header__spacer" />
 
         {health && (
@@ -76,14 +87,9 @@ export function App() {
             {connected ? health.database.database : 'not connected'}
           </span>
         )}
-        {health?.database.readOnlyRole && (
-          <span className="pill" title="The agent's role cannot write to this database">
-            read-only
-          </span>
-        )}
+        {health?.database.readOnlyRole && <span className="pill">read-only</span>}
         {health && !health.capabilities.whatIfIndex && (
           <span className="pill" title="Install hypopg to test indexes without building them">
-            <span className="dot dot--muted" aria-hidden="true" />
             no hypopg
           </span>
         )}
@@ -98,204 +104,291 @@ export function App() {
       </header>
 
       <main className="main">
-        <section className="card">
-          <textarea
-            className="editor"
-            value={sql}
-            onChange={(e) => setSql(e.target.value)}
-            spellCheck={false}
-            placeholder="SELECT …"
-            onKeyDown={(e) => {
-              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-                e.preventDefault();
-                void run();
-              }
-            }}
-          />
-          <div className="editor-footer">
-            <button className="btn btn--primary" onClick={() => void run()} disabled={running}>
-              {running ? (
-                <>
-                  <span className="spinner" aria-hidden="true" /> Analysing
-                </>
-              ) : (
-                'Analyse'
-              )}
-            </button>
-
-            <label className="toggle" title="EXPLAIN ANALYZE executes the query to collect real measurements">
-              <input type="checkbox" checked={measure} onChange={(e) => setMeasure(e.target.checked)} />
-              Execute to measure
-            </label>
-
-            <div className="card__spacer" />
-            <span className="card__sub">⌘↵ to run</span>
-          </div>
-        </section>
-
-        {error && (
-          <div className="alert">
-            <div>{error.message}</div>
-            {error.hint && <div className="alert__hint">{error.hint}</div>}
-          </div>
-        )}
-
-        {!analysis && !error && (
-          <div className="card">
-            <div className="empty">
-              Paste a query and analyse it. Every index suggestion can then be tested against a
-              hypothetical index — so you see whether it works before you build anything.
+        <div className="stack">
+          <section className="composer">
+            <textarea
+              className="editor"
+              value={sql}
+              onChange={(e) => setSql(e.target.value)}
+              spellCheck={false}
+              placeholder="SELECT …"
+              aria-label="SQL query"
+              onKeyDown={(e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                  e.preventDefault();
+                  void run();
+                }
+              }}
+            />
+            <div className="composer__actions">
+              <button className="btn btn--primary" onClick={() => void run()} disabled={running}>
+                {running ? (
+                  <>
+                    <span className="spinner" aria-hidden="true" /> Analysing
+                  </>
+                ) : (
+                  'Analyse'
+                )}
+              </button>
+              <label
+                className="toggle"
+                title="EXPLAIN ANALYZE executes the query to collect real measurements"
+              >
+                <input type="checkbox" checked={measure} onChange={(e) => setMeasure(e.target.checked)} />
+                Execute to measure
+              </label>
+              <div className="header__spacer" />
+              <span className="t-small" style={{ color: 'var(--ink-muted)' }}>
+                ⌘↵
+              </span>
             </div>
-          </div>
-        )}
+          </section>
 
-        {analysis && (
-          <>
-            <Summary analysis={analysis} />
+          {error && (
+            <div className="alert rise">
+              <div>{error.message}</div>
+              {error.hint && <div className="alert__hint">{error.hint}</div>}
+            </div>
+          )}
 
-            <section className="card">
-              <div className="card__header">
-                <span className="card__title">What happened</span>
-                <div className="card__spacer" />
-                <span className="card__sub">plain English</span>
-              </div>
-              <div className="card__body">
-                <p className="narration">{analysis.narration}</p>
-              </div>
-            </section>
+          {!analysis && !error && (
+            <div className="empty">
+              <p>
+                Analyse a query, then test any index against it hypothetically — you see whether
+                it works before you build anything.
+              </p>
+            </div>
+          )}
 
-            <section className="card">
-              <div className="card__header">
-                <span className="card__title">Findings</span>
-                <div className="card__spacer" />
-                <span className="card__sub">
-                  {analysis.findings.length} — ranked by time cost
-                </span>
-              </div>
-              <Findings
-                findings={analysis.findings}
-                selectedNodeId={selectedId}
-                onSelect={setSelectedId}
-              />
-            </section>
+          {analysis && (
+            <>
+              <Verdict analysis={analysis} />
 
-            <section className="card">
-              <div className="card__header">
-                <span className="card__title">Where the time went</span>
-                <div className="card__spacer" />
-                <span className="card__sub">click a node for detail</span>
-              </div>
-              <div className="card__body">
-                <FlameGraph
-                  layout={analysis.flame}
-                  plan={analysis.plan}
-                  selectedId={selectedId}
-                  onSelect={setSelectedId}
-                />
-              </div>
-            </section>
-
-            <section className="card">
-              <div className="card__header">
-                <span className="card__title">Index suggestions</span>
-                <div className="card__spacer" />
-                <span className="card__sub">hypotheses — test before you trust</span>
-              </div>
-              <Suggestions
-                suggestions={analysis.indexSuggestions}
-                sql={sql}
-                canProve={health?.capabilities.whatIfIndex ?? false}
-              />
-            </section>
-
-            <section className="card">
-              <div className="card__header">
-                <span className="card__title">Rewrite the query</span>
-                <div className="card__spacer" />
-                <span className="card__sub">
-                  {analysis.rewrites.length > 0
-                    ? `${analysis.rewrites.length} from the SQL itself`
-                    : 'from the SQL, not the plan'}
-                </span>
-              </div>
-              <Rewrites rewrites={analysis.rewrites} />
-            </section>
-
-            <section className="card">
-              <div className="card__header">
-                <span className="card__title">What if the settings were different?</span>
-                <div className="card__spacer" />
-                <span className="card__sub">re-plans under each change</span>
-              </div>
-              <WhatIfSettings sql={sql} measure={measure} />
-            </section>
-
-            <section className="card">
-              <div className="card__header">
-                <span className="card__title">Plan</span>
-                <div className="card__spacer" />
-                <span className="card__sub">
-                  {analysis.plan.nodes.length} nodes · totals, not per-loop
-                </span>
-              </div>
-              <PlanTree plan={analysis.plan} selectedId={selectedId} onSelect={setSelectedId} />
-            </section>
-
-            {selectedNode && (
-              <section className="card">
-                <div className="card__header">
-                  <span className="card__title">Node detail</span>
-                  <div className="card__spacer" />
-                  <button className="btn btn--ghost btn--small" onClick={() => setSelectedId(null)}>
-                    Clear
-                  </button>
+              <div>
+                <div className="segmented" role="tablist" aria-label="Analysis views">
+                  <Segment id="graph" tab={tab} setTab={setTab} label="Hotspots" />
+                  <Segment id="findings" tab={tab} setTab={setTab} label="Findings" count={analysis.findings.length} />
+                  <Segment id="rewrites" tab={tab} setTab={setTab} label="Rewrites" count={analysis.rewrites.length} />
+                  <Segment id="indexes" tab={tab} setTab={setTab} label="Indexes" count={analysis.indexSuggestions.length} />
+                  <Segment id="settings" tab={tab} setTab={setTab} label="What-if" />
+                  <Segment id="plan" tab={tab} setTab={setTab} label="Plan" />
                 </div>
-                <div className="card__body">
-                  <NodeDetail node={selectedNode} plan={analysis.plan} />
+
+                <div style={{ marginTop: 'var(--sp-5)' }} key={tab} className="rise">
+                  {tab === 'graph' && (
+                    <>
+                      <div className="section-label">
+                        <span className="t-caption">Where the time goes</span>
+                        <div className="section-label__spacer" />
+                        <span className="t-small">rows flow upward · click a node</span>
+                      </div>
+                      <div className="group" style={{ padding: 'var(--sp-5)' }}>
+                        <PlanGraph plan={analysis.plan} selectedId={selectedId} onSelect={setSelectedId} />
+                      </div>
+                      <div style={{ marginTop: 'var(--sp-6)' }}>
+                        <div className="section-label">
+                          <span className="t-caption">Slowest operations</span>
+                          <div className="section-label__spacer" />
+                          <span className="t-small">by self time</span>
+                        </div>
+                        <div className="group" style={{ padding: 'var(--sp-4) var(--sp-5)' }}>
+                          <Hotspots
+                            plan={analysis.plan}
+                            selectedId={selectedId}
+                            onSelect={setSelectedId}
+                          />
+                        </div>
+                      </div>
+                    </>
+                  )}
+
+                  {tab === 'findings' && (
+                    <div className="group">
+                      <Findings
+                        findings={analysis.findings}
+                        selectedNodeId={selectedId}
+                        onSelect={setSelectedId}
+                      />
+                    </div>
+                  )}
+
+                  {tab === 'rewrites' && (
+                    <div className="group">
+                      <Rewrites rewrites={analysis.rewrites} />
+                    </div>
+                  )}
+
+                  {tab === 'indexes' && (
+                    <div className="group">
+                      <Suggestions
+                        suggestions={analysis.indexSuggestions}
+                        sql={sql}
+                        canProve={health?.capabilities.whatIfIndex ?? false}
+                      />
+                    </div>
+                  )}
+
+                  {tab === 'settings' && (
+                    <div className="group">
+                      <WhatIfSettings sql={sql} measure={measure} />
+                    </div>
+                  )}
+
+                  {tab === 'plan' && (
+                    <>
+                      <div className="group">
+                        <PlanTree plan={analysis.plan} selectedId={selectedId} onSelect={setSelectedId} />
+                      </div>
+                      <div style={{ marginTop: 'var(--sp-6)' }}>
+                        <div className="section-label">
+                          <span className="t-caption">Time distribution</span>
+                          <div className="section-label__spacer" />
+                          <span className="t-small">nesting, weighted by self time</span>
+                        </div>
+                        <div className="group" style={{ padding: 'var(--sp-5)' }}>
+                          <FlameGraph
+                            layout={analysis.flame}
+                            plan={analysis.plan}
+                            selectedId={selectedId}
+                            onSelect={setSelectedId}
+                          />
+                        </div>
+                      </div>
+                      <div style={{ marginTop: 'var(--sp-6)' }}>
+                        <div className="section-label">
+                          <span className="t-caption">What happened</span>
+                        </div>
+                        <div className="group" style={{ padding: 'var(--sp-5)' }}>
+                          <p className="t-body" style={{ color: 'var(--ink-secondary)', maxWidth: '68ch' }}>
+                            {analysis.narration}
+                          </p>
+                        </div>
+                      </div>
+                    </>
+                  )}
                 </div>
-              </section>
-            )}
-          </>
-        )}
+              </div>
+
+              {selectedNode && (
+                <div className="rise">
+                  <div className="section-label">
+                    <span className="t-caption">Node detail</span>
+                    <div className="section-label__spacer" />
+                    <button className="btn btn--ghost btn--small" onClick={() => setSelectedId(null)}>
+                      Clear
+                    </button>
+                  </div>
+                  <div className="group" style={{ padding: 'var(--sp-5)' }}>
+                    <NodeDetail node={selectedNode} plan={analysis.plan} />
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
       </main>
     </div>
   );
 }
 
-function Summary({ analysis }: { analysis: Analysis }) {
-  const { plan } = analysis;
-
+function Segment({
+  id,
+  tab,
+  setTab,
+  label,
+  count,
+}: {
+  id: Tab;
+  tab: Tab;
+  setTab: (t: Tab) => void;
+  label: string;
+  count?: number;
+}) {
   return (
-    <div className="stats">
-      {plan.analyzed ? (
-        <>
-          <Stat label="Elapsed" value={formatMs(plan.totalMs)} note="wall clock" />
-          <Stat
-            label="Work done"
-            value={formatMs(plan.totalWorkMs)}
-            note={plan.isParallel ? 'exceeds elapsed — ran in parallel' : 'across all nodes'}
-          />
-          <Stat label="Rows" value={formatRows(plan.root.actualRowsTotal)} note="returned" />
-          <Stat label="Planning" value={formatMs(plan.planningTimeMs)} note="before execution" />
-        </>
-      ) : (
-        <>
-          <Stat label="Estimated cost" value={plan.totalCost.toFixed(0)} note="planner units" />
-          <Stat label="Rows" value={formatRows(plan.root.estimatedRowsTotal)} note="estimated" />
-          <Stat label="Planning" value={formatMs(plan.planningTimeMs)} note="—" />
-          <Stat label="Measured" value="No" note="enable Execute to measure" />
-        </>
-      )}
-    </div>
+    <button
+      className="segmented__item"
+      role="tab"
+      aria-selected={tab === id}
+      onClick={() => setTab(id)}
+    >
+      {label}
+      {count !== undefined && count > 0 && <span className="segmented__count">{count}</span>}
+    </button>
   );
 }
 
-function Stat({ label, value, note }: { label: string; value: string; note: string }) {
+/**
+ * The hero.
+ *
+ * One sentence, at size, saying the most important true thing about this query
+ * — taken from the highest-impact finding rather than composed separately, so
+ * the headline and the detail can never disagree.
+ */
+function Verdict({ analysis }: { analysis: Analysis }) {
+  const { plan, findings } = analysis;
+  const top: Finding | undefined = findings.find((f) => f.kind !== 'not-analyzed');
+  const critical = findings.filter((f) => f.severity === 'critical').length;
+
   return (
-    <div className="stat">
-      <div className="stat__label">{label}</div>
-      <div className="stat__value">{value}</div>
-      <div className="stat__note">{note}</div>
-    </div>
+    <section className="verdict">
+      <div className="verdict__eyebrow">
+        <span
+          className={`dot dot--${critical > 0 ? 'critical' : top ? 'warning' : 'good'}`}
+          aria-hidden="true"
+        />
+        <span className="t-caption">
+          {critical > 0
+            ? `${critical} critical ${critical === 1 ? 'issue' : 'issues'}`
+            : top
+              ? 'Worth a look'
+              : 'Nothing to flag'}
+        </span>
+      </div>
+
+      <h2 className="t-hero verdict__headline">{top ? top.title : 'This query looks healthy.'}</h2>
+
+      <p className="t-lead verdict__sub">
+        {top
+          ? top.detail
+          : plan.analyzed
+            ? 'Estimates were close, nothing spilled to disk, and no scan is doing obviously avoidable work.'
+            : 'Turn on “Execute to measure” to compare the planner’s estimates against what actually happens.'}
+      </p>
+
+      <div className="metrics">
+        {plan.analyzed ? (
+          <>
+            <span>
+              <b>{formatMs(plan.totalMs)}</b> elapsed
+            </span>
+            <span>
+              <b>{formatMs(plan.totalWorkMs)}</b> of work
+              {plan.isParallel ? ' (ran in parallel)' : ''}
+            </span>
+            <span>
+              <b>{formatRows(plan.root.actualRowsTotal)}</b> rows returned
+            </span>
+            <span>
+              <b>{formatMs(plan.planningTimeMs)}</b> planning
+            </span>
+            {top && top.impactMs > 0 && plan.totalWorkMs ? (
+              <span>
+                <b>{formatPercent(Math.min(top.impactMs / plan.totalWorkMs, 1))}</b> of work in the issue above
+              </span>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <span>
+              <b>{plan.totalCost.toFixed(0)}</b> estimated cost
+            </span>
+            <span>
+              <b>{formatRows(plan.root.estimatedRowsTotal)}</b> rows estimated
+            </span>
+            <span>not executed — estimates only</span>
+          </>
+        )}
+      </div>
+    </section>
   );
 }
