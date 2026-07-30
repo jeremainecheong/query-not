@@ -208,6 +208,7 @@ export function App() {
               setSql(q);
               navigate({ name: 'analyse' });
             }}
+            canConsolidate={health?.capabilities.consolidateIndexes ?? false}
           />
         ) : route.name === 'indexes' ? (
           <IndexesPage canProve={health?.capabilities.dropIndex ?? false} />

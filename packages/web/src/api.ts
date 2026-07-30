@@ -49,6 +49,8 @@ export interface Health {
     proveStatistics?: boolean;
     /** Parameter sensitivity — needs a connection and the parser, no extension. */
     sensitivity?: boolean;
+    /** Workload consolidation proves via hypothetical indexes — needs hypopg. */
+    consolidateIndexes?: boolean;
     persistence: boolean;
   };
   store?: { analyses: number; savedQueries: number; decisions: number; queries: number };
@@ -173,6 +175,82 @@ export interface WorkloadResponse {
     entries: WorkloadEntry[];
   } | null;
   snapshots: number;
+}
+
+// ── Workload consolidation ───────────────────────────────────────────────────
+
+export interface ConsolidationScopeQuery {
+  fingerprint: string;
+  sql: string;
+  share: number;
+  source: 'workload' | 'saved-matched' | 'saved-extra';
+  queryId: string | null;
+  savedName: string | null;
+  /** No index demand — the statement acts as a regression sentinel. */
+  noDemand: boolean;
+}
+
+export interface ConsolidationSkipped {
+  queryId: string | null;
+  savedName: string | null;
+  share: number;
+  reason: string;
+  hint: string | null;
+}
+
+export interface ConsolidationPerQuery {
+  fingerprint: string;
+  queryId: string | null;
+  savedName: string | null;
+  source: 'workload' | 'saved-matched' | 'saved-extra';
+  share: number;
+  claimed: boolean;
+  verdict: string | null;
+  costBefore: number | null;
+  costAfter: number | null;
+  costChange: number | null;
+  headline: string | null;
+  accessChanges: string[];
+  error: string | null;
+}
+
+export interface ConsolidationCandidate {
+  relation: string;
+  columns: string[];
+  roles: Array<'eq' | 'range'>;
+  ddl: string;
+  rationale: string;
+  weight: number;
+  claims: string[];
+  replaces: Array<{ relation: string; columns: string[] }>;
+  perQuery: ConsolidationPerQuery[];
+  served: number;
+  servedShare: number;
+  regressed: number;
+  verdict: 'improved' | 'regressed' | 'unchanged';
+  summary: string;
+  costOnly: true;
+  note: string;
+  decisionId: number | null;
+}
+
+export interface ConsolidationReport {
+  window: {
+    isDelta: boolean;
+    fromAt: string | null;
+    toAt: string;
+    totalMs: number;
+    resetDetected: boolean;
+  };
+  scope: {
+    queries: ConsolidationScopeQuery[];
+    skipped: ConsolidationSkipped[];
+    explainableShare: number;
+  };
+  candidates: ConsolidationCandidate[];
+  standalone: Array<{ relation: string; columns: string[]; fingerprints: string[] }>;
+  omitted: Array<{ relation: string; columns: string[]; weight: number }>;
+  summary: string;
 }
 
 export interface HistoryPoint {
@@ -581,6 +659,10 @@ export const api = {
 
   workloadSnapshot: () =>
     request<{ id: number; takenAt: string; entries: number }>('/api/workload/snapshot', {}),
+
+  /** One index proven against many queries — scope derived server-side. */
+  consolidateWorkload: (input: { includeSaved?: boolean; limit?: number; maxCandidates?: number }) =>
+    request<ConsolidationReport>('/api/workload/consolidate', input),
 
   listSaved: () => request<{ queries: SavedQuery[] }>('/api/saved'),
 

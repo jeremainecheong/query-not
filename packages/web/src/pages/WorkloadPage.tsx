@@ -12,6 +12,7 @@ import { useEffect, useState } from 'react';
 import { formatMs, formatPercent, formatRows } from '@query-not/core';
 
 import { api, ApiError, type WorkloadResponse } from '../api';
+import { Consolidation } from '../components/Consolidation';
 import { relative } from './SavedPage';
 
 const FLAG_LABEL: Record<string, string> = {
@@ -21,7 +22,13 @@ const FLAG_LABEL: Record<string, string> = {
   'cold-cache': 'cold cache',
 };
 
-export function WorkloadPage({ onAnalyse }: { onAnalyse: (sql: string) => void }) {
+export function WorkloadPage({
+  onAnalyse,
+  canConsolidate,
+}: {
+  onAnalyse: (sql: string) => void;
+  canConsolidate: boolean;
+}) {
   const [data, setData] = useState<WorkloadResponse | null>(null);
   const [error, setError] = useState<{ message: string; hint: string | null } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -146,6 +153,7 @@ export function WorkloadPage({ onAnalyse }: { onAnalyse: (sql: string) => void }
           </p>
         </div>
       ) : (
+        <>
         <div className="group">
           {top.slice(0, 30).map((e) => (
             <div className="group__row workload-row" key={e.queryId}>
@@ -207,6 +215,11 @@ export function WorkloadPage({ onAnalyse }: { onAnalyse: (sql: string) => void }
             </div>
           ))}
         </div>
+
+        {/* One index proven against many queries — only meaningful once the
+            window has entries to weight the candidates by. */}
+        <Consolidation canConsolidate={canConsolidate} />
+        </>
       )}
     </div>
   );
