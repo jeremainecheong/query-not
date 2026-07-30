@@ -365,6 +365,39 @@ section('Rewrite advisor');
   await ctx.close();
 }
 
+// ── Generated rewrite, proven in the browser ─────────────────────────────────
+
+section('Generated rewrite proof');
+{
+  const { ctx, page, errors } = await newPage();
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
+  // Clean NOT IN with both columns NOT NULL: the full proven path.
+  await setSql(page,
+    'SELECT o.id FROM orders o WHERE o.id < 30000 AND o.id NOT IN (SELECT oi.order_id FROM order_items oi WHERE oi.qty > 3)');
+  await analyse(page);
+  await tab(page, 'Rewrites');
+
+  const candidate = page.locator('.code--candidate').first();
+  check('the generated statement is shown', (await candidate.count()) > 0);
+  check('and it is the NOT EXISTS form', /NOT EXISTS/.test(await candidate.innerText()));
+  check('a copy button sits beside it', (await page.locator('button:has-text("Copy")').count()) > 0);
+
+  await page.locator('.suggestion button:has-text("Prove it")').first().click();
+  await page.waitForSelector('.preconditions', { timeout: 90000 });
+  await page.waitForTimeout(300);
+
+  const panel = await page.locator('.proof').first().innerText();
+  check('precondition evidence cites NOT NULL', /NOT NULL/.test(panel), panel.slice(0, 160));
+  check('the row comparison is reported', /Rows compared|identical/i.test(panel));
+  check('the note claims equivalence on this data only', /on this data/.test(panel));
+  check('the verdict is a real outcome, not a vibe',
+    /Proven|No effect/.test(panel), panel.slice(0, 80));
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-rewrite-proof.png`, fullPage: true });
+  await ctx.close();
+}
+
 // ── Estimate-only ────────────────────────────────────────────────────────────
 
 section('Estimate-only mode');

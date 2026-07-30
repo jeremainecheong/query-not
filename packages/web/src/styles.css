@@ -940,3 +940,8 @@ a.chip:hover { background: var(--accent-wash); color: var(--accent); }
   .group__row, .tree__row { padding-left: var(--sp-4); padding-right: var(--sp-4); }
   .editor, .composer__actions { padding-left: var(--sp-4); padding-right: var(--sp-4); }
 }
+
+/* Generated rewrites: the candidate statement and its precondition verdicts. */
+.code--candidate { white-space: pre-wrap; word-break: break-word; text-align: left; }
+.preconditions li { display: flex; align-items: baseline; gap: var(--sp-2); }
+.proof__note--outcome { color: var(--ink-secondary); }
