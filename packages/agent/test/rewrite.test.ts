@@ -221,3 +221,52 @@ describe('parser behaviour', () => {
     assert.equal(wrapped.length, 1);
   });
 });
+
+describe('generated candidates attached to findings', () => {
+  test('a top-level NOT IN subquery finding carries the rewritten statement', () => {
+    const f = find('SELECT * FROM orders WHERE id NOT IN (SELECT order_id FROM order_items)', 'not-in-subquery');
+    assert.ok(f?.candidate, 'expected a candidate');
+    assert.match(f.candidate.sql, /NOT EXISTS \(SELECT 1 FROM order_items WHERE order_items\.order_id = orders\.id\)/);
+    assert.equal(f.candidateBlocked, null);
+    assert.equal(f.candidate.preconditions.length, 2);
+  });
+
+  test('the <> ALL spelling gets the same candidate', () => {
+    const f = find('SELECT * FROM orders WHERE id <> ALL (SELECT order_id FROM order_items)', 'not-in-subquery');
+    assert.ok(f?.candidate, `expected a candidate, got blocked: ${f?.candidateBlocked}`);
+    assert.match(f.candidate.sql, /NOT EXISTS/);
+  });
+
+  test('date() carries a candidate; lower() carries the reason it cannot', () => {
+    const d = find("SELECT * FROM orders WHERE date(created_at) = '2024-01-01'", 'function-on-column');
+    assert.ok(d?.candidate);
+    assert.match(d.candidate.sql, /::date/);
+
+    const l = find("SELECT * FROM orders WHERE lower(note) = 'x'", 'function-on-column');
+    assert.equal(l?.candidate, null);
+    assert.match(l?.candidateBlocked ?? '', /no range equivalent/);
+  });
+
+  test('a NOT IN inside a nested subquery is not rewritten against the wrong scope', () => {
+    const f = find(
+      'SELECT * FROM a WHERE a.id IN (SELECT b.id FROM b WHERE b.x NOT IN (SELECT y FROM c))',
+      'not-in-subquery');
+    assert.equal(f?.candidate, null);
+    assert.match(f?.candidateBlocked ?? '', /nested subquery/);
+  });
+
+  test('non-SELECT statements get the advice but no generated SQL', () => {
+    const f = analyzeRewrites(
+      "UPDATE orders SET status = 'x' WHERE id NOT IN (SELECT order_id FROM order_items)")
+      .find((x) => x.kind === 'not-in-subquery');
+    assert.ok(f, 'the finding itself should still fire');
+    assert.equal(f.candidate, null);
+    assert.match(f.candidateBlocked ?? '', /SELECT statements/);
+  });
+
+  test('kinds outside Tier A carry neither field', () => {
+    const f = find('SELECT * FROM orders', 'select-star');
+    assert.equal(f?.candidate, null);
+    assert.equal(f?.candidateBlocked, null);
+  });
+});

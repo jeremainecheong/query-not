@@ -455,13 +455,13 @@ function outerRelations(stmt: Node): Array<{ parts: string[]; alias: string | nu
 function resolveOuterColumn(
   parts: string[],
   stmt: Node,
-): { qualified: string; relation: string[] } | { blocked: string } {
+): { qualified: string; qualifierRaw: string; relation: string[] } | { blocked: string } {
   const rels = outerRelations(stmt);
   if (parts.length >= 2) {
     const qual = parts.slice(0, -1).join('.');
     const match = rels.find(r => (r.alias ?? r.parts.at(-1)) === parts.at(-2));
     if (!match) return { blocked: `\`${qual}\` does not name a table in this query's FROM clause` };
-    return { qualified: parts.map(quoteIdent).join('.'), relation: match.parts };
+    return { qualified: parts.map(quoteIdent).join('.'), qualifierRaw: parts.at(-2)!, relation: match.parts };
   }
   if (rels.length !== 1) {
     return {
@@ -471,7 +471,22 @@ function resolveOuterColumn(
   }
   const only = rels[0];
   const qual = only.alias ?? only.parts.at(-1)!;
-  return { qualified: `${quoteIdent(qual)}.${quoteIdent(parts[0])}`, relation: only.parts };
+  return {
+    qualified: `${quoteIdent(qual)}.${quoteIdent(parts[0])}`,
+    qualifierRaw: qual,
+    relation: only.parts,
+  };
+}
+
+/** Does any qualified ColumnRef in the subtree use `name` as its qualifier? */
+function referencesQualifier(value: unknown, name: string): boolean {
+  return contains(value, (type, n) => {
+    if (type !== 'ColumnRef') return false;
+    const fields = n['fields'];
+    if (!Array.isArray(fields) || fields.length < 2) return false;
+    const qual = node(node(fields[fields.length - 2])?.['String'])?.['sval'];
+    return qual === name;
+  });
 }
 
 /** A name not already used anywhere in the statement text. */
@@ -523,14 +538,34 @@ export function generateNotInSubquery(sql: string, stmt: Node, link: Node): Cand
   if ('blocked' in outer) return { ok: false, blocked: outer.blocked };
 
   const relParts = [rv['schemaname'], rv['relname']].filter(x => typeof x === 'string') as string[];
+  const relname = relParts.at(-1)!;
   const existingAlias = (node(rv['alias'])?.['aliasname'] as string) ?? null;
-  const alias = existingAlias ?? freshAlias(sql);
-  // A subquery alias that collides with the outer qualifier would capture the
-  // outer reference. Re-aliasing would break references inside the inner WHERE,
-  // so refuse rather than rewrite around it.
-  const outerQualifier = outer.qualified.split('.')[0].replace(/"/g, '');
-  if (alias === outerQualifier) {
-    return { ok: false, blocked: `the subquery's alias \`${alias}\` shadows the outer table of the same name` };
+
+  // The name that will qualify the subquery's column in the rewrite. An existing
+  // alias keeps meaning exactly what it meant. A bare table keeps its own name —
+  // inventing an alias would hide that name from the inner WHERE we preserve
+  // verbatim, so `order_items.qty` under `FROM order_items AS qn_0` would stop
+  // meaning the inner table, and would silently bind to an outer table of that
+  // name if one existed. That is the scope-capture failure this module exists
+  // to never produce.
+  let alias = existingAlias ?? relname;
+  let aliasSql = existingAlias ? ` AS ${quoteIdent(existingAlias)}` : '';
+  if (alias === outer.qualifierRaw) {
+    if (existingAlias) {
+      // Re-aliasing would break references inside the preserved inner WHERE.
+      return { ok: false, blocked: `the subquery's alias \`${alias}\` shadows the outer table of the same name` };
+    }
+    if (referencesQualifier(sub['whereClause'], relname)) {
+      return {
+        ok: false,
+        blocked: `the subquery refers to \`${relname}\` by name while the outer query is addressed the same ` +
+          'way — aliasing either side would change what the reference means',
+      };
+    }
+    // Self NOT IN against the same bare table, with nothing inside naming it:
+    // a fresh alias is safe, and required to tell the two copies apart.
+    alias = freshAlias(sql);
+    aliasSql = ` AS ${quoteIdent(alias)}`;
   }
 
   const innerCol = innerParts.at(-1)!;
@@ -556,7 +591,6 @@ export function generateNotInSubquery(sql: string, stmt: Node, link: Node): Cand
     innerWhere = buf.subarray(start, close).toString('utf8').trim();
   }
 
-  const aliasSql = existingAlias ? ` AS ${quoteIdent(alias)}` : ` AS ${quoteIdent(alias)}`;
   const where = innerWhere ? `(${innerWhere}) AND ${innerRef} = ${outer.qualified}`
                            : `${innerRef} = ${outer.qualified}`;
   const replacement = `(NOT EXISTS (SELECT 1 FROM ${relSql}${aliasSql} WHERE ${where}))`;
@@ -731,4 +765,97 @@ export function generateFunctionOnColumn(sql: string, stmt: Node, expr: Node): C
     'A bare column on one side of the comparison lets a plain b-tree index on it ' +
     'be used; date() over it cannot be.',
   );
+}
+
+// ── pairing candidates with findings ─────────────────────────────────────────
+
+export interface CandidateSite {
+  kind: GeneratedRewriteKind;
+  /** The byte offset the corresponding finding carries, for pairing. */
+  location: number | null;
+  result: CandidateResult;
+}
+
+const lastSval = (arr: unknown): string | null => {
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+  const s = node(node(arr[arr.length - 1])?.['String'])?.['sval'];
+  return typeof s === 'string' ? s : null;
+};
+
+const loc = (n: Node): number | null => (typeof n['location'] === 'number' ? n['location'] : null);
+
+/**
+ * Find every Tier A site in one statement and run its generator.
+ *
+ * Sites are keyed by the same byte offset the advisor's findings carry, so the
+ * two can be paired without re-detecting anything. Scope matters: the
+ * generators resolve column references against the statement's own FROM
+ * clause, which is only correct for predicates in the statement's own scope.
+ * A pattern inside a nested subquery gets a blocked marker instead of a wrong
+ * candidate, and a non-SELECT statement blocks everything.
+ */
+export function generateCandidates(sql: string, stmtContent: Node): CandidateSite[] {
+  const sites: CandidateSite[] = [];
+  const sel = node(stmtContent['SelectStmt']);
+
+  const emit = (
+    kind: GeneratedRewriteKind,
+    location: number | null,
+    topScope: boolean,
+    make: () => CandidateResult,
+  ): void => {
+    let result: CandidateResult;
+    if (!sel) {
+      result = { ok: false, blocked: 'generated rewrites cover SELECT statements — apply the same change here by hand' };
+    } else if (!topScope) {
+      result = { ok: false, blocked: 'this sits inside a nested subquery — analyse that subquery on its own to get a generated rewrite' };
+    } else {
+      result = make();
+    }
+    sites.push({ kind, location, result });
+  };
+
+  const visit = (value: unknown, topScope: boolean): void => {
+    if (Array.isArray(value)) {
+      for (const v of value) visit(v, topScope);
+      return;
+    }
+    const n = node(value);
+    if (!n) return;
+    for (const [key, v] of Object.entries(n)) {
+      const child = node(v);
+      if (child) {
+        if (key === 'BoolExpr' && child['boolop'] === 'NOT_EXPR' && Array.isArray(child['args'])) {
+          // `x NOT IN (SELECT …)` parses as NOT over ANY_SUBLINK.
+          for (const arg of child['args'] as unknown[]) {
+            const link = node(node(arg)?.['SubLink']);
+            if (link && link['subLinkType'] === 'ANY_SUBLINK' && link['subselect']) {
+              emit('not-in-subquery', loc(link), topScope, () => generateNotInSubquery(sql, sel!, link));
+            }
+          }
+        }
+        if (key === 'SubLink' && child['subLinkType'] === 'ALL_SUBLINK' &&
+            child['subselect'] && lastSval(child['operName']) === '<>') {
+          // The explicitly-spelled `x <> ALL (SELECT …)` form of the same thing.
+          emit('not-in-subquery', loc(child), topScope, () => generateNotInSubquery(sql, sel!, child));
+        }
+        if (key === 'A_Expr' && child['kind'] === 'AEXPR_IN' && lastSval(child['name']) === '<>') {
+          emit('not-in-list', loc(child), topScope, () => generateNotInList(sql, sel!, child));
+        }
+        if (key === 'A_Expr' && child['kind'] === 'AEXPR_OP') {
+          // The finding is keyed to the FuncCall's own offset, one per side.
+          for (const side of ['lexpr', 'rexpr'] as const) {
+            const call = node(node(child[side])?.['FuncCall']);
+            if (call) emit('function-on-column', loc(call), topScope, () => generateFunctionOnColumn(sql, sel!, child));
+          }
+        }
+        visit(v, key === 'SelectStmt' && child !== sel ? false : topScope);
+      } else {
+        visit(v, topScope);
+      }
+    }
+  };
+
+  visit(stmtContent, true);
+  return sites;
 }
