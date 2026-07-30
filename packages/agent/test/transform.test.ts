@@ -131,9 +131,29 @@ describe('not-in-subquery', () => {
     assert.match(c.sql, /NOT EXISTS \(SELECT 1 FROM order_items AS oi WHERE \(oi\.qty > 1\) AND oi\.order_id = o\.id\)/);
   });
 
-  test('invents an alias when the subquery table has none', () => {
+  test('a bare subquery table keeps its own name as the qualifier', () => {
+    // Inventing an alias here would hide the table's name from an inner WHERE
+    // preserved verbatim — `order_items.qty` under `FROM order_items AS qn_0`
+    // stops meaning the inner table. The name itself is the safe qualifier.
     const c = ok(notInSubquery('SELECT * FROM orders WHERE id NOT IN (SELECT order_id FROM order_items)'));
-    assert.match(c.sql, /FROM order_items AS qn_0 WHERE qn_0\.order_id = orders\.id/);
+    assert.match(c.sql, /FROM order_items WHERE order_items\.order_id = orders\.id/);
+  });
+
+  test('table-name references in the preserved inner WHERE stay valid', () => {
+    const c = ok(notInSubquery(
+      'SELECT * FROM orders WHERE id NOT IN (SELECT order_id FROM order_items WHERE order_items.qty > 1)'));
+    assert.match(c.sql, /FROM order_items WHERE \(order_items\.qty > 1\) AND order_items\.order_id = orders\.id/);
+  });
+
+  test('self NOT IN gets a fresh alias only when nothing names the table', () => {
+    const c = ok(notInSubquery('SELECT * FROM orders WHERE id NOT IN (SELECT customer_id FROM orders)'));
+    assert.match(c.sql, /FROM orders AS qn_0 WHERE qn_0\.customer_id = orders\.id/);
+  });
+
+  test('refuses self NOT IN when the inner WHERE names the table', () => {
+    const why = blocked(notInSubquery(
+      'SELECT * FROM orders WHERE id NOT IN (SELECT customer_id FROM orders WHERE orders.total_cents > 0)'));
+    assert.match(why, /by name/);
   });
 
   test('declares NOT NULL preconditions for both columns', () => {

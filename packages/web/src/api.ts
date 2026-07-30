@@ -38,6 +38,27 @@ export interface Health {
 
 export type RewriteSeverity = 'critical' | 'warning' | 'info';
 
+/** A schema fact a generated rewrite depends on, established at prove time. */
+export interface RewritePrecondition {
+  kind: string;
+  relation: string[];
+  column: string;
+  why: string;
+}
+
+/** A ready-to-run rewritten statement, generated and structurally validated. */
+export interface CandidateRewrite {
+  kind: string;
+  sql: string;
+  byteSpan: { start: number; end: number };
+  /** The replaced region in UTF-16 units, for highlighting. */
+  charSpan: { start: number; end: number };
+  replaced: string;
+  replacement: string;
+  preconditions: RewritePrecondition[];
+  rationale: string;
+}
+
 export interface RewriteFinding {
   kind: string;
   severity: RewriteSeverity;
@@ -48,6 +69,10 @@ export interface RewriteFinding {
   semanticChange: string | null;
   location: number | null;
   snippet: string | null;
+  /** Present when the agent generated the optimised statement itself. */
+  candidate?: CandidateRewrite | null;
+  /** Why no candidate was generated, when the kind supports one. */
+  candidateBlocked?: string | null;
 }
 
 export interface SavedQuery {
