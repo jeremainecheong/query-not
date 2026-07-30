@@ -1,0 +1,22 @@
+{
+  "name": "query-not",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A PostgreSQL query optimiser that proves its suggestions before you ship them",
+  "workspaces": [
+    "packages/core",
+    "packages/agent",
+    "packages/web"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @query-not/core && npm run build --workspace @query-not/agent",
+    "test": "node --test --experimental-strip-types \"packages/*/test/**/*.test.ts\"",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "dev": "npm run dev --workspace @query-not/agent & npm run dev --workspace @query-not/web",
+    "agent": "npm run dev --workspace @query-not/agent",
+    "web": "npm run dev --workspace @query-not/web"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
