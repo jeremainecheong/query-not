@@ -72,6 +72,19 @@ itself tells you not to apply. The CI gate fails a build on camera.
   apply** with its rows still matching: the tool argues from evidence either way.
 - **What-if engine** — hypothetical indexes via HypoPG, and `work_mem` /
   planner-GUC changes. Every suggestion re-planned and diffed.
+- **Extended-statistics advisor** — when a node underestimates badly and its
+  predicate is an equality conjunction over several columns of one table (the
+  correlated-columns case per-column statistics cannot represent), the advisor
+  suggests `CREATE STATISTICS (dependencies, ndistinct)` with the measured
+  ratio cited, confirms the columns against the SQL's AST, and reports whether
+  a covering object already exists — including the exists-but-never-ANALYZEd
+  state read from `pg_stats_ext`. With an opt-in sandbox
+  (`QUERYNOT_SANDBOX_URL`) "Prove it" runs the DDL and an `ANALYZE` inside a
+  single rolled-back transaction and diffs estimate accuracy before and after:
+  on the seeded database, 2,036 → ~10,100 estimated against 10,000 actual, with
+  the functional dependency cited by degree from `pg_stats_ext.dependencies`.
+  Nothing persists. Without the sandbox the suggestion stands as advice with
+  exact DDL.
 - **Plan diff** — structural tree alignment with access-method change detection,
   surfaced node by node in the UI.
 - **Collector agent** — holds the database connection, runs the what-if loop, and
@@ -189,6 +202,7 @@ container, recording the baseline, and what the gate does and does not prove.
 | Variable | Default | Purpose |
 |---|---|---|
 | `QUERYNOT_DATABASE_URL` | `postgres://localhost/postgres` | Target database |
+| `QUERYNOT_SANDBOX_URL` | unset | Opt-in DDL sandbox for statistics proofs — a **disposable** copy, never production |
 | `QUERYNOT_STATEMENT_TIMEOUT_MS` | `15000` | Hard ceiling on any statement |
 | `QUERYNOT_MAX_CONNECTIONS` | `4` | Pool size |
 | `QUERYNOT_PORT` | `5174` | Agent HTTP port |
@@ -212,6 +226,25 @@ attackers. Layers 2–4 are what hold, which is why none are optional.
 
 **What a rollback does not undo:** sequence advancement, and side effects from triggers
 that reach outside the database.
+
+### The statistics sandbox is the one deliberate exception
+
+`CREATE STATISTICS` cannot be tested hypothetically, so proving one needs real
+DDL — which is exactly what the main connection must never be able to run.
+Setting `QUERYNOT_SANDBOX_URL` opts into a second connection whose transactions
+are **read-write by necessity** (DDL forbids `BEGIN READ ONLY`) and always
+rolled back: `CREATE STATISTICS` → `ANALYZE` → re-`EXPLAIN` → `ROLLBACK`, in
+one transaction, on one connection. Three things follow, and the proof note
+states them too: the analysed query runs there without the read-only-transaction
+backstop (admission control, the statement timeout and the unconditional
+rollback still apply); the in-transaction `ANALYZE` holds a
+`ShareUpdateExclusive` lock on the table until the rollback; and sequences and
+externally-visible trigger effects still do not roll back. The contract is
+therefore that the sandbox is **disposable** — a copy, or a dev database whose
+locks and resampled statistics nobody will miss — and never production. The
+sandbox role must own the target tables (`CREATE STATISTICS` and
+in-transaction `ANALYZE` both require ownership; PG16's `MAINTAIN` privilege
+covers `ANALYZE` only).
 
 ### Privacy
 
