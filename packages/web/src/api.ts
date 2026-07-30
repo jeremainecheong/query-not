@@ -43,9 +43,13 @@ export type RewriteSeverity = 'critical' | 'warning' | 'info';
 /** A schema fact a generated rewrite depends on, established at prove time. */
 export interface RewritePrecondition {
   kind: string;
-  relation: string[];
-  column: string;
   why: string;
+  /** Column checks carry relation/column; unique-key checks relation/columns;
+      aggregate checks functions. The UI renders the composed evidence line. */
+  relation?: string[];
+  column?: string;
+  columns?: string[];
+  functions?: string[];
 }
 
 /** A ready-to-run rewritten statement, generated and structurally validated. */

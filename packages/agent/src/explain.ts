@@ -27,11 +27,19 @@ import type { Database } from './db.ts';
 import { admitGucs, admitIndexDdl, admitQuery, fingerprint } from './safety.ts';
 import { analyzeRewrites, type RewriteFinding } from './rewrite.ts';
 import {
+  buildAggregateProbe,
   buildCatalogProbe,
+  buildUniqueIndexProbe,
   buildVolatilityProbe,
+  interpretAggregateChecks,
   interpretChecks,
+  interpretUniqueChecks,
+  type AggregatePrecondition,
   type CatalogRow,
+  type ColumnPrecondition,
   type PreconditionCheck,
+  type UniqueIndexRow,
+  type UniqueKeyPrecondition,
 } from './catalog.ts';
 import {
   buildComparisonSql,
@@ -382,13 +390,40 @@ export async function whatIfRewrite(
     // Preconditions first, in the session whose search_path the query itself
     // gets. Failing any of them means the rewrite is not safe to run even for
     // comparison — the original's semantics are the only ones we know we have.
-    const probe = buildCatalogProbe(candidate.preconditions);
-    const probeRows: CatalogRow[] = candidate.preconditions.length > 0
-      ? (await client.query<CatalogRow>(probe.text, probe.values)).rows
-      : [];
+    // Each spec kind has its own probe; the verdicts reassemble in the order
+    // the transform declared them, which is the order the argument reads in.
+    const columnSpecs = candidate.preconditions.filter(
+      (p): p is ColumnPrecondition => p.kind === 'column-not-null' || p.kind === 'column-type-supported',
+    );
+    const uniqueSpecs = candidate.preconditions.filter(
+      (p): p is UniqueKeyPrecondition => p.kind === 'unique-key-covers',
+    );
+    const aggSpecs = candidate.preconditions.filter(
+      (p): p is AggregatePrecondition => p.kind === 'function-not-aggregate',
+    );
+
     const tz =
       (await client.query<{ tz: string }>(`SELECT current_setting('TimeZone') AS tz`)).rows[0]?.tz ?? 'UTC';
-    const preconditions = interpretChecks(candidate.preconditions, probeRows, { timeZone: tz });
+
+    const bySpec = new Map<unknown, PreconditionCheck>();
+    if (columnSpecs.length > 0) {
+      const probe = buildCatalogProbe(columnSpecs);
+      const rows = (await client.query<CatalogRow>(probe.text, probe.values)).rows;
+      for (const c of interpretChecks(columnSpecs, rows, { timeZone: tz })) bySpec.set(c.spec, c);
+    }
+    if (uniqueSpecs.length > 0) {
+      const probe = buildUniqueIndexProbe(uniqueSpecs);
+      const rows = (await client.query<UniqueIndexRow>(probe.text, probe.values)).rows;
+      for (const c of interpretUniqueChecks(uniqueSpecs, rows)) bySpec.set(c.spec, c);
+    }
+    if (aggSpecs.length > 0) {
+      const probe = buildAggregateProbe([...new Set(aggSpecs.flatMap((s) => s.functions))]);
+      const rows = (await client.query<{ proname: string }>(probe.text, probe.values)).rows;
+      for (const c of interpretAggregateChecks(aggSpecs, rows.map((r) => r.proname))) bySpec.set(c.spec, c);
+    }
+    const preconditions = candidate.preconditions
+      .map((p) => bySpec.get(p))
+      .filter((c): c is PreconditionCheck => c !== undefined);
 
     const failed = preconditions.filter((p) => !p.established);
     if (failed.length > 0) {
@@ -481,8 +516,13 @@ export async function whatIfRewrite(
       if (equivalence.status === 'match') {
         outcome = 'proven';
         // The structural fact leads the sentence: an on-data match can be
-        // coincidence, the schema fact is why it cannot be, here.
-        note = `${diff.summary.headline} Safe because ${established}. ${sentence(equivalence.note)}`;
+        // coincidence, the schema fact is why it cannot be, here. A rewrite
+        // with no preconditions (the OR split) is exact by construction, and
+        // the sentence should claim that rather than trail off.
+        const why = established.length > 0
+          ? `Safe because ${established}.`
+          : 'Safe by construction — the guards make the arms mutually exclusive, so no schema fact is needed.';
+        note = `${diff.summary.headline} ${why} ${sentence(equivalence.note)}`;
       } else {
         outcome = 'improved-unverified';
         note = `${diff.summary.headline} Row-level verification did not run: ${sentence(equivalence.note)}`;
