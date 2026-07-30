@@ -8,9 +8,12 @@ import {
   charToByteIndex,
   literalEnd,
   matchParen,
+  generateCorrelatedSelect,
   generateFunctionOnColumn,
   generateNotInList,
   generateNotInSubquery,
+  generateOrSplit,
+  validateReconstruction,
   validateSplice,
   type CandidateResult,
 } from '../src/transform.ts';
@@ -60,6 +63,20 @@ const dateCall = (sql: string): CandidateResult => {
   const expr = findNode(stmt, 'A_Expr', (n) => !!findNode(n, 'FuncCall'));
   assert.ok(expr, 'test fixture has no FuncCall comparison');
   return generateFunctionOnColumn(sql, stmt, expr);
+};
+
+const orSplit = (sql: string): CandidateResult => {
+  const stmt = stmtOf(sql);
+  const or = findNode(stmt, 'BoolExpr', (n) => n['boolop'] === 'OR_EXPR');
+  assert.ok(or, 'test fixture has no OR');
+  return generateOrSplit(sql, stmt, or);
+};
+
+const correlated = (sql: string): CandidateResult => {
+  const stmt = stmtOf(sql);
+  const link = findNode(stmt, 'SubLink', (n) => n['subLinkType'] === 'EXPR_SUBLINK');
+  assert.ok(link, 'test fixture has no EXPR_SUBLINK');
+  return generateCorrelatedSelect(sql, stmt, link);
 };
 
 const ok = (r: CandidateResult) => {
@@ -317,6 +334,267 @@ describe('generated candidates survive the advisor', () => {
     const c = ok(dateCall("SELECT id FROM orders WHERE date(created_at) = '2026-07-01'"));
     const kinds = analyzeRewrites(c.sql).map((f) => f.kind);
     assert.ok(!kinds.includes('function-on-column'), `still flagged: ${kinds.join(', ')}`);
+  });
+});
+
+describe('or-across-columns', () => {
+  test('splits a two-arm OR into guarded UNION ALL arms', () => {
+    const c = ok(orSplit("SELECT id, total FROM orders WHERE customer_id = 42 OR status = 'pending'"));
+    assert.ok(c.sql.includes('UNION ALL'));
+    assert.ok(c.sql.includes("status = 'pending' AND (customer_id = 42) IS NOT TRUE"));
+    assert.equal(c.preconditions.length, 0);
+  });
+
+  test('three arms get cumulative guards — one, then two', () => {
+    const c = ok(orSplit('SELECT id FROM t WHERE a = 1 OR b = 2 OR c = 3'));
+    assert.equal(c.sql.split('UNION ALL').length, 3);
+    assert.equal(c.sql.match(/IS NOT TRUE/g)?.length, 3);
+    assert.ok(c.sql.includes('c = 3 AND (a = 1) IS NOT TRUE AND (b = 2) IS NOT TRUE'));
+  });
+
+  test('parenthesised arms and a fully wrapped WHERE both slice cleanly', () => {
+    ok(orSplit('SELECT id FROM t WHERE (a = 1) OR (b = 2)'));
+    ok(orSplit('SELECT id FROM t WHERE (a = 1 OR b = 2)'));
+    ok(orSplit('SELECT id FROM t WHERE ((a = 1) OR (b = 2))'));
+  });
+
+  test('an arm that is itself an AND keeps a flat AND chain when guarded', () => {
+    // Reparsing flattens AND, so the expected tree must splice guards into the
+    // arm's own args — a nested BoolExpr here would fail validation.
+    const c = ok(orSplit('SELECT id FROM t WHERE (a = 1 AND c = 2) OR b = 3'));
+    assert.ok(c.sql.includes('b = 3 AND (a = 1 AND c = 2) IS NOT TRUE'));
+  });
+
+  test('ORDER BY and LIMIT hoist to the set operation, out of the arms', () => {
+    const c = ok(orSplit('SELECT id, created_at FROM t WHERE a = 1 OR b = 2 ORDER BY created_at DESC LIMIT 10'));
+    const arms = c.sql.split('UNION ALL');
+    assert.ok(!arms[0].includes('ORDER BY'));
+    assert.ok(/ORDER BY created_at DESC\s+LIMIT 10$/.test(c.sql.trim()));
+  });
+
+  test('a sort key that is not an output column name refuses', () => {
+    assert.match(blocked(orSplit('SELECT id FROM t WHERE a = 1 OR b = 2 ORDER BY t.id')), /output column/);
+    assert.match(blocked(orSplit('SELECT id FROM t WHERE a = 1 OR b = 2 ORDER BY lower(id)')), /output column/);
+  });
+
+  test('ordinal sort keys are fine', () => {
+    ok(orSplit('SELECT id FROM t WHERE a = 1 OR b = 2 ORDER BY 1'));
+  });
+
+  test('SELECT * splits, but not under ORDER BY', () => {
+    ok(orSplit('SELECT * FROM t WHERE a = 1 OR b = 2'));
+    assert.match(blocked(orSplit('SELECT * FROM t WHERE a = 1 OR b = 2 ORDER BY id')), /SELECT \*/);
+  });
+
+  test('refuses shapes the split would change: grouping, DISTINCT, windows, CTEs, locking', () => {
+    assert.match(blocked(orSplit('SELECT max(id) FROM t WHERE a = 1 OR b = 2 GROUP BY c')), /GROUP BY/);
+    assert.match(blocked(orSplit('SELECT DISTINCT id FROM t WHERE a = 1 OR b = 2')), /DISTINCT/);
+    assert.match(blocked(orSplit('SELECT sum(x) OVER () FROM t WHERE a = 1 OR b = 2')), /window/);
+    assert.match(blocked(orSplit('WITH w AS (SELECT 1) SELECT id FROM t WHERE a = 1 OR b = 2')), /WITH/);
+    assert.match(blocked(orSplit('SELECT id FROM t WHERE a = 1 OR b = 2 FOR UPDATE')), /locking/);
+  });
+
+  test('refuses an OR that is not the whole WHERE clause', () => {
+    assert.match(blocked(orSplit('SELECT id FROM t WHERE c = 1 AND (a = 1 OR b = 2)')), /whole\s+WHERE/);
+  });
+
+  test('a syntactic aggregate refuses; a plain call becomes a precondition', () => {
+    assert.match(blocked(orSplit('SELECT count(*) FROM t WHERE a = 1 OR b = 2')), /aggregate/);
+    const c = ok(orSplit('SELECT sum(total) FROM orders WHERE a = 1 OR b = 2'));
+    assert.equal(c.preconditions.length, 1);
+    const p = c.preconditions[0];
+    assert.equal(p.kind, 'function-not-aggregate');
+    assert.deepEqual(p.kind === 'function-not-aggregate' ? p.functions : [], ['sum']);
+  });
+
+  test('multibyte text ahead of the arms does not shift the slices', () => {
+    const c = ok(orSplit("SELECT id FROM t WHERE note = 'café' OR flag = true"));
+    // Once in its own arm, once inside the guard on the second arm.
+    assert.equal(c.sql.match(/café/g)?.length, 2);
+  });
+
+  test('a trailing semicolon does not leak into the arms', () => {
+    const c = ok(orSplit('SELECT id FROM t WHERE a = 1 OR b = 2;'));
+    assert.ok(!c.sql.includes(';'));
+  });
+
+  test('refuses multi-statement input rather than dropping a sibling', () => {
+    assert.match(blocked(orSplit('SELECT id FROM t WHERE a = 1 OR b = 2; SELECT 2')), /more than one statement/);
+  });
+});
+
+describe('correlated-subquery-in-select', () => {
+  const base = 'SELECT o.id, (SELECT u.name FROM users u WHERE u.id = o.user_id) FROM orders o';
+
+  test('hoists the value and joins the table, before the outer WHERE', () => {
+    const c = ok(correlated(`${base} WHERE o.total > 5`));
+    assert.ok(c.sql.includes('SELECT o.id, u.name FROM orders o'));
+    assert.ok(c.sql.includes('LEFT JOIN users u ON u.id = o.user_id'));
+    assert.ok(c.sql.indexOf('LEFT JOIN') < c.sql.indexOf('WHERE o.total'));
+  });
+
+  test('declares the unique-key precondition over the pinned columns', () => {
+    const c = ok(correlated(base));
+    assert.equal(c.preconditions.length, 1);
+    const p = c.preconditions[0];
+    assert.equal(p.kind, 'unique-key-covers');
+    if (p.kind === 'unique-key-covers') {
+      assert.deepEqual(p.relation, ['users']);
+      assert.deepEqual(p.columns, ['id']);
+    }
+  });
+
+  test('with no outer WHERE the join lands at the end', () => {
+    const c = ok(correlated(base));
+    assert.ok(c.sql.trimEnd().endsWith('ON u.id = o.user_id'));
+  });
+
+  test('an AS alias on the entry survives, attached to the hoisted value', () => {
+    const c = ok(correlated(`${base.replace(') FROM', ') AS username FROM')}`));
+    assert.ok(c.sql.includes('u.name AS username'));
+  });
+
+  test('only equality conjuncts pin; the rest travel into ON verbatim', () => {
+    const c = ok(correlated(
+      'SELECT o.id, (SELECT u.name FROM users u WHERE u.id = o.user_id AND u.created_at > o.created_at AND u.active = true) FROM orders o',
+    ));
+    const p = c.preconditions[0];
+    assert.ok(p.kind === 'unique-key-covers' && p.columns.join(',') === 'active,id');
+    assert.ok(c.sql.includes('ON u.id = o.user_id AND u.created_at > o.created_at AND u.active = true'));
+  });
+
+  test('joins after an existing outer join tree', () => {
+    const c = ok(correlated(
+      'SELECT o.id, (SELECT u.name FROM users u WHERE u.id = o.user_id) FROM orders o JOIN customers c ON c.id = o.customer_id',
+    ));
+    assert.ok(c.sql.indexOf('JOIN customers') < c.sql.indexOf('LEFT JOIN users'));
+  });
+
+  test('a parenthesised or compound value hoists cleanly', () => {
+    ok(correlated('SELECT o.id, (SELECT (u.a + u.b) FROM users u WHERE u.id = o.user_id) FROM orders o'));
+    const c = ok(correlated(
+      "SELECT o.id, (SELECT u.first || ' ' || u.last FROM users u WHERE u.id = o.user_id) FROM orders o",
+    ));
+    assert.ok(c.sql.includes("u.first || ' ' || u.last FROM orders o"));
+  });
+
+  test('multibyte literals inside the subquery do not shift the slices', () => {
+    const c = ok(correlated(
+      "SELECT o.id, (SELECT u.name FROM users u WHERE u.note = 'café' AND u.id = o.user_id) FROM orders o",
+    ));
+    assert.ok(c.sql.includes("ON u.note = 'café' AND u.id = o.user_id"));
+  });
+
+  test('refuses when the inner name would collide with an outer name', () => {
+    assert.match(
+      blocked(correlated('SELECT u.id, (SELECT u2.name FROM users u2 WHERE u2.id = u.ref) FROM accounts u2')),
+      /collide/,
+    );
+  });
+
+  test('refuses unqualified or unscopable references inside the subquery', () => {
+    assert.match(
+      blocked(correlated('SELECT o.id, (SELECT name FROM users u WHERE u.id = o.user_id) FROM orders o')),
+      /unqualified/,
+    );
+    assert.match(
+      blocked(correlated('SELECT o.id, (SELECT u.name FROM users u WHERE u.id = x.user_id) FROM orders o')),
+      /neither/,
+    );
+  });
+
+  test('refuses an uncorrelated subquery — it already runs once', () => {
+    assert.match(
+      blocked(correlated('SELECT o.id, (SELECT u.name FROM users u WHERE u.id = 1) FROM orders o')),
+      /not correlated/,
+    );
+  });
+
+  test('refuses when nothing is pinned by equality', () => {
+    assert.match(
+      blocked(correlated('SELECT o.id, (SELECT u.name FROM users u WHERE u.created_at > o.created_at) FROM orders o')),
+      /unique index/,
+    );
+  });
+
+  test('refuses a comma-separated outer FROM', () => {
+    assert.match(
+      blocked(correlated('SELECT o.id, (SELECT u.name FROM users u WHERE u.id = o.user_id) FROM orders o, customers c')),
+      /comma/,
+    );
+  });
+
+  test('refuses subquery shapes a plain join cannot express', () => {
+    assert.match(
+      blocked(correlated('SELECT o.id, (SELECT u.name FROM users u WHERE u.id = o.user_id LIMIT 1) FROM orders o')),
+      /LIMIT/,
+    );
+    assert.match(
+      blocked(correlated('SELECT o.id, (SELECT u.name FROM users u WHERE u.id = o.user_id ORDER BY u.name) FROM orders o')),
+      /lateral/,
+    );
+    assert.match(
+      blocked(correlated('SELECT o.id, (SELECT u.a, u.b FROM users u WHERE u.id = o.user_id) FROM orders o')),
+      /more than one column/,
+    );
+  });
+
+  test('count(*) refuses structurally; sum() becomes a precondition', () => {
+    assert.match(
+      blocked(correlated('SELECT o.id, (SELECT count(*) FROM order_items i WHERE i.order_id = o.id) FROM orders o')),
+      /grouped join/,
+    );
+    const c = ok(correlated('SELECT o.id, (SELECT sum(i.qty) FROM order_items i WHERE i.order_id = o.id) FROM orders o'));
+    assert.deepEqual(c.preconditions.map(p => p.kind), ['unique-key-covers', 'function-not-aggregate']);
+  });
+
+  test('refuses a subquery that is not itself the select-list entry', () => {
+    assert.match(
+      blocked(correlated('SELECT o.id, 1 + (SELECT u.n FROM users u WHERE u.id = o.id) FROM orders o')),
+      /nested inside an expression/,
+    );
+    assert.match(
+      blocked(correlated('SELECT o.id FROM orders o WHERE o.total > (SELECT u.n FROM users u WHERE u.id = o.id)')),
+      /select-list entry/,
+    );
+  });
+});
+
+describe('validateReconstruction', () => {
+  test('accepts equal structure regardless of formatting, refuses different structure', () => {
+    const want = parseSync('SELECT id FROM t WHERE a = 1').stmts[0].stmt;
+    assert.equal(validateReconstruction('SELECT id  FROM t /* c */ WHERE a = 1', want), null);
+    assert.match(validateReconstruction('SELECT id FROM t WHERE a = 2', want)!, /intended structure/);
+    assert.match(validateReconstruction('SELECT id FROM', want)!, /does not parse/);
+  });
+});
+
+describe('Tier B candidates survive the advisor', () => {
+  test('the OR split no longer trips or-across-columns and gets a candidate attached', async () => {
+    const { analyzeRewrites } = await import('../src/rewrite.ts');
+    const sql = "SELECT id FROM orders WHERE customer_id = 1 OR status = 'x'";
+    const finding = analyzeRewrites(sql).find(f => f.kind === 'or-across-columns');
+    assert.ok(finding?.candidate, `no candidate: ${finding?.candidateBlocked}`);
+    const again = analyzeRewrites(finding.candidate.sql).map(f => f.kind);
+    assert.ok(!again.includes('or-across-columns'), `still flagged: ${again.join(', ')}`);
+  });
+
+  test('the join rewrite no longer trips correlated-subquery-in-select', async () => {
+    const { analyzeRewrites } = await import('../src/rewrite.ts');
+    const sql = 'SELECT o.id, (SELECT u.name FROM users u WHERE u.id = o.user_id) FROM orders o';
+    const finding = analyzeRewrites(sql).find(f => f.kind === 'correlated-subquery-in-select');
+    assert.ok(finding?.candidate, `no candidate: ${finding?.candidateBlocked}`);
+    const again = analyzeRewrites(finding.candidate.sql).map(f => f.kind);
+    assert.ok(!again.includes('correlated-subquery-in-select'), `still flagged: ${again.join(', ')}`);
+  });
+
+  test('a nested-scope OR is blocked with a reason, not mis-generated', async () => {
+    const { analyzeRewrites } = await import('../src/rewrite.ts');
+    const sql = 'SELECT id FROM orders WHERE id IN (SELECT order_id FROM order_items WHERE qty = 1 OR price = 2)';
+    const finding = analyzeRewrites(sql).find(f => f.kind === 'or-across-columns');
+    assert.ok(finding, 'expected the nested OR finding');
+    assert.equal(finding.candidate, null);
+    assert.match(finding.candidateBlocked ?? '', /nested subquery/);
   });
 });
 
