@@ -9,10 +9,12 @@
 
 import {
   analyze,
+  describeNode,
   diffPlans,
   layoutFlame,
   narratePlan,
   parseExplainJson,
+  suggestExtendedStatistics,
   suggestIndexes,
   type Finding,
   type FlameLayout,
@@ -51,6 +53,26 @@ import {
   type ComparisonRow,
   type EquivalenceResult,
 } from './equivalence.ts';
+import {
+  buildAdviceDdl,
+  buildDependencyEvidenceSql,
+  buildProofDdl,
+  buildStatisticsProbe,
+  classifyOutcome,
+  composeStatisticsNote,
+  confirmConjunctionFromAst,
+  interpretStatisticsProbe,
+  parseDependencies,
+  pickTargetNode,
+  statisticsProbeUnavailable,
+  validateStatisticsColumns,
+  type DependencyPair,
+  type StatisticsAccuracySide,
+  type StatisticsFinding,
+  type StatisticsProbeCandidate,
+  type StatisticsProbeRow,
+  type StatisticsProof,
+} from './statistics.ts';
 import type { CandidateRewrite, GeneratedRewriteKind } from './transform.ts';
 
 export class AgentError extends Error {
@@ -77,6 +99,8 @@ export interface Analysis {
   plan: QueryPlan;
   findings: Finding[];
   indexSuggestions: IndexSuggestion[];
+  /** CREATE STATISTICS advice for correlated-column misestimates. */
+  statisticsSuggestions: StatisticsFinding[];
   /** Structural anti-patterns found in the SQL text itself, via the AST. */
   rewrites: RewriteFinding[];
   narration: string;
@@ -153,15 +177,110 @@ export async function analyzeQuery(
     console.warn('[agent] rewrite analysis skipped:', err instanceof Error ? err.message : err);
   }
 
+  // Same degradation posture for statistics advice: a probe or parse failure
+  // costs that one feature, never the analysis.
+  let statisticsSuggestions: StatisticsFinding[] = [];
+  try {
+    statisticsSuggestions = await deriveStatisticsSuggestions(db, sql, plan);
+  } catch (err) {
+    console.warn('[agent] statistics advice skipped:', err instanceof Error ? err.message : err);
+  }
+
   return {
     plan,
     findings: analyze(plan),
     indexSuggestions: suggestIndexes(plan),
+    statisticsSuggestions,
     rewrites,
     narration: narratePlan(plan),
     flame: layoutFlame(plan),
     fingerprint: fingerprint(sql),
   };
+}
+
+/**
+ * Refine core's extended-statistics candidates into findings.
+ *
+ * Layer 2 of the detection: core read columns out of deparsed plan text; here
+ * each candidate is re-checked against the SQL's AST — agreement upgrades the
+ * source to 'ast', an unresolvable scope (view, CTE, parser unavailable)
+ * downgrades confidence with a caveat naming the degradation, and a positive
+ * contradiction drops the candidate: refuse rather than guess. Then one
+ * catalog probe (fresh session, never cached) reports whether a covering
+ * statistics object already exists and in what state.
+ */
+async function deriveStatisticsSuggestions(
+  db: Database,
+  sql: string,
+  plan: QueryPlan,
+): Promise<StatisticsFinding[]> {
+  const candidates = suggestExtendedStatistics(plan);
+  if (candidates.length === 0) return [];
+
+  const refined: StatisticsFinding[] = [];
+  for (const candidate of candidates) {
+    const alias = plan.nodes.find((n) => n.id === candidate.nodeId)?.alias ?? null;
+    let source: StatisticsFinding['source'] = 'plan-text';
+    let confidence = candidate.confidence;
+    let caveat = candidate.caveat;
+    try {
+      const check = confirmConjunctionFromAst(sql, candidate.relation, alias, candidate.columns);
+      if (check.verdict === 'contradicted') {
+        console.warn(`[agent] statistics candidate dropped: ${check.reason}`);
+        continue;
+      }
+      if (check.verdict === 'confirmed') {
+        source = 'ast';
+        confidence = 'high';
+      }
+    } catch {
+      // Parser unavailable or the SQL did not parse — fall through to plan-text.
+    }
+    if (source === 'plan-text') {
+      confidence = confidence === 'high' ? 'medium' : confidence;
+      caveat = [caveat, 'Columns were read from the deparsed plan predicate, not the SQL.']
+        .filter((c): c is string => c !== null)
+        .join(' ');
+    }
+    refined.push({
+      ...candidate,
+      confidence,
+      caveat,
+      source,
+      existingState: 'unknown',
+      existing: null,
+      existingAdvice: null,
+    });
+  }
+  if (refined.length === 0) return [];
+
+  const probeCandidates: StatisticsProbeCandidate[] = refined.map((f) => ({
+    relation: f.relation,
+    columns: f.columns,
+    ratio: f.ratio,
+  }));
+  let checks;
+  try {
+    checks = await db.readOnlySession(async (client) => {
+      const probe = buildStatisticsProbe(probeCandidates);
+      const rows = (await client.query<StatisticsProbeRow>(probe.text, probe.values)).rows;
+      return interpretStatisticsProbe(probeCandidates, rows);
+    });
+  } catch (err) {
+    const failure = statisticsProbeUnavailable(err instanceof Error ? err.message : String(err));
+    checks = probeCandidates.map(() => failure);
+  }
+
+  return refined.map((finding, i) => {
+    const check = checks[i] ?? statisticsProbeUnavailable('probe returned no row');
+    return {
+      ...finding,
+      ddl: check.ddlOverride ?? finding.ddl,
+      existingState: check.existingState,
+      existing: check.existing,
+      existingAdvice: check.existingAdvice,
+    };
+  });
 }
 
 export interface WhatIfResult {
@@ -172,7 +291,8 @@ export interface WhatIfResult {
   change:
     | { kind: 'index'; ddl: string }
     | { kind: 'settings'; settings: Record<string, string> }
-    | { kind: 'rewrite'; sql: string };
+    | { kind: 'rewrite'; sql: string }
+    | { kind: 'statistics'; ddl: string };
   /** Findings on the after-plan, so you can see what the change did and did not fix. */
   findingsAfter: Finding[];
   /**
@@ -308,6 +428,183 @@ export async function whatIfSettings(
     note: opts.analyze
       ? 'Both plans were executed, so this comparison is measured wall-clock time. Run it more than once — a first run pays cold-cache costs the second does not.'
       : 'Neither plan was executed, so this compares planner cost estimates. Enable ANALYZE to measure it.',
+  };
+}
+
+/**
+ * Prove a CREATE STATISTICS suggestion on the opt-in sandbox.
+ *
+ * Nothing hypothetical exists for extended statistics, so this is the one
+ * what-if that needs real DDL — which is exactly what the main connection must
+ * never be able to run. The sandbox is a second, explicitly configured
+ * credential (QUERYNOT_SANDBOX_URL) pointing at a disposable copy; without it
+ * the endpoint refuses with the manual recipe and the advice stands on its own.
+ *
+ * One transaction, always rolled back: before-EXPLAIN ANALYZE, CREATE
+ * STATISTICS qn_proof_stats, ANALYZE <table>, after-EXPLAIN ANALYZE, a bonus
+ * in-transaction read of the computed dependency degrees, ROLLBACK (issued by
+ * the session wrapper's finally). The diffed quantity is estimate accuracy
+ * first — estimated rows moving toward actual on the matched node — with the
+ * plan-cost verdict riding separately in the embedded diff.
+ *
+ * The client sends only coordinates ({sql, relation, columns}); every
+ * statement that reaches the sandbox is composed server-side from quoteIdent'd
+ * validated parts, and the candidate is re-derived from the SQL's AST — a
+ * proof can only ever describe this agent's own advice.
+ */
+export async function whatIfStatistics(
+  sandbox: Database | null,
+  sql: string,
+  relation: string,
+  columnsInput: unknown,
+): Promise<StatisticsProof> {
+  if (!sandbox) {
+    throw new AgentError(
+      'No sandbox database is configured — CREATE STATISTICS cannot be tested hypothetically, and the agent\'s own role is read-only by design.',
+      'Point QUERYNOT_SANDBOX_URL at a disposable copy of the database (never production). Manual recipe: run the ' +
+        'suggested CREATE STATISTICS and ANALYZE there, re-run EXPLAIN (ANALYZE, BUFFERS), and compare estimated vs ' +
+        'actual rows on the scan.',
+      412,
+    );
+  }
+
+  const admission = admitQuery(sql);
+  if (!admission.ok) throw new AgentError(admission.reason ?? 'Query refused.');
+
+  const colCheck = validateStatisticsColumns(columnsInput);
+  if (!colCheck.ok) throw new AgentError(colCheck.reason);
+  const columns = columnsInput as string[];
+
+  // Re-derive the candidate server-side: if the SQL no longer pins exactly
+  // these columns as an equality conjunction on this relation, the client is
+  // holding stale coordinates — a conflict, not a guess.
+  const confirmation = confirmConjunctionFromAst(sql, relation, null, columns);
+  if (confirmation.verdict !== 'confirmed') {
+    throw new AgentError(
+      'The SQL no longer produces this candidate — re-run the analysis.',
+      confirmation.reason,
+      409,
+    );
+  }
+
+  const statement = sql.trim().replace(/;\s*$/, '');
+  const proofDdl = buildProofDdl(relation, columns);
+
+  let session: {
+    before: QueryPlan;
+    after: QueryPlan;
+    database: string;
+    dependency: { pairs: DependencyPair[]; raw: string } | null;
+  };
+  try {
+    // allowWrites opens a plain BEGIN — the transaction cannot be READ ONLY
+    // because CREATE STATISTICS is DDL — while SET LOCAL statement_timeout and
+    // the unconditional ROLLBACK in the session's finally still apply exactly
+    // as on the main path. Running without the read-only backstop is
+    // acceptable here and only here because the statement passed admitQuery,
+    // every other statement is composed from validated identifiers above, and
+    // the sandbox is opt-in and disposable by contract.
+    session = await sandbox.readOnlySession(
+      async (client) => {
+        const explain = async (): Promise<QueryPlan> => {
+          const res = await client.query<Record<string, unknown>>(
+            `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${statement}`,
+          );
+          const row = res.rows[0];
+          if (!row) throw new AgentError('EXPLAIN returned no rows.', null, 500);
+          return parseExplainJson(Object.values(row)[0] as unknown, statement);
+        };
+
+        const before = await explain();
+        await client.query(proofDdl.create);
+        await client.query(proofDdl.analyze);
+        const after = await explain();
+
+        const db = await client.query<{ db: string }>('SELECT current_database() AS db');
+
+        // The dependency citation is a bonus, never a gate: the transaction
+        // sees its own uncommitted object, but a lagging pg_stats_ext or an
+        // odd search_path must not fail a proof that already measured.
+        let dependency: { pairs: DependencyPair[]; raw: string } | null = null;
+        try {
+          const evidence = buildDependencyEvidenceSql();
+          const rows = await client.query<{ deps: string | null; colnames: string[] | null; attnums: string | null }>(
+            evidence.text,
+            evidence.values,
+          );
+          const row = rows.rows[0];
+          const pairs = parseDependencies(row?.deps ?? null, row?.attnums ?? null, row?.colnames ?? null);
+          if (pairs && row?.deps) dependency = { pairs, raw: row.deps };
+        } catch {
+          // Swallowed on purpose.
+        }
+
+        return { before, after, database: db.rows[0]?.db ?? 'unknown', dependency };
+      },
+      { allowWrites: true },
+    );
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === '42501') {
+      throw new AgentError(
+        'The sandbox role may not create statistics on that table.',
+        `CREATE STATISTICS and in-transaction ANALYZE both require the sandbox role to own ${relation} ` +
+          '(PG16’s MAINTAIN privilege covers ANALYZE only). Transfer ownership on the sandbox copy, or connect as the owner.',
+      );
+    }
+    if (code === '57014') {
+      throw new AgentError(
+        'The proof exceeded the agent’s statement timeout.',
+        'The sandbox ANALYZE samples the whole table and the query runs twice under EXPLAIN ANALYZE. ' +
+          'Raise QUERYNOT_STATEMENT_TIMEOUT_MS, or point the sandbox at a smaller copy.',
+      );
+    }
+    throw err;
+  }
+
+  const { before, after, database, dependency } = session;
+  const beforeNode = pickTargetNode(before, relation, columns);
+  const afterNode = pickTargetNode(after, relation, columns);
+
+  const side = (node: typeof beforeNode): StatisticsAccuracySide | null =>
+    node && node.misestimate !== null && node.actualRowsTotal !== null
+      ? { estimatedRows: node.estimatedRowsTotal, actualRows: node.actualRowsTotal, ratio: node.misestimate }
+      : null;
+  const beforeSide = side(beforeNode);
+  const afterSide = side(afterNode);
+  const accuracy =
+    beforeSide && afterSide && beforeNode
+      ? { before: beforeSide, after: afterSide, nodeLabel: describeNode(beforeNode) }
+      : null;
+
+  const diff = diffPlans(before, after);
+  const planDiff: WhatIfResult = {
+    before,
+    after,
+    diff,
+    change: { kind: 'statistics', ddl: proofDdl.create },
+    findingsAfter: analyze(after),
+    // Both sides executed — on the sandbox, which the note names.
+    costOnly: false,
+    note:
+      'Both plans were executed on the sandbox, so this comparison is measured there. Run it more than once — ' +
+      'a first run pays cold-cache costs the second does not.',
+  };
+
+  return {
+    ddl: proofDdl.create,
+    adviceDdl: buildAdviceDdl(relation, columns),
+    relation,
+    columns,
+    outcome: classifyOutcome(beforeSide, afterSide),
+    accuracy,
+    accuracyUnavailableReason: accuracy
+      ? null
+      : `No ${beforeSide ? 'after' : 'before'}-plan node on \`${relation}\` carried a measurable estimate for these columns — the plan diff below is the whole comparison.`,
+    dependency,
+    planDiff,
+    sandbox: { database },
+    note: composeStatisticsNote(database, relation),
   };
 }
 

@@ -18,6 +18,14 @@ const { Pool } = pg;
 
 export interface AgentConfig {
   connectionString: string;
+  /**
+   * Opt-in second connection for extended-statistics proofs. CREATE STATISTICS
+   * cannot be hypothetical, so proving one needs a role that can run DDL —
+   * which the main connection must never hold. Point this at a disposable copy
+   * (or, accepting the risks the README lists, a dev database). Null disables
+   * the feature; the suggestion then ships as advice with exact DDL.
+   */
+  sandboxUrl: string | null;
   /** Hard ceiling on any single statement. */
   statementTimeoutMs: number;
   /** Cap on concurrent connections the agent holds. */
@@ -31,6 +39,7 @@ export function configFromEnv(): AgentConfig {
       process.env['QUERYNOT_DATABASE_URL'] ??
       process.env['DATABASE_URL'] ??
       'postgres://localhost/postgres',
+    sandboxUrl: process.env['QUERYNOT_SANDBOX_URL'] ?? null,
     statementTimeoutMs: Number(process.env['QUERYNOT_STATEMENT_TIMEOUT_MS'] ?? 15_000),
     maxConnections: Number(process.env['QUERYNOT_MAX_CONNECTIONS'] ?? 4),
     applicationName: 'query-not-agent',

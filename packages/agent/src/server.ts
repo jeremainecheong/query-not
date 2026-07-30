@@ -20,6 +20,7 @@ import {
   whatIfIndex,
   whatIfRewrite,
   whatIfSettings,
+  whatIfStatistics,
 } from './explain.ts';
 import { fingerprint, TUNABLE_GUCS } from './safety.ts';
 import { analyzeRewrites, initParser, SqlParseError } from './rewrite.ts';
@@ -37,6 +38,24 @@ import {
 
 const config = configFromEnv();
 const db = new Database(config);
+
+/**
+ * The statistics sandbox — a second, opt-in connection with DDL rights on a
+ * disposable copy. The target pool above stays read-only by design; this one
+ * exists because CREATE STATISTICS cannot be hypothetical. One connection on
+ * purpose: an in-transaction ANALYZE holds ShareUpdateExclusive on the table
+ * until rollback, so proofs serialise instead of stacking behind each other's
+ * locks.
+ */
+const sandbox = config.sandboxUrl
+  ? new Database({
+      ...config,
+      connectionString: config.sandboxUrl,
+      maxConnections: 1,
+      applicationName: 'query-not-sandbox',
+    })
+  : null;
+
 const app = express();
 
 // The rewrite advisor's parser loads a wasm module once at startup. Tracked as
@@ -76,6 +95,20 @@ function requireSql(body: unknown): string {
 
 app.get('/api/health', async (_req, res) => {
   const probe = await db.probe();
+
+  // The sandbox is probed fresh alongside the target. canDdl is the bit the
+  // statistics proof actually needs — probe() already measures exactly it.
+  const sandboxProbe = sandbox ? await sandbox.probe() : null;
+  const sandboxHealth = sandboxProbe
+    ? {
+        configured: true,
+        connected: sandboxProbe.connected,
+        database: sandboxProbe.database,
+        canDdl: sandboxProbe.connected && !sandboxProbe.readOnlyRole,
+        error: sandboxProbe.error,
+      }
+    : null;
+
   res.json({
     agent: 'ok',
     statementTimeoutMs: config.statementTimeoutMs,
@@ -83,6 +116,7 @@ app.get('/api/health', async (_req, res) => {
     store: store.stats(),
     workload: { snapshots: store.workloadSnapshotCount() },
     database: probe,
+    sandbox: sandboxHealth,
     // Surfaced so the UI can warn rather than silently offering a broken feature.
     capabilities: {
       whatIfIndex: probe.hypopgInstalled,
@@ -96,6 +130,10 @@ app.get('/api/health', async (_req, res) => {
       // probed by function existence rather than version-string parsing. The
       // /api/indexes listing itself needs no extension; only proving does.
       dropIndex: probe.hypopgInstalled && probe.hypopgHideIndex,
+      // Statistics proofs run real (rolled-back) DDL, so they need the
+      // opt-in sandbox with a role that can write, plus the parser for the
+      // server-side candidate re-derivation.
+      proveStatistics: (sandboxHealth?.canDdl ?? false) && parserReady,
       persistence: true,
     },
   });
@@ -371,8 +409,9 @@ app.delete('/api/saved/:name', (req, res) => {
 app.post('/api/decisions', (req, res) => {
   try {
     const body = req.body ?? {};
-    if (body.kind !== 'index' && body.kind !== 'settings' && body.kind !== 'rewrite' && body.kind !== 'drop-index') {
-      throw new AgentError('kind must be "index", "settings", "rewrite" or "drop-index".');
+    const kinds = ['index', 'settings', 'rewrite', 'drop-index', 'statistics'];
+    if (!kinds.includes(body.kind)) {
+      throw new AgentError(`kind must be one of ${kinds.map((k) => `"${k}"`).join(', ')}.`);
     }
     if (typeof body.change !== 'string' || body.change.trim().length === 0) {
       throw new AgentError('Provide the "change" that was tested.');
@@ -448,6 +487,36 @@ app.post('/api/whatif/rewrite', async (req, res) => {
       throw new AgentError('Provide the finding\'s numeric "location", or null.');
     }
     res.json(await whatIfRewrite(db, sql, kind, location, { analyze: req.body?.analyze === true }));
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+/**
+ * Prove a CREATE STATISTICS suggestion on the opt-in sandbox.
+ *
+ * Coordinates only — {sql, relation, columns} — never DDL: every statement
+ * that reaches the sandbox is composed server-side from validated parts, and
+ * the candidate is re-derived from the SQL's AST (mismatch → 409). Without a
+ * configured sandbox this is a 412 that explains QUERYNOT_SANDBOX_URL and the
+ * manual recipe; the suggestion stands as advice either way.
+ */
+app.post('/api/whatif/statistics', async (req, res) => {
+  try {
+    const sql = requireSql(req.body);
+    if (!parserReady) {
+      throw new AgentError(
+        'The SQL parser failed to load; statistics proofs are unavailable.',
+        null,
+        503,
+      );
+    }
+    const relation = req.body?.relation;
+    if (typeof relation !== 'string' || relation.trim().length === 0) {
+      throw new AgentError('Provide the "relation" the statistics object would cover.');
+    }
+    const columns = req.body?.columns;
+    res.json(await whatIfStatistics(sandbox, sql, relation.trim(), columns));
   } catch (err) {
     fail(res, err);
   }
@@ -549,6 +618,19 @@ const server = app.listen(port, () => {
       console.warn('[agent] hypopg not installed: index what-ifs are unavailable until you CREATE EXTENSION hypopg.');
     }
   });
+  if (sandbox) {
+    sandbox.probe().then((p) => {
+      if (!p.connected) {
+        console.warn(`[agent] statistics sandbox not connected: ${p.error}`);
+      } else if (p.readOnlyRole) {
+        console.warn(
+          '[agent] statistics sandbox is configured but its role cannot run DDL — proofs will fail until it owns the target tables.',
+        );
+      } else {
+        console.log(`[agent] statistics sandbox: ${p.database} (proofs run there, in rolled-back transactions)`);
+      }
+    });
+  }
 });
 
 async function shutdown(signal: string): Promise<void> {
@@ -556,6 +638,7 @@ async function shutdown(signal: string): Promise<void> {
   server.close();
   store.close();
   await db.close();
+  await sandbox?.close();
   process.exit(0);
 }
 
