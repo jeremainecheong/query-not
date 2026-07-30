@@ -1,0 +1,18 @@
+[
+  {
+    "Plan": {
+      "Node Type": "Index Scan",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Scan Direction": "Forward",
+      "Index Name": "<13605>btree_orders_status_created_at",
+      "Relation Name": "orders",
+      "Alias": "orders",
+      "Startup Cost": 0.05,
+      "Total Cost": 1638.32,
+      "Plan Rows": 840,
+      "Plan Width": 81,
+      "Index Cond": "((status = 'disputed'::text) AND (created_at > (now() - '30 days'::interval)))"
+    }
+  }
+]
