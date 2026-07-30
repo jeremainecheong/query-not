@@ -592,6 +592,62 @@ check('yet the rows still match — exact even when slower',
   orProof.body.equivalence.rowsOriginal === orProof.body.equivalence.rowsRewritten,
   JSON.stringify(orProof.body.equivalence ?? {}).slice(0, 160));
 
+section('Prove a grouped-join rewrite (aggregate subquery)');
+
+// count(*) per outer row — the aggregate flavour of the hidden N+1. The
+// derived table groups by the correlation column, so fan-out is impossible by
+// construction; what must be proven is that count IS an aggregate.
+const GRP_SQL =
+  'SELECT o.id, (SELECT count(*) FROM order_items i WHERE i.order_id = o.id) AS items ' +
+  'FROM orders o WHERE o.id < 15000';
+const grpRw = await call('/api/rewrite', { sql: GRP_SQL });
+const grpFinding = (grpRw.body.rewrites ?? []).find((r) => r.kind === 'correlated-subquery-in-select');
+check('the finding carries the grouped derived table with COALESCE',
+  /LEFT JOIN \(SELECT i\.order_id, count\(\*\) AS agg FROM order_items i GROUP BY i\.order_id\)/.test(grpFinding?.candidate?.sql ?? '') &&
+  /COALESCE\(qn_0\.agg, 0\)/.test(grpFinding?.candidate?.sql ?? ''),
+  grpFinding?.candidateBlocked ?? 'no candidate');
+const grpProof = await call('/api/whatif/rewrite', {
+  sql: GRP_SQL, kind: 'correlated-subquery-in-select', location: grpFinding?.location ?? null,
+});
+check('the grouped join proves outright', grpProof.body.outcome === 'proven',
+  `outcome ${grpProof.body.outcome}: ${grpProof.body.note}`);
+check('aggregate-ness is cited from pg_proc',
+  grpProof.body.preconditions?.every((p) => p.established) &&
+  /pg_proc\.prokind/.test(grpProof.body.preconditions?.[0]?.evidence ?? ''),
+  JSON.stringify(grpProof.body.preconditions ?? []).slice(0, 200));
+check('rows match between subplan and grouped-join forms',
+  grpProof.body.equivalence?.status === 'match' &&
+  grpProof.body.equivalence.rowsOriginal === grpProof.body.equivalence.rowsRewritten,
+  JSON.stringify(grpProof.body.equivalence ?? {}).slice(0, 160));
+
+section('Prove a lateral top-1 rewrite');
+
+// Latest promotion per order. promotions_pkey covers (id) ⊆ {order_id, id},
+// so the pick is deterministic and the precondition establishes — while with
+// no index on order_id to drive the lateral, the honest verdict is no effect.
+const LAT_SQL =
+  'SELECT o.id, (SELECT p.applied_at FROM promotions p WHERE p.order_id = o.id ' +
+  'ORDER BY p.id DESC LIMIT 1) AS last_promo FROM orders o WHERE o.id < 40';
+const latRw = await call('/api/rewrite', { sql: LAT_SQL });
+const latFinding = (latRw.body.rewrites ?? []).find((r) => r.kind === 'correlated-subquery-in-select');
+check('the finding carries the verbatim lateral candidate',
+  /LEFT JOIN LATERAL \(SELECT p\.applied_at FROM promotions p WHERE p\.order_id = o\.id ORDER BY p\.id DESC LIMIT 1\) qn_0 ON true/
+    .test(latFinding?.candidate?.sql ?? ''),
+  latFinding?.candidateBlocked ?? 'no candidate');
+check('the outer AS alias survives the hoist',
+  /qn_0\.applied_at AS last_promo/.test(latFinding?.candidate?.sql ?? ''));
+const latProof = await call('/api/whatif/rewrite', {
+  sql: LAT_SQL, kind: 'correlated-subquery-in-select', location: latFinding?.location ?? null,
+});
+check('the tie-break precondition establishes via the primary key',
+  latProof.body.preconditions?.every((p) => p.established) &&
+  /promotions_pkey/.test(latProof.body.preconditions?.[0]?.evidence ?? ''),
+  JSON.stringify(latProof.body.preconditions ?? []).slice(0, 200));
+check('rows match and the verdict is honest, never differed',
+  latProof.body.equivalence?.status === 'match' &&
+  latProof.body.outcome !== 'differed' && latProof.body.outcome !== 'advice-only',
+  `outcome ${latProof.body.outcome}`);
+
 // An OR inside a subquery is out of the generator's scope, and the prove
 // endpoint must refuse it with the same reason the finding carries.
 const NESTED_OR_SQL =
