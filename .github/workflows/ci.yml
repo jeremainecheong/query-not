@@ -1,0 +1,59 @@
+# Full verification: unit tests, then both end-to-end suites against a real
+# Postgres with hypopg and pg_stat_statements — the same stack the agent talks
+# to in production. A suite that only runs against fixtures would not have
+# caught most of the bugs this project has already found.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # HypoPG and pg_stat_statements preinstalled; the index what-if and the
+        # workload view are both unavailable without them.
+        image: ghcr.io/hypopg/hypopg:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: querynot
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+
+    env:
+      PGPASSWORD: postgres
+      QUERYNOT_DATABASE_URL: postgres://postgres:postgres@localhost:5432/querynot
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Seed the test database
+        run: |
+          psql -h localhost -U postgres -d querynot -c 'CREATE EXTENSION IF NOT EXISTS hypopg'
+          psql -h localhost -U postgres -d querynot -f packages/core/test/fixtures/seed.sql
+
+      - run: npm run typecheck
+      - run: npm run build --workspace @query-not/core
+      - run: npm test
+
+      - name: Install a browser for the UI suite
+        run: npx playwright install --with-deps chromium
+
+      - name: End to end
+        run: npm run test:e2e

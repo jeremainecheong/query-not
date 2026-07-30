@@ -624,6 +624,96 @@ section('Query index');
   await ctx.close();
 }
 
+// ── Workload and decisions ───────────────────────────────────────────────────
+
+section('Workload page');
+{
+  const { ctx, page, errors } = await newPage();
+  await page.goto(new globalThis.URL('/workload', URL).toString(), { waitUntil: 'networkidle' });
+  await page.waitForSelector('.verdict, .alert', { timeout: 60000 });
+
+  const installed = (await page.locator('.workload-row').count()) > 0
+    || /snapshot/i.test(await page.locator('.main').innerText());
+
+  check('the workload page renders', installed);
+  if (await page.locator('.workload-row').count()) {
+    check('entries show total time, calls and share',
+      /total/.test(await page.locator('.workload-row__meta').first().innerText()));
+    check('the page explains it ranks by total, not mean',
+      /total time rather than mean|cheap query running constantly/i.test(await page.locator('.verdict__sub').innerText()));
+    check('a snapshot can be taken from the UI',
+      (await page.locator('button:has-text("Take snapshot")').count()) > 0);
+  }
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-workload.png`, fullPage: true });
+  await ctx.close();
+}
+
+section('Decisions page');
+{
+  const { ctx, page, errors } = await newPage();
+  // Prove an index so there is a decision to show.
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
+  await setSql(page, SEQ_QUERY);
+  await analyse(page);
+  await tab(page, 'Indexes');
+  await page.locator('button:has-text("Prove it")').first().click();
+  await page.waitForSelector('.proof__verdict', { timeout: 90000 });
+  await page.waitForTimeout(600);
+
+  await page.goto(new globalThis.URL('/decisions', URL).toString(), { waitUntil: 'networkidle' });
+  await page.waitForSelector('.decision-row, .empty', { timeout: 30000 });
+
+  check('proving an index records a decision automatically',
+    (await page.locator('.decision-row').count()) > 0,
+    'the decisions page should fill without an extra button nobody presses');
+  check('a decision shows what was tested',
+    /CREATE INDEX/i.test(await page.locator('.decision-row__change').first().innerText()));
+  check('a decision shows its verdict',
+    (await page.locator('.decision-row__verdict').first().innerText()).trim().length > 0);
+  check('a decision can be marked as shipped',
+    (await page.locator('.decision-row__actions input[type="checkbox"]').count()) > 0);
+
+  await page.locator('.decision-row__actions input[type="checkbox"]').first().check();
+  await page.waitForTimeout(500);
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForSelector('.decision-row', { timeout: 30000 });
+  check('shipped survives a reload',
+    await page.locator('.decision-row__actions input[type="checkbox"]').first().isChecked());
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-decisions.png`, fullPage: true });
+  await ctx.close();
+}
+
+section('Command palette');
+{
+  const { ctx, page } = await newPage();
+  await page.goto(URL, { waitUntil: 'networkidle' });
+
+  await page.keyboard.press('Control+k');
+  await page.waitForSelector('.palette', { timeout: 15000 });
+  check('cmd-K opens the palette', (await page.locator('.palette__input').count()) > 0);
+
+  await page.fill('.palette__input', 'hash join');
+  await page.waitForTimeout(200);
+  check('the palette searches operations, not just pages',
+    (await page.locator('.palette__item').allInnerTexts()).some((t) => /Hash Join/.test(t)));
+
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(600);
+  check('selecting an operation goes to the reference',
+    new globalThis.URL(page.url()).pathname === '/reference');
+
+  await page.keyboard.press('Control+k');
+  await page.waitForSelector('.palette', { timeout: 15000 });
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(200);
+  check('escape closes it', (await page.locator('.palette').count()) === 0);
+  await ctx.close();
+}
+
 // ── Accessibility ────────────────────────────────────────────────────────────
 
 section('Accessibility');

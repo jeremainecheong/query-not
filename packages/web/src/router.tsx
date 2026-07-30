@@ -18,6 +18,8 @@ export type Route =
   | { name: 'queries' }
   | { name: 'saved' }
   | { name: 'history'; fingerprint: string }
+  | { name: 'workload' }
+  | { name: 'decisions' }
   | { name: 'reference' };
 
 export function parsePath(pathname: string): Route {
@@ -28,6 +30,8 @@ export function parsePath(pathname: string): Route {
   if (parts[0] === 'a' && parts[1]) return { name: 'analysis', slug: decodeURIComponent(parts[1]) };
   if (parts[0] === 'queries') return { name: 'queries' };
   if (parts[0] === 'saved') return { name: 'saved' };
+  if (parts[0] === 'workload') return { name: 'workload' };
+  if (parts[0] === 'decisions') return { name: 'decisions' };
   if (parts[0] === 'reference') return { name: 'reference' };
   if (parts[0] === 'history' && parts[1]) {
     return { name: 'history', fingerprint: decodeURIComponent(parts[1]) };
@@ -46,6 +50,10 @@ export function pathFor(route: Route): string {
       return '/queries';
     case 'saved':
       return '/saved';
+    case 'workload':
+      return '/workload';
+    case 'decisions':
+      return '/decisions';
     case 'reference':
       return '/reference';
     case 'history':

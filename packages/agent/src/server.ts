@@ -8,6 +8,9 @@
 
 import express from 'express';
 import cors from 'cors';
+import { existsSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { configFromEnv, Database, describeDbError } from './db.ts';
 import {
@@ -21,6 +24,14 @@ import { fingerprint, TUNABLE_GUCS } from './safety.ts';
 import { analyzeRewrites, initParser, SqlParseError } from './rewrite.ts';
 import { Store } from './store.ts';
 import { buildHistory } from './history.ts';
+import {
+  collectWorkload,
+  deltaWorkload,
+  isExplainable,
+  probeWorkload,
+  rankWorkload,
+  type WorkloadEntry,
+} from './workload.ts';
 
 const config = configFromEnv();
 const db = new Database(config);
@@ -68,6 +79,7 @@ app.get('/api/health', async (_req, res) => {
     statementTimeoutMs: config.statementTimeoutMs,
     tunableSettings: [...TUNABLE_GUCS],
     store: store.stats(),
+    workload: { snapshots: store.workloadSnapshotCount() },
     database: probe,
     // Surfaced so the UI can warn rather than silently offering a broken feature.
     capabilities: {
@@ -184,6 +196,97 @@ app.get('/api/queries', (_req, res) => {
 app.get('/api/history/:fingerprint', (req, res) => {
   res.json(buildHistory(store, req.params.fingerprint));
 });
+
+// ── Workload ─────────────────────────────────────────────────────────────────
+
+/**
+ * Take a snapshot of the cumulative counters.
+ *
+ * Called on a timer by the agent and on demand from the UI. A single snapshot
+ * is not useful on its own — the delta between two is what describes a period.
+ */
+app.post('/api/workload/snapshot', async (_req, res) => {
+  try {
+    const availability = await probeWorkload(db);
+    if (!availability.installed) {
+      throw new AgentError(availability.reason ?? 'pg_stat_statements unavailable.', availability.hint, 412);
+    }
+    const entries = await collectWorkload(db);
+    const snapshot = store.recordWorkloadSnapshot(entries);
+    res.json({ ...snapshot, entries: entries.length });
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+/**
+ * The workload, ranked by total time over the most recent window.
+ *
+ * Ranked by total, never mean: the query taking 4ms that runs two million
+ * times a day costs more than the eight-second report, and only one of those
+ * shows up in a slow-query log.
+ */
+app.get('/api/workload', async (_req, res) => {
+  try {
+    const availability = await probeWorkload(db);
+    if (!availability.installed) {
+      res.json({ availability, window: null });
+      return;
+    }
+
+    const snapshots = store.recentWorkloadSnapshots(2);
+    const current = snapshots[0];
+
+    // Nothing recorded yet: take one now so the first visit shows something,
+    // clearly labelled as cumulative rather than a window.
+    if (!current) {
+      const entries = await collectWorkload(db);
+      store.recordWorkloadSnapshot(entries);
+      const { ranked, totalMs } = rankWorkload(entries);
+      res.json({
+        availability,
+        window: {
+          isDelta: false,
+          fromAt: null,
+          toAt: new Date().toISOString(),
+          resetDetected: false,
+          totalMs,
+          entries: ranked.map(withExplainable),
+        },
+        snapshots: store.workloadSnapshotCount(),
+      });
+      return;
+    }
+
+    const previous = snapshots[1];
+    const { entries, resetDetected } = deltaWorkload(
+      (previous?.entries as WorkloadEntry[] | undefined) ?? null,
+      current.entries as WorkloadEntry[],
+    );
+    const { ranked, totalMs } = rankWorkload(entries);
+
+    res.json({
+      availability,
+      window: {
+        isDelta: Boolean(previous),
+        fromAt: previous?.takenAt ?? null,
+        toAt: current.takenAt,
+        resetDetected,
+        totalMs,
+        entries: ranked.map(withExplainable),
+      },
+      snapshots: store.workloadSnapshotCount(),
+    });
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+/** Attach whether the normalised text can be planned as-is (§6.1). */
+function withExplainable<T extends { query: string }>(entry: T) {
+  const { ok, reason } = isExplainable(entry.query);
+  return { ...entry, explainable: ok, notExplainableReason: reason };
+}
 
 app.get('/api/saved', (_req, res) => {
   res.json({ queries: store.listSavedQueries() });
@@ -326,6 +429,23 @@ app.post('/api/analyze/verified', async (req, res) => {
   }
 });
 
+/**
+ * Serve the built UI from the agent, so production is one process.
+ *
+ * Registered after every /api route so it can never shadow one, and it falls
+ * through to index.html for unknown paths because the router is client-side —
+ * without that, refreshing /reference would 404.
+ */
+const webDist = resolve(dirname(fileURLToPath(import.meta.url)), '../../web/dist');
+const servingUi = existsSync(join(webDist, 'index.html'));
+
+if (servingUi) {
+  app.use(express.static(webDist, { index: false, maxAge: '1h' }));
+  app.get(/^(?!\/api\/).*/, (_req, res) => {
+    res.sendFile(join(webDist, 'index.html'));
+  });
+}
+
 await initParser()
   .then(() => {
     parserReady = true;
@@ -338,6 +458,11 @@ const port = Number(process.env['QUERYNOT_PORT'] ?? 5174);
 const server = app.listen(port, () => {
   console.log(`[agent] listening on http://localhost:${port}`);
   console.log(`[agent] statement_timeout ${config.statementTimeoutMs}ms, max ${config.maxConnections} connections`);
+  console.log(
+    servingUi
+      ? `[agent] serving the UI from ${webDist}`
+      : '[agent] API only — run `npm run build --workspace @query-not/web` to serve the UI from here too',
+  );
   db.probe().then((p) => {
     if (!p.connected) {
       console.warn(`[agent] not connected: ${p.error}`);

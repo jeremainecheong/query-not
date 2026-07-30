@@ -121,6 +121,15 @@ CREATE TABLE IF NOT EXISTS decisions (
   created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS decisions_by_query ON decisions (fingerprint, created_at DESC, id DESC);
+
+-- Workload snapshots. Counters are cumulative, so a single snapshot says
+-- nothing about a period; two of them say everything.
+CREATE TABLE IF NOT EXISTS workload_snapshots (
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  taken_at TEXT NOT NULL,
+  entries  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS workload_by_time ON workload_snapshots (taken_at DESC, id DESC);
 `;
 
 /** URL-safe, short enough to paste in chat, long enough not to collide. */
@@ -444,6 +453,47 @@ export class Store {
       | Record<string, unknown>
       | undefined;
     return row ? toDecision(row) : null;
+  }
+
+  // ── Workload snapshots ─────────────────────────────────────────────────────
+
+  recordWorkloadSnapshot(entries: unknown, keep = 48): { id: number; takenAt: string } {
+    const takenAt = nowIso();
+    this.db
+      .prepare('INSERT INTO workload_snapshots (taken_at, entries) VALUES (?, ?)')
+      .run(takenAt, JSON.stringify(entries));
+    const row = this.db.prepare('SELECT id FROM workload_snapshots ORDER BY id DESC LIMIT 1').get() as
+      | { id: number }
+      | undefined;
+
+    // Bounded history; a snapshot is a few hundred KB and they add up.
+    this.db
+      .prepare(
+        `DELETE FROM workload_snapshots WHERE id NOT IN (
+           SELECT id FROM workload_snapshots ORDER BY taken_at DESC, id DESC LIMIT ?
+         )`,
+      )
+      .run(keep);
+
+    return { id: row?.id ?? 0, takenAt };
+  }
+
+  /** The two most recent snapshots, newest first. */
+  recentWorkloadSnapshots(count = 2): Array<{ id: number; takenAt: string; entries: unknown }> {
+    const rows = this.db
+      .prepare('SELECT * FROM workload_snapshots ORDER BY taken_at DESC, id DESC LIMIT ?')
+      .all(count) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: row['id'] as number,
+      takenAt: row['taken_at'] as string,
+      entries: JSON.parse(row['entries'] as string),
+    }));
+  }
+
+  workloadSnapshotCount(): number {
+    return (
+      (this.db.prepare('SELECT count(*) AS n FROM workload_snapshots').get() as { n: number } | undefined)?.n ?? 0
+    );
   }
 
   stats(): { analyses: number; savedQueries: number; decisions: number; queries: number } {

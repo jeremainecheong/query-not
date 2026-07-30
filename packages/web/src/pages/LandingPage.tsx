@@ -70,6 +70,11 @@ export function LandingPage({ health }: { health: Health | null }) {
           body="Paste a query. Get the hotspot, the wasted work, and index suggestions that are tested before they are shown."
         />
         <Card
+          to={{ name: 'workload' }}
+          title="Workload"
+          body="What the server is actually spending its day on, ranked by total time — not the slow query everyone notices, the cheap one running constantly."
+        />
+        <Card
           to={{ name: 'queries' }}
           title="Query history"
           body="Every run is recorded. When a plan changes shape — an index scan becoming a sequential scan — you can see exactly when."
@@ -82,6 +87,11 @@ export function LandingPage({ health }: { health: Health | null }) {
           body="Name the queries you care about so their history is easy to find later."
           count={health?.store?.savedQueries}
           countLabel="saved"
+        />
+        <Card
+          to={{ name: 'decisions' }}
+          title="Decisions"
+          body="What was tested, what it concluded, and whether it ever shipped. The reasoning survives the person who did the testing."
         />
         <Card
           to={{ name: 'reference' }}
