@@ -164,6 +164,22 @@ app.get('/api/analyses', (req, res) => {
   res.json({ analyses: store.recentAnalyses(Number(req.query['limit'] ?? 25)) });
 });
 
+/**
+ * One row per distinct query, with how many times its plan changed.
+ *
+ * The regression count comes from the same buildHistory the detail page uses,
+ * so the number in the list and the entries on the page cannot disagree.
+ */
+app.get('/api/queries', (_req, res) => {
+  const groups = store.queryGroups().map((g) => ({
+    ...g,
+    regressions: buildHistory(store, g.fingerprint).regressions.filter((r) => r.worse).length,
+  }));
+  // Queries whose plans have moved matter more than ones that have not.
+  groups.sort((a, b) => b.regressions - a.regressions || b.lastSeen.localeCompare(a.lastSeen));
+  res.json({ queries: groups });
+});
+
 /** Plan history for one query, with the points where it changed shape. */
 app.get('/api/history/:fingerprint', (req, res) => {
   res.json(buildHistory(store, req.params.fingerprint));

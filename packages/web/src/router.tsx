@@ -12,34 +12,42 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 import type { ReactNode } from 'react';
 
 export type Route =
-  | { name: 'new' }
+  | { name: 'home' }
+  | { name: 'analyse' }
   | { name: 'analysis'; slug: string }
+  | { name: 'queries' }
   | { name: 'saved' }
   | { name: 'history'; fingerprint: string }
-  | { name: 'decisions' };
+  | { name: 'reference' };
 
 export function parsePath(pathname: string): Route {
   const parts = pathname.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
 
-  if (parts.length === 0) return { name: 'new' };
+  if (parts.length === 0) return { name: 'home' };
+  if (parts[0] === 'analyse') return { name: 'analyse' };
   if (parts[0] === 'a' && parts[1]) return { name: 'analysis', slug: decodeURIComponent(parts[1]) };
+  if (parts[0] === 'queries') return { name: 'queries' };
   if (parts[0] === 'saved') return { name: 'saved' };
-  if (parts[0] === 'decisions') return { name: 'decisions' };
+  if (parts[0] === 'reference') return { name: 'reference' };
   if (parts[0] === 'history' && parts[1]) {
     return { name: 'history', fingerprint: decodeURIComponent(parts[1]) };
   }
-  // Anything unrecognised lands on the composer rather than a dead end.
-  return { name: 'new' };
+  // Anything unrecognised lands on the front door rather than a dead end.
+  return { name: 'home' };
 }
 
 export function pathFor(route: Route): string {
   switch (route.name) {
+    case 'analyse':
+      return '/analyse';
     case 'analysis':
       return `/a/${encodeURIComponent(route.slug)}`;
+    case 'queries':
+      return '/queries';
     case 'saved':
       return '/saved';
-    case 'decisions':
-      return '/decisions';
+    case 'reference':
+      return '/reference';
     case 'history':
       return `/history/${encodeURIComponent(route.fingerprint)}`;
     default:

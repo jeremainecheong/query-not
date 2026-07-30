@@ -14,13 +14,25 @@ import { describeNode } from './parse.ts';
 import { formatMs, formatPercent, formatRatio, formatRows } from './format.ts';
 import type { PlanNode, QueryPlan } from './types.ts';
 
-interface NodeExplanation {
+/**
+ * How operations group in the reference. Ordered roughly by how often someone
+ * looking at a slow plan needs them.
+ */
+export type NodeFamily = 'scan' | 'join' | 'aggregate' | 'order' | 'parallel' | 'other';
+
+export interface NodeExplanation {
   /** What this operation does, in one sentence. */
   what: string;
   /** When the planner chooses it. */
   why: string;
   /** The failure mode to watch for. */
   watch: string | null;
+  family: NodeFamily;
+}
+
+export interface NodeTypeEntry extends NodeExplanation {
+  /** The Postgres node type, exactly as it appears in EXPLAIN output. */
+  nodeType: string;
 }
 
 const GLOSSARY: Record<string, NodeExplanation> = {
@@ -28,121 +40,145 @@ const GLOSSARY: Record<string, NodeExplanation> = {
     what: 'Reads every row in the table, start to finish.',
     why: 'Chosen when no useful index exists, or when the planner expects to match so much of the table that scanning it in physical order beats jumping around an index.',
     watch: 'A sequential scan that returns a small fraction of what it reads is doing avoidable work — that is the classic missing-index shape.',
+    family: 'scan',
   },
   'Index Scan': {
     what: 'Walks an index to find matching rows, then fetches each one from the table.',
     why: 'Chosen when the planner expects few enough matches that the per-row heap fetch is cheaper than reading the whole table.',
     watch: 'Each match costs a random heap read. If the planner underestimated the match count, this can end up slower than a sequential scan.',
+    family: 'scan',
   },
   'Index Only Scan': {
     what: 'Answers entirely from the index, never touching the table.',
     why: 'Possible when every column the query needs is present in the index and the visibility map says the pages are all-visible.',
     watch: 'Heap Fetches above zero means the visibility map was stale and it had to touch the table anyway — a vacuum problem.',
+    family: 'scan',
   },
   'Bitmap Heap Scan': {
     what: 'Builds a bitmap of matching row locations from an index, then reads the table in physical order.',
     why: 'A middle ground: too many matches for row-at-a-time index lookups, too few to justify reading everything. Sorting the reads makes them sequential rather than random.',
     watch: 'If the bitmap outgrows work_mem it degrades to tracking whole pages, forcing a recheck of every row on them.',
+    family: 'scan',
   },
   'Bitmap Index Scan': {
     what: 'Scans the index to build the bitmap the Bitmap Heap Scan above it will use.',
     why: 'Always paired with a Bitmap Heap Scan.',
     watch: null,
+    family: 'scan',
   },
   'Nested Loop': {
     what: 'For every row from the outer side, scans the inner side for matches.',
     why: 'Cheapest join when the outer side yields very few rows, because it has no setup cost at all.',
     watch: 'Cost scales with outer rows multiplied by inner cost. A handful of outer rows is fine; an underestimate that turns ten into ten thousand is how a fast query becomes a timeout.',
+    family: 'join',
   },
   'Hash Join': {
     what: 'Builds a hash table from one side, then probes it with rows from the other.',
     why: 'Chosen for equality joins on larger inputs — building the table costs upfront, but each probe is then near-constant time.',
     watch: 'The hash table must fit in work_mem. If it does not, the join splits into batches and each batch means another pass over the data.',
+    family: 'join',
   },
   'Merge Join': {
     what: 'Walks two sorted inputs in step, matching as it goes.',
     why: 'Efficient when both inputs are already sorted on the join key, often because indexes provided the order for free.',
     watch: 'If the inputs are not already sorted, the sorts required to enable this can cost more than a hash join would have.',
+    family: 'join',
   },
   Hash: {
     what: 'Builds the hash table that the Hash Join above it probes.',
     why: 'Always paired with a Hash Join.',
     watch: 'Its memory use is what decides whether the join spills to batches.',
+    family: 'join',
   },
   Sort: {
     what: 'Orders rows.',
     why: 'Required by ORDER BY, and by merge joins and some aggregates that need sorted input.',
     watch: 'A sort that exceeds work_mem spills to disk, which is dramatically slower. An index providing the order can remove the sort entirely.',
+    family: 'order',
   },
   Aggregate: {
     what: 'Reduces many rows to a summary — count, sum, avg and friends.',
     why: 'Required by aggregate functions without GROUP BY, or over already-grouped input.',
     watch: null,
+    family: 'aggregate',
   },
   HashAggregate: {
     what: 'Groups rows using a hash table keyed on the grouping columns.',
     why: 'The usual choice for GROUP BY when the input is not already sorted.',
     watch: 'Like a hash join, it needs the group keys to fit in work_mem, and spills if they do not.',
+    family: 'aggregate',
   },
   GroupAggregate: {
     what: 'Groups rows arriving in sorted order, emitting each group as it ends.',
     why: 'Chosen when the input is already sorted on the grouping key, which makes grouping nearly free.',
     watch: null,
+    family: 'aggregate',
   },
   Limit: {
     what: 'Stops after the requested number of rows.',
     why: 'LIMIT — and it can stop the nodes beneath it early too.',
     watch: 'A LIMIT with a large OFFSET still has to produce and discard every skipped row. Keyset pagination avoids that.',
+    family: 'order',
   },
   Gather: {
     what: 'Collects rows from parallel workers back into a single stream.',
     why: 'The boundary where a parallel plan becomes serial again.',
     watch: 'If fewer workers launch than were planned, the plan was costed for parallelism it never got.',
+    family: 'parallel',
   },
   'Gather Merge': {
     what: 'Collects rows from parallel workers while preserving their sort order.',
     why: 'Used when a parallel plan must stay ordered.',
     watch: null,
+    family: 'parallel',
   },
   Materialize: {
     what: 'Caches its input so the node above can re-read it without recomputing.',
     why: 'Usually inserted on the inner side of a nested loop, so repeated scans hit the cache instead of the table.',
     watch: null,
+    family: 'other',
   },
   Memoize: {
     what: 'Caches inner-side results keyed by the join parameters, reusing them across loop iterations.',
     why: 'Added when the planner expects the same lookup to repeat within a nested loop.',
     watch: 'Only pays off when the outer side has repeating values. Check the hit rate.',
+    family: 'other',
   },
   'CTE Scan': {
     what: 'Reads the materialised result of a WITH clause.',
     why: 'Chosen when the CTE was materialised rather than inlined.',
     watch: 'A materialised CTE is an optimisation fence — predicates from the outer query cannot be pushed into it. MATERIALIZED and NOT MATERIALIZED let you control this explicitly.',
+    family: 'scan',
   },
   'Subquery Scan': {
     what: 'Reads the output of a subquery that could not be flattened into the parent.',
     why: 'Appears when a subquery has to be evaluated on its own terms.',
     watch: null,
+    family: 'scan',
   },
   Append: {
     what: 'Concatenates the output of several child plans.',
     why: 'UNION ALL, and scanning multiple partitions.',
     watch: 'On a partitioned table, a large child count can mean partition pruning did not happen.',
+    family: 'other',
   },
   Unique: {
     what: 'Removes adjacent duplicate rows from sorted input.',
     why: 'DISTINCT or UNION over already-sorted rows.',
     watch: null,
+    family: 'aggregate',
   },
   'Function Scan': {
     what: 'Reads rows returned by a set-returning function.',
     why: 'A function appears in the FROM clause.',
     watch: 'The planner has almost no idea how many rows a function will return — it guesses 1000 by default. ROWS on the function definition improves that.',
+    family: 'scan',
   },
   Result: {
     what: 'Evaluates an expression without reading a table.',
     why: 'A constant or computed row, or a one-time filter that turned out to be false.',
     watch: null,
+    family: 'other',
   },
 };
 
@@ -150,7 +186,28 @@ const FALLBACK: NodeExplanation = {
   what: 'Processes rows from its children.',
   why: 'Chosen by the planner as part of the overall strategy.',
   watch: null,
+  family: 'other',
 };
+
+/**
+ * The whole glossary, as a list.
+ *
+ * Exported so the reference page renders from the same source the narrator
+ * reads. Two copies of this would drift, and a reference that disagrees with
+ * the explanation shown next to a real plan is worse than no reference.
+ */
+export const NODE_TYPES: NodeTypeEntry[] = Object.entries(GLOSSARY)
+  .map(([nodeType, entry]) => ({ nodeType, ...entry }))
+  .sort((a, b) => a.nodeType.localeCompare(b.nodeType));
+
+export const NODE_FAMILIES: Array<{ id: NodeFamily; label: string; blurb: string }> = [
+  { id: 'scan', label: 'Reading tables', blurb: 'How rows get off disk. Most slow queries are decided here.' },
+  { id: 'join', label: 'Combining tables', blurb: 'Three strategies with very different cost curves.' },
+  { id: 'aggregate', label: 'Summarising', blurb: 'Collapsing many rows into few.' },
+  { id: 'order', label: 'Ordering and limiting', blurb: 'Sorting, and stopping early.' },
+  { id: 'parallel', label: 'Parallelism', blurb: 'Where a plan splits across workers and comes back together.' },
+  { id: 'other', label: 'Plumbing', blurb: 'Nodes that move or cache rows without changing them much.' },
+];
 
 export function explainNodeType(nodeType: string): NodeExplanation {
   if (GLOSSARY[nodeType]) return GLOSSARY[nodeType] as NodeExplanation;

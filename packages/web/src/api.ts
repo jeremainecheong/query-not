@@ -76,6 +76,28 @@ export interface Decision {
   createdAt: string;
 }
 
+export interface AnalysisSummary {
+  slug: string;
+  fingerprint: string;
+  sql: string;
+  analyzed: boolean;
+  totalMs: number | null;
+  totalCost: number;
+  createdAt: string;
+}
+
+export interface QueryGroup {
+  fingerprint: string;
+  sql: string;
+  runs: number;
+  firstSeen: string;
+  lastSeen: string;
+  lastMs: number | null;
+  lastCost: number;
+  savedAs: string | null;
+  regressions: number;
+}
+
 export interface HistoryPoint {
   slug: string;
   createdAt: string;
@@ -209,6 +231,11 @@ export const api = {
 
   history: (fingerprint: string) =>
     request<HistoryReport>(`/api/history/${encodeURIComponent(fingerprint)}`),
+
+  recentAnalyses: (limit = 25) =>
+    request<{ analyses: AnalysisSummary[] }>(`/api/analyses?limit=${limit}`),
+
+  queries: () => request<{ queries: QueryGroup[] }>('/api/queries'),
 
   listSaved: () => request<{ queries: SavedQuery[] }>('/api/saved'),
 

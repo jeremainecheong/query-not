@@ -372,11 +372,12 @@ over an IR we already have.
 | Plan graph + ranked hotspots | `packages/web/src/components/{PlanGraph,Hotspots}.tsx` |
 | Agent-side store (node:sqlite) | `packages/agent/src/store.ts` |
 | Plan history + regression detection | `packages/agent/src/history.ts` |
-| Routing, saved queries, history pages | `packages/web/src/{router.tsx,pages/}` |
+| Routing and pages | `packages/web/src/{router.tsx,pages/}` |
+| Operation reference + diagrams | `packages/web/src/{pages/ReferencePage,components/ScanDiagram}.tsx` |
 | Web UI | `packages/web/` |
 | End-to-end suites | `e2e/` |
 
-**405 checks** — 189 unit, 107 API end-to-end, 109 browser end-to-end. Core's fixtures are
+**426 checks** — 189 unit, 107 API end-to-end, 130 browser end-to-end. Core's fixtures are
 real `EXPLAIN` output from a seeded Postgres, including a before/after pair captured
 either side of a live HypoPG hypothetical index.
 
