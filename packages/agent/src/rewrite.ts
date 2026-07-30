@@ -428,11 +428,12 @@ function checkBoolExpr(expr: Node, sql: string, push: Push): void {
       'A single index cannot satisfy both sides of an OR across different columns. Postgres may manage a BitmapOr over two ' +
       'indexes, but it often falls back to a sequential scan instead.',
     suggestion:
-      'If the plan shows a sequential scan here, try UNION ALL of two indexed queries — each arm can then use its own index. ' +
-      'Add a de-duplicating UNION only if the arms can overlap.',
+      'If the plan shows a sequential scan here, try UNION ALL of per-arm queries — each arm can then use its own index. ' +
+      'Guard each later arm with AND (earlier arm) IS NOT TRUE so the arms stay mutually exclusive.',
     semanticChange:
-      'UNION ALL keeps duplicates that a single OR predicate would have returned once. Use UNION, or an explicit ' +
-      'anti-overlap condition, when a row can satisfy both arms.',
+      'A bare UNION ALL returns a row once per arm it matches, where the OR returned it once. The IS NOT TRUE guards ' +
+      'restore exactness — each row lands in exactly one arm, NULLs included — and a de-duplicating UNION is not a fix, ' +
+      'since it would also collapse rows that were legitimately duplicated.',
     location,
     snippet: snippetAt(sql, location),
   });
@@ -515,7 +516,8 @@ function checkCorrelatedSubqueryInSelect(stmt: Node, sql: string, push: Push): v
         'evaluated once as a set.',
       semanticChange:
         'A scalar subquery returns NULL when it matches nothing and errors when it matches more than one row. A LEFT JOIN ' +
-        'preserves the NULL but multiplies outer rows on multiple matches — aggregate or use LIMIT 1 to keep the cardinality.',
+        'preserves the NULL but silently multiplies outer rows when several match. A unique index over the join columns ' +
+        'rules that out — which is what the generated rewrite requires as a precondition before anything runs.',
       location,
       snippet: snippetAt(sql, location),
     });

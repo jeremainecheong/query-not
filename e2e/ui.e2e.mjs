@@ -398,6 +398,56 @@ section('Generated rewrite proof');
   await ctx.close();
 }
 
+section('Tier B rewrite proofs');
+{
+  const { ctx, page, errors } = await newPage();
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
+
+  // The hidden N+1: a scalar subquery per row, provable as a LEFT JOIN
+  // because customers.id is unique.
+  await setSql(page,
+    'SELECT o.id, (SELECT c.email FROM customers c WHERE c.id = o.customer_id) AS email FROM orders o WHERE o.id < 20000');
+  await analyse(page);
+  await tab(page, 'Rewrites');
+
+  const candidate = page.locator('.code--candidate').first();
+  check('the correlated finding shows the LEFT JOIN candidate',
+    /LEFT JOIN customers/.test(await candidate.innerText()));
+
+  await page.locator('.suggestion button:has-text("Prove it")').first().click();
+  await page.waitForSelector('.preconditions', { timeout: 90000 });
+  await page.waitForTimeout(300);
+
+  const panel = await page.locator('.proof').first().innerText();
+  check('the unique index is cited as the reason it cannot fan out',
+    /customers_pkey/.test(panel) && /at most one row/.test(panel), panel.slice(0, 200));
+  check('the verdict is Proven', /Proven/.test(panel), panel.slice(0, 80));
+
+  // The OR split: exact by construction, honestly worse without indexes —
+  // and with no preconditions, no empty list may render.
+  await setSql(page, "SELECT id FROM orders WHERE status = 'disputed' OR total_cents > 495000");
+  await analyse(page);
+  await tab(page, 'Rewrites');
+
+  const orCandidate = page.locator('.code--candidate').first();
+  check('the OR finding shows the guarded UNION ALL candidate',
+    /UNION ALL/.test(await orCandidate.innerText()) && /IS NOT TRUE/.test(await orCandidate.innerText()));
+
+  await page.locator('.suggestion button:has-text("Prove it")').first().click();
+  await page.waitForSelector('.proof', { timeout: 90000 });
+  await page.waitForTimeout(300);
+
+  const orPanel = await page.locator('.proof').first().innerText();
+  check('the losing split says so', /Made it worse/.test(orPanel), orPanel.slice(0, 80));
+  check('while the rows still matched', /identical rows/.test(orPanel), orPanel.slice(0, 200));
+  check('no empty precondition list renders for a construction-exact rewrite',
+    (await page.locator('.proof .preconditions').count()) === 0);
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-tierb-proof.png`, fullPage: true });
+  await ctx.close();
+}
+
 // ── Estimate-only ────────────────────────────────────────────────────────────
 
 section('Estimate-only mode');

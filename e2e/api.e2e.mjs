@@ -508,6 +508,102 @@ const rwDecision = await call('/api/decisions', {
 });
 check('decisions accept kind rewrite', rwDecision.status === 200, JSON.stringify(rwDecision.body).slice(0, 120));
 
+// ── Tier B: statement restructurings ─────────────────────────────────────────
+
+section('Prove a correlated-subquery rewrite');
+
+// The hidden N+1: a scalar subquery per output row. customers.id is the
+// primary key, so the LEFT JOIN provably cannot fan out — the strongest
+// result in the product, and it must prove outright.
+const CORR_SQL =
+  'SELECT o.id, (SELECT c.email FROM customers c WHERE c.id = o.customer_id) AS email ' +
+  'FROM orders o WHERE o.id < 20000';
+const corrRw = await call('/api/rewrite', { sql: CORR_SQL });
+const corrFinding = (corrRw.body.rewrites ?? []).find((r) => r.kind === 'correlated-subquery-in-select');
+check('the finding carries the LEFT JOIN candidate',
+  /LEFT JOIN customers c ON c\.id = o\.customer_id/.test(corrFinding?.candidate?.sql ?? ''),
+  corrFinding?.candidateBlocked ?? 'no candidate');
+check('the candidate declares unique-key coverage over the pinned column',
+  corrFinding?.candidate?.preconditions?.some(
+    (p) => p.kind === 'unique-key-covers' && (p.columns ?? []).join() === 'id'),
+  JSON.stringify(corrFinding?.candidate?.preconditions ?? []));
+
+const corrProof = await call('/api/whatif/rewrite', {
+  sql: CORR_SQL, kind: 'correlated-subquery-in-select', location: corrFinding?.location ?? null,
+});
+check('the per-row subquery proves as a join', corrProof.body.outcome === 'proven',
+  `outcome ${corrProof.body.outcome}: ${corrProof.body.note}`);
+check('the unique index is cited by name',
+  corrProof.body.preconditions?.every((p) => p.established) &&
+  /customers_pkey/.test(corrProof.body.note ?? ''),
+  corrProof.body.note);
+check('rows match between subquery and join forms',
+  corrProof.body.equivalence?.status === 'match' &&
+  corrProof.body.equivalence.rowsOriginal === corrProof.body.equivalence.rowsRewritten &&
+  (corrProof.body.equivalence.rowsOriginal ?? 0) > 0,
+  JSON.stringify(corrProof.body.equivalence ?? {}).slice(0, 160));
+check('the plan verdict behind it is improved',
+  corrProof.body.planDiff?.diff?.summary?.verdict === 'improved');
+
+// The refusal that makes the precondition load-bearing: promotions.order_id
+// has no unique index, and genuinely holds several rows per order — the join
+// would fan out where the subquery would error. Nothing may execute.
+const FANOUT_SQL =
+  'SELECT o.id, (SELECT p.applied_at FROM promotions p WHERE p.order_id = o.id) ' +
+  'FROM orders o WHERE o.id < 100';
+const fanoutProof = await call('/api/whatif/rewrite', {
+  sql: FANOUT_SQL, kind: 'correlated-subquery-in-select',
+  location: (await call('/api/rewrite', { sql: FANOUT_SQL }))
+    .body.rewrites?.find((r) => r.kind === 'correlated-subquery-in-select')?.location ?? null,
+});
+check('a non-unique correlation downgrades to advice-only', fanoutProof.body.outcome === 'advice-only',
+  `outcome ${fanoutProof.body.outcome}`);
+check('nothing was executed for it',
+  fanoutProof.body.planDiff === null && fanoutProof.body.equivalence === null);
+check('the refusal names the missing unique index',
+  fanoutProof.body.preconditions?.some((p) => !p.established && /no unique index on `promotions`/.test(p.evidence)),
+  JSON.stringify(fanoutProof.body.preconditions ?? []).slice(0, 200));
+
+section('Prove an OR-split rewrite');
+
+// Neither arm is indexed here, so the honest verdict is that the split loses —
+// and the equivalence guard still has to hold, because the transform is exact
+// whether or not it is faster. A tool that only reports wins is an ad.
+const OR_SQL = "SELECT id FROM orders WHERE status = 'disputed' OR total_cents > 495000";
+const orRw = await call('/api/rewrite', { sql: OR_SQL });
+const orFinding = (orRw.body.rewrites ?? []).find((r) => r.kind === 'or-across-columns');
+check('the finding carries the guarded UNION ALL candidate',
+  /UNION ALL/.test(orFinding?.candidate?.sql ?? '') &&
+  /AND \(status = 'disputed'\) IS NOT TRUE/.test(orFinding?.candidate?.sql ?? ''),
+  orFinding?.candidateBlocked ?? 'no candidate');
+check('the split declares no preconditions — it is exact by construction',
+  orFinding?.candidate?.preconditions?.length === 0);
+check('the arms are not parenthesised, so the candidate passes admission',
+  /^SELECT/.test(orFinding?.candidate?.sql ?? ''));
+
+const orProof = await call('/api/whatif/rewrite', {
+  sql: OR_SQL, kind: 'or-across-columns', location: orFinding?.location ?? null,
+});
+check('the unindexed split honestly regresses', orProof.body.outcome === 'regressed',
+  `outcome ${orProof.body.outcome}: ${orProof.body.note}`);
+check('and says do not apply', /do not apply/.test(orProof.body.note ?? ''), orProof.body.note);
+check('yet the rows still match — exact even when slower',
+  orProof.body.equivalence?.status === 'match' &&
+  orProof.body.equivalence.rowsOriginal === orProof.body.equivalence.rowsRewritten,
+  JSON.stringify(orProof.body.equivalence ?? {}).slice(0, 160));
+
+// An OR inside a subquery is out of the generator's scope, and the prove
+// endpoint must refuse it with the same reason the finding carries.
+const NESTED_OR_SQL =
+  "SELECT id FROM orders WHERE id IN (SELECT order_id FROM order_items WHERE qty = 1 OR sku = 'SKU-1')";
+const nestedOr = await call('/api/whatif/rewrite', {
+  sql: NESTED_OR_SQL, kind: 'or-across-columns',
+  location: (await call('/api/rewrite', { sql: NESTED_OR_SQL }))
+    .body.rewrites?.find((r) => r.kind === 'or-across-columns')?.location ?? null,
+});
+check('a nested-scope OR refuses with the reason', nestedOr.status === 409 && /nested subquery/.test(nestedOr.body.error ?? ''),
+  JSON.stringify(nestedOr.body).slice(0, 160));
+
 // ── Verify the database was never mutated ────────────────────────────────────
 
 section('Nothing was written');
