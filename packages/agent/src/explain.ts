@@ -21,9 +21,27 @@ import {
   type QueryPlan,
 } from '@query-not/core';
 
+import { parseSync } from 'libpg-query';
+
 import type { Database } from './db.ts';
 import { admitGucs, admitIndexDdl, admitQuery, fingerprint } from './safety.ts';
 import { analyzeRewrites, type RewriteFinding } from './rewrite.ts';
+import {
+  buildCatalogProbe,
+  buildVolatilityProbe,
+  interpretChecks,
+  type CatalogRow,
+  type PreconditionCheck,
+} from './catalog.ts';
+import {
+  buildComparisonSql,
+  equivalenceGuard,
+  harvestFunctionNames,
+  interpretComparison,
+  type ComparisonRow,
+  type EquivalenceResult,
+} from './equivalence.ts';
+import type { CandidateRewrite, GeneratedRewriteKind } from './transform.ts';
 
 export class AgentError extends Error {
   readonly hint: string | null;
@@ -141,7 +159,10 @@ export interface WhatIfResult {
   after: QueryPlan;
   diff: PlanDiff;
   /** What was changed to produce `after`. */
-  change: { kind: 'index'; ddl: string } | { kind: 'settings'; settings: Record<string, string> };
+  change:
+    | { kind: 'index'; ddl: string }
+    | { kind: 'settings'; settings: Record<string, string> }
+    | { kind: 'rewrite'; sql: string };
   /** Findings on the after-plan, so you can see what the change did and did not fix. */
   findingsAfter: Finding[];
   /**
@@ -278,6 +299,204 @@ export async function whatIfSettings(
       ? 'Both plans were executed, so this comparison is measured wall-clock time. Run it more than once — a first run pays cold-cache costs the second does not.'
       : 'Neither plan was executed, so this compares planner cost estimates. Enable ANALYZE to measure it.',
   };
+}
+
+export type RewriteProofOutcome =
+  | 'proven'
+  | 'improved-unverified'
+  | 'no-effect'
+  | 'regressed'
+  | 'differed'
+  | 'advice-only';
+
+export interface RewriteProof {
+  candidate: CandidateRewrite;
+  preconditions: PreconditionCheck[];
+  outcome: RewriteProofOutcome;
+  /** Null when preconditions failed — nothing was executed. */
+  planDiff: WhatIfResult | null;
+  /** Null when preconditions failed. `not-checkable` when the guard refused. */
+  equivalence: EquivalenceResult | null;
+  /** The composed verdict sentence, citing its evidence. */
+  note: string;
+}
+
+const sentence = (s: string): string =>
+  s.length > 0 ? `${s.charAt(0).toUpperCase()}${s.slice(1)}${/[.!?]$/.test(s) ? '' : '.'}` : s;
+
+/**
+ * Prove a generated rewrite, or refuse with the reason.
+ *
+ * The client sends only the finding's coordinates. The candidate is re-derived
+ * here from the submitted SQL, so a proof can only ever describe this agent's
+ * own transform — never text something else edited.
+ *
+ * The checks run in one read-only session, in a fixed order, and each layer
+ * stops the next: preconditions that fail mean nothing executes at all;
+ * a guard-refused equivalence downgrades `proven` to `improved-unverified`;
+ * a row mismatch overrides everything and says do not apply. `proven` means
+ * the preconditions held as schema facts, the planner preferred the rewrite,
+ * and both forms returned identical rows on the current data — with the note
+ * citing all three, because a claim without its evidence is just a vibe.
+ */
+export async function whatIfRewrite(
+  db: Database,
+  sql: string,
+  kind: GeneratedRewriteKind,
+  location: number | null,
+  opts: { analyze?: boolean } = {},
+): Promise<RewriteProof> {
+  const admission = admitQuery(sql);
+  if (!admission.ok) throw new AgentError(admission.reason ?? 'Query refused.');
+
+  const finding = analyzeRewrites(sql).find((f) => f.kind === kind && f.location === location);
+  if (!finding) {
+    throw new AgentError('The SQL no longer produces this finding — re-run the analysis.', null, 409);
+  }
+  if (!finding.candidate) {
+    throw new AgentError(
+      finding.candidateBlocked ?? 'No generated rewrite exists for this finding.',
+      null,
+      409,
+    );
+  }
+  const candidate = finding.candidate;
+
+  // Generated output is untrusted by design. If it cannot pass the same gate
+  // as user input, nothing runs — and that is a bug worth a 500, not a quiet
+  // downgrade.
+  const rewrittenAdmission = admitQuery(candidate.sql);
+  if (!rewrittenAdmission.ok) {
+    throw new AgentError(
+      `The generated rewrite failed admission: ${rewrittenAdmission.reason}`,
+      null,
+      500,
+    );
+  }
+
+  const statement = sql.trim().replace(/;\s*$/, '');
+  const rewritten = candidate.sql.trim().replace(/;\s*$/, '');
+  const measured = opts.analyze ?? false;
+
+  return db.readOnlySession(async (client) => {
+    // Preconditions first, in the session whose search_path the query itself
+    // gets. Failing any of them means the rewrite is not safe to run even for
+    // comparison — the original's semantics are the only ones we know we have.
+    const probe = buildCatalogProbe(candidate.preconditions);
+    const probeRows: CatalogRow[] = candidate.preconditions.length > 0
+      ? (await client.query<CatalogRow>(probe.text, probe.values)).rows
+      : [];
+    const tz =
+      (await client.query<{ tz: string }>(`SELECT current_setting('TimeZone') AS tz`)).rows[0]?.tz ?? 'UTC';
+    const preconditions = interpretChecks(candidate.preconditions, probeRows, { timeZone: tz });
+
+    const failed = preconditions.filter((p) => !p.established);
+    if (failed.length > 0) {
+      return {
+        candidate,
+        preconditions,
+        outcome: 'advice-only' as const,
+        planDiff: null,
+        equivalence: null,
+        note: `Not executed: ${failed.map((f) => f.evidence).join('; ')}. The written advice and its caveat stand.`,
+      };
+    }
+
+    const explain = async (text: string): Promise<QueryPlan> => {
+      const res = await client.query<Record<string, unknown>>(
+        `EXPLAIN (${measured ? 'ANALYZE, BUFFERS, ' : ''}FORMAT JSON) ${text}`,
+      );
+      const row = res.rows[0];
+      if (!row) throw new AgentError('EXPLAIN returned no rows.', null, 500);
+      return parseExplainJson(Object.values(row)[0] as unknown, text);
+    };
+
+    const before = await explain(statement);
+    const after = await explain(rewritten);
+    const diff = diffPlans(before, after);
+    const planDiff: WhatIfResult = {
+      before,
+      after,
+      diff,
+      change: { kind: 'rewrite', sql: candidate.sql },
+      findingsAfter: analyze(after),
+      costOnly: !measured,
+      note: measured
+        ? 'Both forms were executed, so this comparison is measured wall-clock time. Run it more than once — a first run pays cold-cache costs the second does not.'
+        : 'Neither form was executed for the plan comparison, so it reflects planner cost estimates. Enable ANALYZE to measure it.',
+    };
+
+    // Row-level equivalence, where a row-level claim is sound at all.
+    const tree = parseSync(statement);
+    const names = harvestFunctionNames(tree);
+    let volatile = new Set<string>();
+    if (names.length > 0) {
+      const vp = buildVolatilityProbe(names);
+      const vrows = await client.query<{ proname: string }>(vp.text, vp.values);
+      volatile = new Set(vrows.rows.map((r) => r.proname));
+    }
+
+    const guard = equivalenceGuard(tree, volatile);
+    let equivalence: EquivalenceResult;
+    if (!guard.checkable) {
+      equivalence = {
+        status: 'not-checkable',
+        rowsOriginal: null,
+        rowsRewritten: null,
+        onlyInOriginal: null,
+        onlyInRewritten: null,
+        comparedAs: null,
+        note: guard.reason,
+      };
+    } else {
+      // Parallel workers reorder floating-point aggregation, which is the one
+      // known source of false mismatch we can simply remove. SET LOCAL dies
+      // with the transaction.
+      await client.query('SET LOCAL max_parallel_workers_per_gather = 0');
+      const cmp = buildComparisonSql(statement, rewritten);
+      try {
+        const row = (await client.query<ComparisonRow>(cmp.text)).rows[0]!;
+        equivalence = interpretComparison(row, cmp.cap, 'native');
+      } catch (err) {
+        if ((err as { code?: string }).code === '42883') {
+          // The row type has no equality operator (json, xml, point); compare
+          // the rows' text form and say so.
+          const textCmp = buildComparisonSql(statement, rewritten, { asText: true });
+          const row = (await client.query<ComparisonRow>(textCmp.text)).rows[0]!;
+          equivalence = interpretComparison(row, textCmp.cap, 'text');
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    const established = preconditions.map((p) => p.evidence).join('; ');
+    const verdict = diff.summary.verdict;
+    let outcome: RewriteProofOutcome;
+    let note: string;
+    if (equivalence.status === 'mismatch') {
+      outcome = 'differed';
+      note = sentence(equivalence.note);
+    } else if (verdict === 'improved') {
+      if (equivalence.status === 'match') {
+        outcome = 'proven';
+        // The structural fact leads the sentence: an on-data match can be
+        // coincidence, the schema fact is why it cannot be, here.
+        note = `${diff.summary.headline} Safe because ${established}. ${sentence(equivalence.note)}`;
+      } else {
+        outcome = 'improved-unverified';
+        note = `${diff.summary.headline} Row-level verification did not run: ${sentence(equivalence.note)}`;
+      }
+    } else if (verdict === 'regressed') {
+      outcome = 'regressed';
+      note = `${diff.summary.headline} The planner prefers the original on this database — do not apply.`;
+    } else {
+      outcome = 'no-effect';
+      note = `${diff.summary.headline}${equivalence.status === 'match' ? ` ${sentence(equivalence.note)}` : ''}`;
+    }
+
+    return { candidate, preconditions, outcome, planDiff, equivalence, note };
+  });
 }
 
 /**

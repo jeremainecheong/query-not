@@ -9,6 +9,7 @@
 --                                        cannot see with per-column statistics
 --   * wide-ish rows + no index         → sequential scans that discard most reads
 
+DROP TABLE IF EXISTS promotions CASCADE;
 DROP TABLE IF EXISTS order_items CASCADE;
 DROP TABLE IF EXISTS orders CASCADE;
 DROP TABLE IF EXISTS customers CASCADE;
@@ -78,6 +79,26 @@ FROM generate_series(1, 800000) g;
 -- Deliberately minimal indexing: the point is for the tool to find what's missing.
 CREATE INDEX ON order_items (order_id);
 
+-- A table with a genuinely nullable column, so the NOT IN → NOT EXISTS
+-- precondition check has something real to refuse: ~2% of order_id is NULL,
+-- which is exactly the case where the two forms return different rows.
+-- applied_at is NOT NULL and indexed, so the date() range rewrite has an index
+-- to win with.
+CREATE TABLE promotions (
+    id         bigserial PRIMARY KEY,
+    order_id   bigint,
+    applied_at timestamp NOT NULL
+);
+
+INSERT INTO promotions (order_id, applied_at)
+SELECT
+    CASE WHEN g % 50 = 0 THEN NULL ELSE 1 + (g * 7) % 400000 END,
+    now() - (g % 400) * interval '1 day'
+FROM generate_series(1, 200000) g;
+
+CREATE INDEX ON promotions (applied_at);
+
 ANALYZE customers;
 ANALYZE orders;
 ANALYZE order_items;
+ANALYZE promotions;
