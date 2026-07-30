@@ -24,6 +24,8 @@ export interface Health {
     readOnlyRole: boolean;
     hypopgAvailable: boolean;
     hypopgInstalled: boolean;
+    /** hypopg_hide_index exists — hiding arrived in hypopg 1.4.0. */
+    hypopgHideIndex?: boolean;
     error: string | null;
   };
   capabilities: {
@@ -33,6 +35,8 @@ export interface Health {
     rewriteAdvisor: boolean;
     /** Generated rewrites can be proven — needs a connection and the parser. */
     proveRewrite?: boolean;
+    /** Drop proofs need hypopg 1.4+ (hypopg_hide_index) on the target. */
+    dropIndex?: boolean;
     persistence: boolean;
   };
   store?: { analyses: number; savedQueries: number; decisions: number; queries: number };
@@ -96,7 +100,7 @@ export interface Decision {
   id: number;
   analysisSlug: string | null;
   fingerprint: string;
-  kind: 'index' | 'settings';
+  kind: 'index' | 'settings' | 'rewrite' | 'drop-index';
   change: string;
   verdict: string;
   headline: string;
@@ -269,6 +273,78 @@ export interface RewriteProof {
   note: string;
 }
 
+// ── Index inventory and drop proofs ──────────────────────────────────────────
+
+export interface IndexDisqualifier {
+  kind: 'primary-key' | 'unique' | 'exclusion-constraint' | 'replica-identity' | 'constraint-backing';
+  evidence: string;
+}
+
+export interface IndexInventoryEntry {
+  schema: string;
+  table: string;
+  index: string;
+  definition: string;
+  sizeBytes: number;
+  scans: number;
+  lastScanAt: string | null;
+  valid: boolean;
+  droppableForPerformance: boolean;
+  disqualifiers: IndexDisqualifier[];
+  evidence: string;
+}
+
+export interface IndexInventory {
+  statsResetAt: string | null;
+  hasLastScan: boolean;
+  statsNote: string;
+  indexes: IndexInventoryEntry[];
+}
+
+export interface ProofSetSkip {
+  source: 'store' | 'workload';
+  fingerprint: string | null;
+  reason: string;
+}
+
+export interface PerQueryDropResult {
+  fingerprint: string;
+  sql: string;
+  source: 'store' | 'workload';
+  usedIndex: boolean;
+  verdict: 'improved' | 'regressed' | 'unchanged' | 'restructured' | null;
+  headline: string | null;
+  costBefore: number | null;
+  costAfter: number | null;
+  costChange: number | null;
+  accessChanges: string[];
+  error: string | null;
+}
+
+export type DropOutcome = 'no-plan-changed' | 'plans-changed-not-worse' | 'regressed';
+
+export interface DropIndexProof {
+  index: { schema: string; table: string; name: string; definition: string; sizeBytes: number };
+  usage: {
+    scans: number | null;
+    lastScanAt: string | null;
+    statsResetAt: string | null;
+    evidence: string;
+  };
+  perQuery: PerQueryDropResult[];
+  coverage: {
+    tested: number;
+    fromStore: number;
+    fromWorkload: number;
+    skipped: ProofSetSkip[];
+    capped: boolean;
+    cap: number;
+  };
+  outcome: DropOutcome;
+  costOnly: true;
+  note: string;
+}
+
 export class ApiError extends Error {
   readonly hint: string | null;
   constructor(message: string, hint: string | null = null) {
@@ -345,6 +421,17 @@ export const api = {
 
   workload: () => request<WorkloadResponse>('/api/workload'),
 
+  /** Every user index with usage evidence; needs no extension. */
+  indexes: () => request<IndexInventory>('/api/indexes'),
+
+  /**
+   * Prove an index is safe to drop. Only the name (and optional schema) is
+   * sent — the server resolves, disqualifies, hides and re-plans in its own
+   * single session, so no SQL or oid ever crosses the wire.
+   */
+  whatIfDropIndex: (index: string, schema: string | null) =>
+    request<DropIndexProof>('/api/whatif/drop-index', { index, schema }),
+
   workloadSnapshot: () =>
     request<{ id: number; takenAt: string; entries: number }>('/api/workload/snapshot', {}),
 
@@ -363,7 +450,7 @@ export const api = {
   recordDecision: (input: {
     analysisSlug: string | null;
     fingerprint: string;
-    kind: 'index' | 'settings' | 'rewrite';
+    kind: 'index' | 'settings' | 'rewrite' | 'drop-index';
     change: string;
     verdict: string;
     headline: string;

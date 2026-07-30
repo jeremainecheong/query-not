@@ -9,6 +9,7 @@ import { LandingPage } from './pages/LandingPage';
 import { QueriesPage } from './pages/QueriesPage';
 import { ReferencePage } from './pages/ReferencePage';
 import { WorkloadPage } from './pages/WorkloadPage';
+import { IndexesPage } from './pages/IndexesPage';
 import { DecisionsPage } from './pages/DecisionsPage';
 import { CommandPalette } from './components/CommandPalette';
 import { FlameGraph } from './components/FlameGraph';
@@ -146,6 +147,12 @@ export function App() {
             Workload
           </Link>
           <Link
+            className={`header__link${route.name === 'indexes' ? ' header__link--active' : ''}`}
+            to={{ name: 'indexes' }}
+          >
+            Indexes
+          </Link>
+          <Link
             className={`header__link${route.name === 'queries' || route.name === 'history' ? ' header__link--active' : ''}`}
             to={{ name: 'queries' }}
           >
@@ -200,6 +207,8 @@ export function App() {
               navigate({ name: 'analyse' });
             }}
           />
+        ) : route.name === 'indexes' ? (
+          <IndexesPage canProve={health?.capabilities.dropIndex ?? false} />
         ) : route.name === 'decisions' ? (
           <DecisionsPage />
         ) : route.name === 'reference' ? (

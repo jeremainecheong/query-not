@@ -17,6 +17,18 @@ import { api, type Decision } from '../api';
 import { Link } from '../router';
 import { relative } from './SavedPage';
 
+/**
+ * Verdict vocabularies differ by proof kind — what-ifs say 'improved', drop
+ * proofs say 'no-plan-changed' — but the page renders them uniformly. Anything
+ * unrecognised falls back to the neutral "No effect".
+ */
+const VERDICT_STYLE: Record<string, { label: string; dot: 'good' | 'critical' | 'muted' }> = {
+  improved: { label: 'Proven', dot: 'good' },
+  regressed: { label: 'Made it worse', dot: 'critical' },
+  'no-plan-changed': { label: 'Safe to drop', dot: 'good' },
+  'plans-changed-not-worse': { label: 'Changed, not worse', dot: 'muted' },
+};
+
 export function DecisionsPage() {
   const [decisions, setDecisions] = useState<Decision[] | null>(null);
 
@@ -85,17 +97,14 @@ export function DecisionsPage() {
       </section>
 
       <div className="group">
-        {decisions.map((d) => (
+        {decisions.map((d) => {
+          const style = VERDICT_STYLE[d.verdict] ?? { label: 'No effect', dot: 'muted' as const };
+          return (
           <div className="group__row decision-row" key={d.id}>
             <div className="decision-row__main">
               <div className="decision-row__head">
-                <span
-                  className={`dot dot--${d.verdict === 'improved' ? 'good' : d.verdict === 'regressed' ? 'critical' : 'muted'}`}
-                  aria-hidden="true"
-                />
-                <span className="decision-row__verdict">
-                  {d.verdict === 'improved' ? 'Proven' : d.verdict === 'regressed' ? 'Made it worse' : 'No effect'}
-                </span>
+                <span className={`dot dot--${style.dot}`} aria-hidden="true" />
+                <span className="decision-row__verdict">{style.label}</span>
                 <span className="pill">{d.kind}</span>
                 <span className="t-small">{relative(d.createdAt)}</span>
               </div>
@@ -133,7 +142,8 @@ export function DecisionsPage() {
               </label>
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );

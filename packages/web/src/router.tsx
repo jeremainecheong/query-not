@@ -19,6 +19,7 @@ export type Route =
   | { name: 'saved' }
   | { name: 'history'; fingerprint: string }
   | { name: 'workload' }
+  | { name: 'indexes' }
   | { name: 'decisions' }
   | { name: 'reference' };
 
@@ -31,6 +32,7 @@ export function parsePath(pathname: string): Route {
   if (parts[0] === 'queries') return { name: 'queries' };
   if (parts[0] === 'saved') return { name: 'saved' };
   if (parts[0] === 'workload') return { name: 'workload' };
+  if (parts[0] === 'indexes') return { name: 'indexes' };
   if (parts[0] === 'decisions') return { name: 'decisions' };
   if (parts[0] === 'reference') return { name: 'reference' };
   if (parts[0] === 'history' && parts[1]) {
@@ -52,6 +54,8 @@ export function pathFor(route: Route): string {
       return '/saved';
     case 'workload':
       return '/workload';
+    case 'indexes':
+      return '/indexes';
     case 'decisions':
       return '/decisions';
     case 'reference':
