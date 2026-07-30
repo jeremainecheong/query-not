@@ -221,10 +221,10 @@ rests on.
 ```bash
 npm test          # 317 unit tests across core and agent
 npm run typecheck
-npm run test:e2e  # full stack, cold: 474 checks plus a production-bundle run
+npm run test:e2e  # full stack, cold: 476 checks plus a production-bundle run
 ```
 
-**791 checks in total** — 317 unit, 152 API end-to-end, 161 browser end-to-end, and the
+**793 checks in total** — 317 unit, 152 API end-to-end, 162 browser end-to-end, and the
 whole browser suite again against the production bundle served by the agent. The dev
 server and the built artifact are different things; verifying only the first ships a
 build nobody ran.
