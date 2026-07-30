@@ -159,6 +159,20 @@ CREATE EXTENSION hypopg;
 Without it everything else still works; the UI shows a `no hypopg` badge and disables
 "Prove it" rather than silently offering a broken button.
 
+### GitHub Action
+
+The gate is also packaged as a reusable action, so a repository can gate its pull
+requests on plan regressions with one step:
+
+```yaml
+- uses: jeremainecheong/query-not@main
+  with:
+    database-url: postgres://postgres:postgres@localhost:5432/app
+```
+
+[docs/github-action.md](docs/github-action.md) has the full setup — the service
+container, recording the baseline, and what the gate does and does not prove.
+
 ### Configuration
 
 | Variable | Default | Purpose |
