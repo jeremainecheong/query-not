@@ -19,6 +19,8 @@
 
 import { loadModule, parseSync } from 'libpg-query';
 
+import { byteToCharIndex } from './transform.ts';
+
 export type RewriteKind =
   | 'function-on-column'
   | 'not-in-subquery'
@@ -151,8 +153,13 @@ function constInt(node: unknown): number | null {
  * cut off. Backing up to a word boundary first restores the keyword that makes
  * the fragment recognisable.
  */
-function snippetAt(sql: string, location: number | null, span = 60, lead = 16): string | null {
-  if (location === null || location < 0 || location >= sql.length) return null;
+function snippetAt(sql: string, byteLocation: number | null, span = 60, lead = 16): string | null {
+  if (byteLocation === null || byteLocation < 0) return null;
+  // The parser reports byte offsets; everything below indexes a JS string. On
+  // any non-ASCII query those are different numbers, and slicing with the wrong
+  // one shifts the snippet off the token it is supposed to show.
+  const location = byteToCharIndex(sql, byteLocation);
+  if (location >= sql.length) return null;
 
   let start = Math.max(0, location - lead);
   if (start > 0) {
