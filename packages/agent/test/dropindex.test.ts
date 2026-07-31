@@ -8,6 +8,7 @@ import {
   composeDropNote,
   disqualifiersFor,
   dropVerdict,
+  everyQueryErrored,
   interpretIndexInventory,
   MAX_PROOF_QUERIES,
   usageEvidence,
@@ -266,11 +267,20 @@ describe('dropVerdict', () => {
     );
   });
 
-  test('error rows carry no verdict and do not vacuously pass', () => {
+  test('an error row alongside a real unchanged verdict is genuinely no-plan-changed', () => {
     assert.equal(
-      dropVerdict([perQuery({ verdict: null, error: 'relation gone' }), perQuery({})]),
+      dropVerdict([perQuery({ verdict: null, error: 'relation gone' }), perQuery({ verdict: 'unchanged' })]),
       'no-plan-changed',
     );
+  });
+
+  test('every query errored is detected as vacuous — the orchestrator refuses it', () => {
+    // dropVerdict alone would classify an all-null set as no-plan-changed
+    // ("safe to drop"); everyQueryErrored is the guard that stops that green
+    // verdict from shipping when nothing was actually tested.
+    assert.equal(everyQueryErrored([perQuery({ verdict: null, error: 'a' }), perQuery({ verdict: null, error: 'b' })]), true);
+    assert.equal(everyQueryErrored([perQuery({ verdict: null, error: 'a' }), perQuery({ verdict: 'unchanged' })]), false);
+    assert.equal(everyQueryErrored([]), false);
   });
 });
 

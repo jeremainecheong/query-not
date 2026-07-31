@@ -23,7 +23,7 @@
 
 import { diffPlans, parseExplainJson, type QueryPlan, type Verdict } from '@query-not/core';
 
-import type { Database } from './db.ts';
+import { trySavepoint, type Database } from './db.ts';
 import type { Store } from './store.ts';
 import { AgentError } from './explain.ts';
 import { admitQuery, fingerprint } from './safety.ts';
@@ -463,6 +463,15 @@ export function assembleProofSet(
  * completely still surface reads as "no plan changed". Error rows carry no
  * verdict and are excluded here — they are disclosed in the note instead.
  */
+/**
+ * Did every query in the proof set fail to plan? Then nothing was tested and
+ * no verdict — least of all a green one — may be issued. The orchestrator
+ * refuses on this; dropVerdict itself only classifies the verdicts that exist.
+ */
+export function everyQueryErrored(perQuery: PerQueryDropResult[]): boolean {
+  return perQuery.length > 0 && perQuery.every((q) => q.verdict === null);
+}
+
 export function dropVerdict(perQuery: PerQueryDropResult[]): DropOutcome {
   const verdicts = perQuery
     .map((q) => q.verdict)
@@ -710,15 +719,19 @@ export async function proveDropIndex(
         return parseExplainJson(Object.values(first)[0] as unknown, text);
       };
 
-      // Before-plans, per-query try/catch: a stored query whose table has since
-      // vanished becomes an error row, not a failed proof.
+      // Before-plans, one savepoint per query: a stored query whose table has
+      // since vanished becomes an error row, not a failed proof. Without the
+      // savepoint its failure aborts the whole transaction, so every later
+      // statement — the remaining plans, the hide, and the unhide cleanup —
+      // fails with 25P02 and the proof collapses into a meaningless error.
       const befores: Array<{ q: ProofQuery; plan: QueryPlan | null; error: string | null }> = [];
       for (const q of set.queries) {
-        try {
-          befores.push({ q, plan: await explain(q.sql), error: null });
-        } catch (err) {
-          befores.push({ q, plan: null, error: err instanceof Error ? err.message : String(err) });
-        }
+        const r = await trySavepoint(client, () => explain(q.sql));
+        befores.push(
+          r.ok
+            ? { q, plan: r.value, error: null }
+            : { q, plan: null, error: r.error instanceof Error ? r.error.message : String(r.error) },
+        );
       }
 
       const hidden = await client.query<{ hidden: boolean }>(
@@ -758,12 +771,16 @@ export async function proveDropIndex(
           });
           continue;
         }
-        try {
-          const after = await explain(b.q.sql);
-          const diff = diffPlans(b.plan, after);
+        const usedIndex = b.plan.nodes.some((n) => n.indexName === row.index);
+        // Same savepoint discipline for the after-plan: one query that fails to
+        // re-plan with the index hidden must not abort the transaction and
+        // strand the hidden index on this pooled connection.
+        const r = await trySavepoint(client, () => explain(b.q.sql));
+        if (r.ok) {
+          const diff = diffPlans(b.plan, r.value);
           perQuery.push({
             ...base,
-            usedIndex: b.plan.nodes.some((n) => n.indexName === row.index),
+            usedIndex,
             verdict: diff.summary.verdict,
             headline: diff.summary.headline,
             costBefore: diff.summary.costBefore,
@@ -772,17 +789,17 @@ export async function proveDropIndex(
             accessChanges: diff.summary.accessChanges,
             error: null,
           });
-        } catch (err) {
+        } else {
           perQuery.push({
             ...base,
-            usedIndex: b.plan.nodes.some((n) => n.indexName === row.index),
+            usedIndex,
             verdict: null,
             headline: null,
             costBefore: null,
             costAfter: null,
             costChange: null,
             accessChanges: [],
-            error: err instanceof Error ? err.message : String(err),
+            error: r.error instanceof Error ? r.error.message : String(r.error),
           });
         }
       }
@@ -803,6 +820,19 @@ export async function proveDropIndex(
         capped: set.capped,
         cap: MAX_PROOF_QUERIES,
       };
+      // Every query errored: nothing was actually re-planned, so there is no
+      // verdict to give. dropVerdict would fall through to 'no-plan-changed',
+      // whose note reads "safe to drop" — a green verdict computed from zero
+      // evidence. Refuse instead; a proof that proved nothing is not a pass.
+      if (everyQueryErrored(perQuery)) {
+        throw new AgentError(
+          `Could not test whether \`${row.index}\` is safe to drop: all ${perQuery.length} ` +
+            'queries in the proof set failed to plan. The index may still be in use — this is ' +
+            'not a verdict.',
+          'Re-run once the failing queries plan cleanly, or narrow the proof set.',
+          422,
+        );
+      }
       const outcome = dropVerdict(perQuery);
 
       return {
@@ -824,10 +854,24 @@ export async function proveDropIndex(
       // Hidden indexes live in backend memory for the whole session, not the
       // transaction — ROLLBACK does not clear them. Without this the pooled
       // connection would keep planning without the index for every later
-      // request, silently falsifying their analyses. Mirrors whatIfIndex's
-      // hypopg_reset discipline exactly, and runs on every exit path —
-      // success, refusal, or throw.
-      await client.query('SELECT hypopg_unhide_all_indexes()').catch(() => undefined);
+      // request, silently falsifying their analyses.
+      //
+      // The savepoints above keep the transaction alive, so this normally runs
+      // clean. But if the hide statement itself aborted the transaction, the
+      // unhide fails with 25P02 — and hypopg's hidden list survives ROLLBACK,
+      // so cleanup must not depend on the transaction. Roll back to a clean
+      // state and unhide in autocommit as the backstop.
+      try {
+        await client.query('SELECT hypopg_unhide_all_indexes()');
+      } catch {
+        try {
+          await client.query('ROLLBACK');
+          await client.query('SELECT hypopg_unhide_all_indexes()');
+        } catch {
+          // The connection is unusable; readOnlySession releases it, and a
+          // dead backend clears its own hypopg state. Nothing leaks past here.
+        }
+      }
     }
   });
 }

@@ -398,8 +398,20 @@ export async function whatIfIndex(
       // Hypothetical indexes live in backend memory for the whole session, not
       // the transaction — ROLLBACK does not clear them. Without this reset the
       // connection returns to the pool still carrying them, and would silently
-      // poison every later query on it.
-      await client.query('SELECT hypopg_reset()').catch(() => undefined);
+      // poison every later query on it. hypopg's state survives ROLLBACK, so if
+      // the after-EXPLAIN aborted the transaction (a timeout behind concurrent
+      // DDL), the reset must still run — roll back to a clean state first.
+      try {
+        await client.query('SELECT hypopg_reset()');
+      } catch {
+        try {
+          await client.query('ROLLBACK');
+          await client.query('SELECT hypopg_reset()');
+        } catch {
+          // The connection is unusable; readOnlySession releases it and a dead
+          // backend clears its own hypopg state.
+        }
+      }
     }
   });
 

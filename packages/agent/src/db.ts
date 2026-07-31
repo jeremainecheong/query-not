@@ -204,3 +204,42 @@ export function describeDbError(err: unknown): { message: string; hint: string |
       return { message, hint: null };
   }
 }
+
+/**
+ * Run a statement that is allowed to fail without poisoning its transaction.
+ *
+ * A failed statement in Postgres aborts the whole transaction: every later
+ * statement then fails with 25P02 until a rollback. Inside a multi-statement
+ * session where individual failures are expected and recoverable — a per-query
+ * EXPLAIN over stored SQL, one of which references a since-dropped table; a
+ * hypothetical re-plan that trips a timeout — that abort turns one bad query
+ * into a total failure, and (worse, with hypopg) makes the backend-local
+ * cleanup at the end fail too, releasing a connection with hidden state intact.
+ *
+ * A SAVEPOINT contains the damage. On success the savepoint is released; on
+ * failure we ROLLBACK TO it, which restores the pre-statement state and leaves
+ * the transaction alive, so every following statement — including cleanup —
+ * still runs. The savepoint name is reused sequentially, which is safe because
+ * each is released before the next is taken; do not call this concurrently on
+ * one client.
+ */
+export async function trySavepoint<T>(
+  client: PoolClient,
+  run: () => Promise<T>,
+): Promise<{ ok: true; value: T } | { ok: false; error: unknown }> {
+  await client.query('SAVEPOINT qn_sp');
+  try {
+    const value = await run();
+    await client.query('RELEASE SAVEPOINT qn_sp');
+    return { ok: true, value };
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK TO SAVEPOINT qn_sp');
+      await client.query('RELEASE SAVEPOINT qn_sp');
+    } catch {
+      // If even the rollback fails the connection is beyond saving; the
+      // session's own ROLLBACK-and-release in the finally is the backstop.
+    }
+    return { ok: false, error };
+  }
+}
