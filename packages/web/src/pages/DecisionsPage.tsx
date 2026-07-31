@@ -30,8 +30,10 @@ const VERDICT_STYLE: Record<string, { label: string; dot: 'good' | 'critical' | 
   'no-effect': { label: 'No effect', dot: 'muted' },
   differed: { label: 'Returns different rows', dot: 'critical' },
   'advice-only': { label: 'Not executed', dot: 'muted' },
-  'no-plan-changed': { label: 'Safe to drop', dot: 'good' },
-  'plans-changed-not-worse': { label: 'Changed, not worse', dot: 'muted' },
+  // "No plan changed" bounded to the tested queries, matching the indexes
+  // page — never an unbounded green "safe to drop" on the decisions list.
+  'no-plan-changed': { label: 'No plan changed', dot: 'good' },
+  'plans-changed-not-worse': { label: 'Plans changed, none worse', dot: 'muted' },
   'estimates-fixed': { label: 'Estimates fixed', dot: 'good' },
   'estimates-improved': { label: 'Estimates improved', dot: 'good' },
 };

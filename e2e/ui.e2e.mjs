@@ -102,6 +102,8 @@ section('Initial load');
     (await page.locator('.hero__actions a:has-text("Analyse a query")').count()) > 0);
   check('the landing page links every section',
     (await page.locator('.card-tile').count()) >= 4);
+  check('the landing page includes the indexes page',
+    (await page.locator('.card-tile__title', { hasText: 'Indexes' }).count()) > 0);
   check('the landing page reports connection state',
     (await page.locator('.hero__status').count()) > 0);
 
@@ -926,10 +928,10 @@ section('Indexes page');
   await page.waitForSelector('.proof__verdict', { timeout: 90000 });
   // The proof must reach a real drop verdict, not merely render something.
   // promotions_applied_at_idx is untouched by the store's queries, so hiding
-  // it changes no plan — the outcome is "Safe to drop", never a green badge
-  // on zero evidence.
-  check('the proof reaches the safe-to-drop verdict',
-    /Safe to drop/i.test(await page.locator('.proof__verdict').first().innerText()),
+  // it changes no plan — the panel says "No plan changed" (bounded to the
+  // tested queries), never an unbounded green "safe" on zero evidence.
+  check('the proof reaches the no-plan-changed verdict',
+    /No plan changed/i.test(await page.locator('.proof__verdict').first().innerText()),
     await page.locator('.proof__verdict').first().innerText());
   check('the proof is labelled estimate-only',
     (await page.locator('.chip', { hasText: 'estimate only' }).count()) > 0);
@@ -968,6 +970,20 @@ section('Command palette');
   await page.waitForTimeout(600);
   check('selecting an operation goes to the reference',
     new globalThis.URL(page.url()).pathname === '/reference');
+
+  // Every page is reachable from the palette; the indexes page (drop proofs)
+  // was the one the sprint added, so search for it by its plural page name —
+  // distinct from the singular plan operations ("Index Scan").
+  await page.keyboard.press('Control+k');
+  await page.waitForSelector('.palette', { timeout: 15000 });
+  await page.fill('.palette__input', 'Indexes');
+  await page.waitForTimeout(200);
+  check('the palette finds the indexes page',
+    (await page.locator('.palette__item').allInnerTexts()).some((t) => /^Indexes\b/.test(t.trim())));
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(600);
+  check('selecting it navigates to /indexes',
+    new globalThis.URL(page.url()).pathname === '/indexes');
 
   await page.keyboard.press('Control+k');
   await page.waitForSelector('.palette', { timeout: 15000 });
