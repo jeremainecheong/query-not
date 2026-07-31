@@ -22,11 +22,23 @@ import { relative } from './SavedPage';
  * proofs say 'no-plan-changed' — but the page renders them uniformly. Anything
  * unrecognised falls back to the neutral "No effect".
  */
+// Every verdict vocabulary that reaches the store: index/settings what-ifs,
+// generated-rewrite outcomes, drop proofs, statistics proofs. An unknown
+// verdict shows its raw value rather than borrowing a label — mislabelling a
+// result is worse than looking unpolished.
 const VERDICT_STYLE: Record<string, { label: string; dot: 'good' | 'critical' | 'muted' }> = {
   improved: { label: 'Proven', dot: 'good' },
   regressed: { label: 'Made it worse', dot: 'critical' },
+  unchanged: { label: 'No change', dot: 'muted' },
+  proven: { label: 'Proven', dot: 'good' },
+  'improved-unverified': { label: 'Improved, rows unverified', dot: 'muted' },
+  'no-effect': { label: 'No effect', dot: 'muted' },
+  differed: { label: 'Returns different rows', dot: 'critical' },
+  'advice-only': { label: 'Not executed', dot: 'muted' },
   'no-plan-changed': { label: 'Safe to drop', dot: 'good' },
   'plans-changed-not-worse': { label: 'Changed, not worse', dot: 'muted' },
+  'estimates-fixed': { label: 'Estimates fixed', dot: 'good' },
+  'estimates-improved': { label: 'Estimates improved', dot: 'good' },
 };
 
 export function DecisionsPage() {
@@ -98,7 +110,7 @@ export function DecisionsPage() {
 
       <div className="group">
         {decisions.map((d) => {
-          const style = VERDICT_STYLE[d.verdict] ?? { label: 'No effect', dot: 'muted' as const };
+          const style = VERDICT_STYLE[d.verdict] ?? { label: d.verdict, dot: 'muted' as const };
           return (
           <div className="group__row decision-row" key={d.id}>
             <div className="decision-row__main">
