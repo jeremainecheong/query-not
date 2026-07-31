@@ -448,6 +448,34 @@ describe('literal formatting and the byte-domain splice', () => {
     assert.ok(problem !== null, 'a splice that changed more than the constant must be withheld');
   });
 
+  test('buildVariants withholds a variant whose splice fails validation — it refuses, never emits it as valid', () => {
+    // The gap this closes: validateConstSplice is unit-tested on its own just
+    // above, but buildVariants' USE of it — withhold the bad splice WITH a note,
+    // then continue past it — was never exercised. Here we drive that defense
+    // with the exact defect it guards against: a bad byte offset (a scanner
+    // bug), forced by shrinking the site's literal span by one byte so every
+    // generated splice lands mid-token and reparses wrong. quoteLiteral makes
+    // the outcome value-independent, so all three picks hit the withhold branch
+    // (each recorded with its `was withheld: …` note and skipped); with none
+    // left standing, buildVariants surfaces its own-bug refusal rather than
+    // shipping a corrupted variant as if it were valid evidence.
+    const site = rangeSite();
+    const badOffset: PredicateSite = {
+      ...site,
+      literalByteSpan: { start: site.literalByteSpan.start, end: site.literalByteSpan.end - 1 },
+    };
+    const build = buildVariants(RANGE_SQL, badOffset, stats({ histogram: ['100000', '200000', '300000'] }));
+    // ok:false is itself the proof that no corrupted variant was emitted — the
+    // ok:true shape is the only one that carries a variants array.
+    assert.equal(build.ok, false, 'a build carrying a corrupted variant must never report ok');
+    const refusal = (build as { refusal: string }).refusal;
+    // The post-withhold refusal, reached only after the loop discarded every
+    // corrupted splice — and worded as the agent's own bug, not the user's.
+    assert.match(refusal, /reparse validation/);
+    assert.match(refusal, /agent bug/);
+    assert.match(refusal, /not a property of your query/);
+  });
+
   test('quoteLiteral doubles every quote', () => {
     assert.equal(quoteLiteral("a'b'c"), "'a''b''c'");
   });
