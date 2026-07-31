@@ -315,29 +315,86 @@ function candidateSummary(
   regressed: number,
 ): string {
   const tested = perQuery.length;
-  // The heuristic claimed service and the planner said no. Reporting that is
-  // the product's whole argument: being wrong is detected, not shipped.
-  const declined = perQuery.filter(
-    (r) => r.claimed && r.verdict !== null && r.verdict !== 'improved' && r.verdict !== 'regressed',
-  );
-  const declinedNote = declined
-    .slice(0, 3)
-    .map((r) => ` Claimed to serve ${labelFor(r)} but the planner declined — not counted.`)
-    .join('');
+  // An errored proof re-planned nothing: it is neither served, nor safe, nor a
+  // decline. It must never sit inside a "regresses none of N" or "declined for
+  // every statement" denominator — those claims quantify only over what
+  // actually re-planned. Errors are disclosed separately instead, so an
+  // untested query can never read as a proven-safe one.
+  const errored = perQuery.filter((r) => r.error !== null).length;
+  const replanned = tested - errored;
+  const errNote =
+    errored > 0
+      ? ` ${errored} of ${tested} could not be planned and ${errored === 1 ? 'is' : 'are'} excluded from that count.`
+      : '';
+
+  // A claimed statement the planner did not turn into a win, split by why:
+  // "kept the old plan" (a genuine decline) and "adopted the index at
+  // essentially equal cost" (a restructure — the planner DID use it) are
+  // different facts, and calling an adoption a decline is a claim the per-query
+  // rows, which show "now uses index …", would flatly contradict.
+  const noteFor = (rows: ConsolidationPerQuery[], phrase: string): string =>
+    rows
+      .slice(0, 3)
+      .map((r) => ` Claimed to serve ${labelFor(r)} but ${phrase} — not counted.`)
+      .join('');
+  const declinedNote =
+    noteFor(
+      perQuery.filter((r) => r.claimed && r.verdict === 'unchanged'),
+      'the planner kept the existing plan',
+    ) +
+    noteFor(
+      perQuery.filter((r) => r.claimed && r.verdict === 'restructured'),
+      'the planner adopted the index at essentially unchanged cost',
+    ) +
+    noteFor(
+      perQuery.filter((r) => r.claimed && r.error !== null),
+      'it could not be re-planned',
+    );
+
+  // Nothing re-planned: there is no evidence for any verdict, least of all a
+  // green one. Say so plainly rather than let the 'unchanged' bucket read as a
+  // tested pass.
+  if (replanned === 0) {
+    return (
+      `Could not be tested: none of the ${plural(tested, 'statement')} in scope re-planned with the index.` +
+      declinedNote
+    );
+  }
 
   if (verdict === 'regressed') {
     return (
-      `Regresses ${plural(regressed, 'statement')} of the ${tested} it was tested against — do not apply.` +
+      `Regresses ${plural(regressed, 'statement')} of the ${replanned} it re-planned — do not apply.` +
+      errNote +
       declinedNote
     );
   }
+
   if (verdict === 'unchanged') {
+    const adopted = perQuery.filter((r) => r.verdict === 'restructured').length;
+    if (adopted > 0) {
+      // The planner DID use the index, just at near-equal estimated cost — not
+      // "declined", not "wins nothing". The win is that it can stand in for the
+      // narrower indexes it replaces.
+      const replaceClause =
+        candidate.replaces.length > 0
+          ? ` It could still replace ${plural(candidate.replaces.length, 'narrower single-query index')} at no estimated cost.`
+          : '';
+      return (
+        `The planner adopted this index for ${adopted} of the ${replanned} statement${replanned === 1 ? '' : 's'} ` +
+        'it re-planned, but at essentially unchanged estimated cost — a plan-shape change with no estimated win.' +
+        replaceClause +
+        errNote +
+        declinedNote
+      );
+    }
     return (
-      'The planner declined this index for every statement it was tested against — the merged shape ' +
-      'was structurally sound but wins nothing on this database.' +
+      `The planner produced the same plan for every one of the ${replanned} statement${replanned === 1 ? '' : 's'} ` +
+      'it re-planned — the merged shape is structurally sound but wins nothing on this database.' +
+      errNote +
       declinedNote
     );
   }
+
   const shareClause =
     servedShare > 0
       ? `${formatPercent(servedShare)} of all query time in this window`
@@ -347,10 +404,54 @@ function candidateSummary(
       ? `, and would replace ${plural(candidate.replaces.length, 'narrower single-query index')}`
       : '';
   return (
-    `Serves ${served} of the ${tested} explainable statements it was tested against — ${shareClause} — ` +
-    `regresses none of the ${tested}${replaceClause}.` +
+    `Serves ${served} of the ${replanned} statement${replanned === 1 ? '' : 's'} it re-planned — ${shareClause} — ` +
+    `regresses none of the ${replanned}${replaceClause}.` +
+    errNote +
     declinedNote
   );
+}
+
+/**
+ * Classify one candidate against its proof rows, and word the verdict honestly.
+ *
+ * Pure, so the safety invariant unit-tests without a database: ANY regressed
+ * proof row — a claimed statement or an unclaimed sentinel — condemns the
+ * candidate to 'regressed' / do-not-apply, overriding any number of served
+ * rows; and an errored row (the proof threw) counts as neither served nor safe.
+ * `served` is claimed-and-improved only; `regressed` spans claimed and sentinel
+ * rows alike, because a sentinel getting worse is still the workload getting
+ * worse.
+ */
+export function summarizeCandidate(
+  candidate: ConsolidatedIndex,
+  perQuery: ConsolidationPerQuery[],
+): {
+  served: number;
+  servedShare: number;
+  regressed: number;
+  verdict: 'improved' | 'regressed' | 'unchanged';
+  summary: string;
+} {
+  const servedRows = perQuery.filter((r) => r.claimed && r.verdict === 'improved');
+  const regressedRows = perQuery.filter((r) => r.verdict === 'regressed');
+  const verdict: 'improved' | 'regressed' | 'unchanged' =
+    regressedRows.length > 0 ? 'regressed' : servedRows.length > 0 ? 'improved' : 'unchanged';
+  const servedShare = servedRows.reduce((sum, r) => sum + r.share, 0);
+  const summary = candidateSummary(
+    candidate,
+    perQuery,
+    verdict,
+    servedRows.length,
+    servedShare,
+    regressedRows.length,
+  );
+  return {
+    served: servedRows.length,
+    servedShare,
+    regressed: regressedRows.length,
+    verdict,
+    summary,
+  };
 }
 
 /**
@@ -505,20 +606,12 @@ export async function consolidateWorkload(
       }
     }
 
-    const servedRows = perQuery.filter((r) => r.claimed && r.verdict === 'improved');
-    const regressedRows = perQuery.filter((r) => r.verdict === 'regressed');
-    // ANY regression — claimed or sentinel — overrides served counts, exactly
-    // as the OR-split rewrite reports an honest loss.
-    const verdict: ConsolidationCandidateReport['verdict'] =
-      regressedRows.length > 0 ? 'regressed' : servedRows.length > 0 ? 'improved' : 'unchanged';
-    const servedShare = servedRows.reduce((sum, r) => sum + r.share, 0);
-    const summary = candidateSummary(
+    // Verdict and wording are one pure function, unit-tested apart from the
+    // database: ANY regressed row (claimed or sentinel) condemns the candidate,
+    // and errored rows count as neither served nor safe.
+    const { served, servedShare, regressed, verdict, summary } = summarizeCandidate(
       candidate,
       perQuery,
-      verdict,
-      servedRows.length,
-      servedShare,
-      regressedRows.length,
     );
 
     // Record the decision server-side, attributed to the highest-share claimed
@@ -552,9 +645,9 @@ export async function consolidateWorkload(
     candidates.push({
       ...candidate,
       perQuery,
-      served: servedRows.length,
+      served,
       servedShare,
-      regressed: regressedRows.length,
+      regressed,
       verdict,
       summary,
       costOnly: true,

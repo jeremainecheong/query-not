@@ -10,7 +10,14 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildScope, matchKey } from '../src/consolidate.ts';
+import type { ConsolidatedIndex } from '@query-not/core';
+
+import {
+  buildScope,
+  matchKey,
+  summarizeCandidate,
+  type ConsolidationPerQuery,
+} from '../src/consolidate.ts';
 import { fingerprint } from '../src/safety.ts';
 import type { SavedQuery } from '../src/store.ts';
 import type { RankedEntry } from '../src/workload.ts';
@@ -42,6 +49,39 @@ function savedQuery(name: string, sql: string): SavedQuery {
     updatedAt: '2026-01-01T00:00:00Z',
     latestSlug: null,
     runCount: 0,
+  };
+}
+
+/** One proof row, defaulting to an unclaimed, un-re-planned sentinel. */
+function pq(over: Partial<ConsolidationPerQuery> & { fingerprint: string }): ConsolidationPerQuery {
+  return {
+    queryId: null,
+    savedName: null,
+    source: 'workload',
+    share: 0,
+    claimed: false,
+    verdict: null,
+    costBefore: null,
+    costAfter: null,
+    costChange: null,
+    headline: null,
+    accessChanges: [],
+    error: null,
+    ...over,
+  };
+}
+
+function candidate(over: Partial<ConsolidatedIndex> = {}): ConsolidatedIndex {
+  return {
+    relation: 'orders',
+    columns: ['status', 'created_at'],
+    roles: ['eq', 'range'],
+    ddl: 'CREATE INDEX CONCURRENTLY ON orders (status, created_at);',
+    rationale: 'test candidate',
+    weight: 0.5,
+    claims: [],
+    replaces: [],
+    ...over,
   };
 }
 
@@ -236,5 +276,115 @@ describe('buildScope — the saved-query contribution is capped by `limit`', () 
       { limit: 5, includeSaved: false },
     );
     assert.deepEqual(savedExtras, { cap: 5, included: 0, omitted: 0 });
+  });
+});
+
+describe('summarizeCandidate — the verdict and its honest wording', () => {
+  test('a regressed CLAIMED statement condemns the candidate: do not apply', () => {
+    const r = summarizeCandidate(candidate({ claims: ['q1'] }), [
+      pq({ fingerprint: 'q1', claimed: true, verdict: 'regressed', share: 0.3, costChange: 0.4 }),
+    ]);
+    assert.equal(r.verdict, 'regressed');
+    assert.equal(r.regressed, 1);
+    assert.match(r.summary, /do not apply/);
+  });
+
+  test('a regressed SENTINEL condemns the candidate even when a claimed row improved', () => {
+    // The safety invariant that had no test: any regression — a claimed
+    // statement or an unclaimed sentinel — flips the verdict to do-not-apply,
+    // overriding served rows.
+    const r = summarizeCandidate(candidate({ claims: ['q1'] }), [
+      pq({ fingerprint: 'q1', claimed: true, verdict: 'improved', share: 0.4 }),
+      pq({ fingerprint: 'q2', claimed: false, verdict: 'regressed', share: 0.2 }),
+    ]);
+    assert.equal(r.verdict, 'regressed', 'a sentinel regression still condemns');
+    assert.equal(r.regressed, 1);
+    assert.match(r.summary, /Regresses 1 statement of the 2 it re-planned — do not apply/);
+  });
+
+  test('an errored row counts as neither served nor safe, and never inflates "regresses none"', () => {
+    // 2 served, 1 errored (whatIfIndex threw). The claim quantifies over the 2
+    // re-planned, and the error is disclosed — never folded into "of the 3".
+    const r = summarizeCandidate(candidate({ claims: ['q1', 'q2'] }), [
+      pq({ fingerprint: 'q1', claimed: true, verdict: 'improved', share: 0.4 }),
+      pq({ fingerprint: 'q2', claimed: true, verdict: 'improved', share: 0.2 }),
+      pq({ fingerprint: 'q3', claimed: false, verdict: null, error: 'statement timeout', share: 0.1 }),
+    ]);
+    assert.equal(r.verdict, 'improved');
+    assert.equal(r.served, 2);
+    assert.match(r.summary, /Serves 2 of the 2 statements it re-planned/);
+    assert.match(r.summary, /regresses none of the 2/);
+    assert.match(r.summary, /1 of 3 could not be planned and is excluded/);
+    assert.doesNotMatch(r.summary, /regresses none of the 3/, 'the untested row must not read as safe');
+  });
+
+  test('a candidate whose every proof errored is not a pass — it "could not be tested"', () => {
+    const r = summarizeCandidate(candidate({ claims: ['q1'] }), [
+      pq({ fingerprint: 'q1', claimed: true, verdict: null, error: 'relation dropped', share: 0.3 }),
+    ]);
+    assert.equal(r.served, 0);
+    assert.equal(r.regressed, 0);
+    assert.match(r.summary, /Could not be tested/);
+    assert.doesNotMatch(r.summary, /wins nothing/, 'zero evidence must not read as a proven no-op');
+    assert.doesNotMatch(r.summary, /regresses none/);
+  });
+
+  test('an equal-cost adoption (restructured) is reported as adopted, not "declined" / "wins nothing"', () => {
+    // The planner DID adopt the hypothetical index, at near-equal cost, so no
+    // claimed row is 'improved' and the candidate lands in the 'unchanged'
+    // bucket. The old wording called this "declined … wins nothing" — the exact
+    // claim the per-query "now uses index …" row contradicts.
+    const r = summarizeCandidate(
+      candidate({ claims: ['q1'], replaces: [{ relation: 'orders', columns: ['status'] }] }),
+      [
+        pq({
+          fingerprint: 'q1',
+          claimed: true,
+          verdict: 'restructured',
+          share: 0.4,
+          accessChanges: ['Seq Scan on orders: now uses index hypothetical btree_orders_status_created_at'],
+        }),
+      ],
+    );
+    assert.equal(r.verdict, 'unchanged');
+    assert.match(r.summary, /adopted this index/);
+    assert.doesNotMatch(r.summary, /declined/);
+    assert.doesNotMatch(r.summary, /wins nothing/);
+    assert.match(r.summary, /replace 1 narrower single-query index at no estimated cost/);
+  });
+
+  test('a genuine same-plan no-op still reads "wins nothing", and cites a kept plan not a decline', () => {
+    const r = summarizeCandidate(candidate({ claims: ['q1'] }), [
+      pq({ fingerprint: 'q1', claimed: true, verdict: 'unchanged', share: 0.4 }),
+    ]);
+    assert.equal(r.verdict, 'unchanged');
+    assert.match(r.summary, /wins nothing on this database/);
+    assert.match(r.summary, /kept the existing plan/);
+  });
+
+  test('a served candidate weights by window share and reports what it replaces', () => {
+    const r = summarizeCandidate(
+      candidate({ claims: ['q1'], replaces: [{ relation: 'orders', columns: ['status'] }] }),
+      [
+        pq({ fingerprint: 'q1', claimed: true, verdict: 'improved', share: 0.5 }),
+        pq({ fingerprint: 'q2', claimed: false, verdict: 'unchanged', share: 0.1 }),
+      ],
+    );
+    assert.equal(r.verdict, 'improved');
+    assert.equal(r.served, 1);
+    assert.ok(Math.abs(r.servedShare - 0.5) < 1e-9);
+    assert.match(r.summary, /Serves 1 of the 2 statements it re-planned/);
+    assert.match(r.summary, /50% of all query time in this window/);
+    assert.match(r.summary, /would replace 1 narrower single-query index/);
+  });
+
+  test('served rows that all sit outside the window say so instead of claiming 0%', () => {
+    // Saved extras carry share 0; a candidate served only by them has no window
+    // share to weight by, and the summary must say that rather than "0%".
+    const r = summarizeCandidate(candidate({ claims: ['s1'] }), [
+      pq({ fingerprint: 's1', claimed: true, verdict: 'improved', share: 0, source: 'saved-extra', savedName: 'nightly' }),
+    ]);
+    assert.equal(r.verdict, 'improved');
+    assert.match(r.summary, /all outside the measured window/);
   });
 });
