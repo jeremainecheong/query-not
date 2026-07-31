@@ -17,11 +17,6 @@ import { api, type Decision } from '../api';
 import { Link } from '../router';
 import { relative } from './SavedPage';
 
-/**
- * Verdict vocabularies differ by proof kind — what-ifs say 'improved', drop
- * proofs say 'no-plan-changed' — but the page renders them uniformly. Anything
- * unrecognised falls back to the neutral "No effect".
- */
 // Every verdict vocabulary that reaches the store: index/settings what-ifs,
 // generated-rewrite outcomes, drop proofs, statistics proofs. An unknown
 // verdict shows its raw value rather than borrowing a label — mislabelling a
@@ -90,7 +85,9 @@ export function DecisionsPage() {
   }
 
   const applied = decisions.filter((d) => d.applied).length;
-  const proven = decisions.filter((d) => d.verdict === 'improved').length;
+  // "Proven" spans vocabularies: an improved what-if, a proven rewrite, a
+  // safe-to-drop index and fixed estimates are all positive verdicts.
+  const proven = decisions.filter((d) => VERDICT_STYLE[d.verdict]?.dot === 'good').length;
 
   return (
     <div className="stack stack--tight">
