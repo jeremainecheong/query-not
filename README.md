@@ -308,12 +308,12 @@ rests on.
 ## Development
 
 ```bash
-npm test          # 492 unit tests across core and agent
+npm test          # 514 unit tests across core and agent
 npm run typecheck
-npm run test:e2e  # full stack, cold: 651 checks plus a production-bundle run
+npm run test:e2e  # full stack, cold: 465 checks plus a production-bundle run
 ```
 
-**1,143 checks in total** — 492 unit, 267 API end-to-end, 192 browser end-to-end, and the
+**979 checks in total** — 514 unit, 270 API end-to-end, 195 browser end-to-end, and the
 whole browser suite again against the production bundle served by the agent. The dev
 server and the built artifact are different things; verifying only the first ships a
 build nobody ran.
