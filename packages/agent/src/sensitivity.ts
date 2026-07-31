@@ -113,7 +113,24 @@ export interface FlipPoint {
   value: string;
   signature: string[];
   totalCost: number;
+  /**
+   * The ROOT node's output-row estimate — the plan's final cardinality after
+   * any join, aggregate or LIMIT. This is NOT the same population as the swept
+   * relation's reltuples (a `count(*)` root emits ~1 row at every constant),
+   * so narration never sets this against reltuples; `scanRows` is the figure
+   * that legitimately is.
+   */
   estimatedRows: number;
+  /**
+   * The estimate emitted by the scan node ON THE SWEPT RELATION — how many of
+   * that one table's rows the varied predicate is expected to select. It is the
+   * only row figure in the same population as the relation's reltuples, so it,
+   * not `estimatedRows`, is what any "~X of ~Y rows" selectivity claim cites.
+   * Null when no single scan on the swept relation is identifiable in the plan
+   * (folded into a join, scanned twice by a self-join, materialised, …), in
+   * which case narration drops the ratio rather than pair two populations.
+   */
+  scanRows: number | null;
 }
 
 export interface FlipBoundary {
@@ -878,15 +895,28 @@ function signatureDelta(a: string[], b: string[]): string {
  * crossing — the exact crossing constant is not knowable from two EXPLAINs,
  * and a guessed number wearing precision would be worse than the honest range.
  */
-export function findFlips(points: FlipPoint[], site: Pick<PredicateSite, 'column' | 'operator'>): FlipBoundary[] {
+export function findFlips(
+  points: FlipPoint[],
+  site: Pick<PredicateSite, 'column' | 'operator' | 'relation'>,
+): FlipBoundary[] {
   const out: FlipBoundary[] = [];
+  const rel = site.relation.at(-1) ?? site.relation.join('.');
+  // Annotate each end of the bracket with the SWEPT RELATION's own scan
+  // estimate (scanRows), never the root's output. On an aggregate/LIMIT/join
+  // the root emits the same handful of rows at every constant, so citing it
+  // here would print an identical "~1 rows" on both sides of a flip the row
+  // change actually caused. When no single scan on the relation is identifiable
+  // (scanRows null), name the plan shape without a row figure rather than a
+  // misleading one — the same population-honesty rule the narrative follows.
+  const rows = (p: FlipPoint): string =>
+    p.scanRows !== null ? `, ~${formatRows(p.scanRows)} rows on \`${rel}\`` : '';
   for (let i = 0; i + 1 < points.length; i += 1) {
     const from = points[i];
     const to = points[i + 1];
     if (sameSignature(from.signature, to.signature)) continue;
     const headline =
-      `Between \`${site.column} ${site.operator} ${shortValue(from.value)}\` (${from.label}, ~${formatRows(from.estimatedRows)} rows estimated) ` +
-      `and \`${site.column} ${site.operator} ${shortValue(to.value)}\` (${to.label}, ~${formatRows(to.estimatedRows)} rows) the plan flips: ` +
+      `Between \`${site.column} ${site.operator} ${shortValue(from.value)}\` (${from.label}${rows(from)}) ` +
+      `and \`${site.column} ${site.operator} ${shortValue(to.value)}\` (${to.label}${rows(to)}) the plan flips: ` +
       `${signatureDelta(from.signature, to.signature)} → ${signatureDelta(to.signature, from.signature)}. ` +
       `The planner's cost estimates cross between these points (${from.totalCost.toFixed(0)} vs ${to.totalCost.toFixed(0)}) — estimates, not measurements.`;
     out.push({
@@ -924,14 +954,35 @@ export function composeNarrative(args: {
   const op = site.operator;
   const first = points[0];
   const last = points[points.length - 1];
+  const rel = site.relation.at(-1) ?? site.relation.join('.');
+  const firstPlan = first.signature.join(' + ') || 'no scan at all';
+  const lastPlan = last.signature.join(' + ') || 'no scan at all';
   const parts: string[] = [`${evidence}.`];
 
-  parts.push(
-    `At \`${col} ${op} ${shortValue(first.value)}\` (${first.label}) the planner expects ` +
-      `~${formatRows(first.estimatedRows)} of ~${formatRows(stats.reltuples)} rows and plans ` +
-      `${first.signature.join(' + ') || 'no scan at all'}; at \`${col} ${op} ${shortValue(last.value)}\` (${last.label}) ` +
-      `it expects ~${formatRows(last.estimatedRows)} and plans ${last.signature.join(' + ') || 'no scan at all'}.`,
-  );
+  // The "~X of ~Y rows" ratio is honest only when X and Y are the same
+  // population. X comes from the scan node ON THE SWEPT RELATION
+  // (FlipPoint.scanRows) — the rows the varied predicate selects from `rel` —
+  // which is directly comparable to Y = `rel`'s reltuples. We deliberately do
+  // NOT use the root's estimatedRows: on a join/aggregate/LIMIT query the root
+  // reports the plan's FINAL output (1 row for a `count(*)`), a different
+  // population from reltuples, and pairing the two would state a
+  // predicate-selectivity claim the planner never made. When the swept
+  // relation's scan is not a single identifiable node (scanRows null) we take
+  // option (b): state the plan shapes with no row ratio at all, rather than
+  // cite a comparison we cannot stand behind.
+  if (first.scanRows !== null && last.scanRows !== null) {
+    parts.push(
+      `At \`${col} ${op} ${shortValue(first.value)}\` (${first.label}) the planner expects the scan on \`${rel}\` ` +
+        `to return ~${formatRows(first.scanRows)} of its ~${formatRows(stats.reltuples)} rows and plans ${firstPlan}; ` +
+        `at \`${col} ${op} ${shortValue(last.value)}\` (${last.label}) it expects ~${formatRows(last.scanRows)} and plans ${lastPlan}.`,
+    );
+  } else {
+    parts.push(
+      `At \`${col} ${op} ${shortValue(first.value)}\` (${first.label}) the query plans ${firstPlan}; ` +
+        `at \`${col} ${op} ${shortValue(last.value)}\` (${last.label}) it plans ${lastPlan}. ` +
+        `(No single scan on \`${rel}\` is identifiable in these plans, so no per-relation row estimate is cited.)`,
+    );
+  }
 
   if (flips.length > 0) {
     parts.push(
@@ -939,12 +990,22 @@ export function composeNarrative(args: {
         'and the boundary above is where the estimates cross.',
     );
   } else {
-    const rowsSpread = points.map((p) => p.estimatedRows);
-    const lo = Math.min(...rowsSpread);
-    const hi = Math.max(...rowsSpread);
+    // The selectivity spread must be read from the swept relation's scan
+    // estimate, not the root: on a count(*)/LIMIT/join the root emits the same
+    // few rows at every constant (1 to 1 for an aggregate), which would read as
+    // "nothing moved" while the scan estimate in fact swung wide — an
+    // affirmatively false account of the mechanism. Use scanRows when every
+    // point identified one; fall back to the root only when it did not, and say
+    // which population the numbers describe so the sentence stays honest.
+    const scanSpread = points.map((p) => p.scanRows).filter((r): r is number => r !== null);
+    const useScan = scanSpread.length === points.length;
+    const spread = useScan ? scanSpread : points.map((p) => p.estimatedRows);
+    const lo = Math.min(...spread);
+    const hi = Math.max(...spread);
+    const where = useScan ? `on \`${rel}\`` : 'at the plan root';
     parts.push(
       `Every point planned the same way — ${first.signature.join(' + ')} at each constant the statistics offer. ` +
-        `The estimated rows move (${formatRows(lo)} to ${formatRows(hi)}) but never enough to make another access path cheaper.`,
+        `The estimated rows ${where} move (${formatRows(lo)} to ${formatRows(hi)}) but never enough to make another access path cheaper.`,
     );
   }
 

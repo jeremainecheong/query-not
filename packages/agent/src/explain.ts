@@ -1032,8 +1032,14 @@ export async function whatIfParameterSensitivity(
 
   const scanRowsOf = (plan: QueryPlan): number | null => {
     const relname = site.relation.at(-1);
-    const scan = plan.nodes.find((n) => n.nodeType.endsWith('Scan') && n.relation === relname);
-    return scan ? scan.estimatedRowsTotal : null;
+    // The scan node ON THE SWEPT RELATION — the one node whose row estimate is
+    // the same population as the relation's reltuples, and the only figure the
+    // narrative may set against it. Require EXACTLY one match: a self-join scans
+    // the relation more than once and we cannot tell which scan the varied
+    // predicate drove, so we return null and let composition fall back to citing
+    // no ratio rather than guess the wrong scan.
+    const scans = plan.nodes.filter((n) => n.nodeType.endsWith('Scan') && n.relation === relname);
+    return scans.length === 1 ? scans[0].estimatedRowsTotal : null;
   };
 
   const signatures = variantPlans.map(accessSignature);
@@ -1043,6 +1049,11 @@ export async function whatIfParameterSensitivity(
     signature: signatures[i],
     totalCost: variantPlans[i].totalCost,
     estimatedRows: variantPlans[i].root.estimatedRowsTotal,
+    // The swept relation's own scan estimate — the population comparable to
+    // reltuples. Carried into flip/narrative composition so the "~X of ~Y rows"
+    // claim pairs like with like on join/aggregate/LIMIT queries, where the
+    // root's output row count is a different population entirely.
+    scanRows: scanRowsOf(variantPlans[i]),
   }));
   const flips = findFlips(points, site);
 

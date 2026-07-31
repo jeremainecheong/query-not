@@ -21,6 +21,7 @@ import {
   quoteLiteral,
   toTextArray,
   validateConstSplice,
+  type FlipPoint,
   type PredicateSite,
   type SiteStats,
   type StatsRow,
@@ -470,14 +471,19 @@ describe('accessSignature', () => {
 describe('findFlips', () => {
   const idx = ['Index Scan on orders via orders_pkey'];
   const seq = ['Seq Scan on orders'];
-  const points = [
-    { label: 'p10', value: '39116', signature: idx, totalCost: 1758, estimatedRows: 39999 },
-    { label: 'p50', value: '201178', signature: idx, totalCost: 8774, estimatedRows: 199999 },
-    { label: 'p90', value: '359773', signature: seq, totalCost: 11142, estimatedRows: 359999 },
+  // estimatedRows is the ROOT output; scanRows is the swept relation's own scan
+  // estimate. They are set apart here on purpose — as on a `count(*)` query,
+  // where the root is 1 at every point while the orders scan swings wide — so
+  // the headline is forced to cite the scan figure, never the misleading root 1.
+  const points: FlipPoint[] = [
+    { label: 'p10', value: '39116', signature: idx, totalCost: 1758, estimatedRows: 1, scanRows: 39999 },
+    { label: 'p50', value: '201178', signature: idx, totalCost: 8774, estimatedRows: 1, scanRows: 199999 },
+    { label: 'p90', value: '359773', signature: seq, totalCost: 11142, estimatedRows: 1, scanRows: 359999 },
   ];
+  const site = { column: 'id', operator: '<', relation: ['orders'] };
 
-  test('reports the boundary as a bracket with both values, both costs, and the word estimates', () => {
-    const flips = findFlips(points, { column: 'id', operator: '<' });
+  test('brackets the boundary with both values, both costs, and the swept relation row estimates', () => {
+    const flips = findFlips(points, site);
     assert.equal(flips.length, 1);
     const flip = flips[0];
     assert.equal(flip.fromLabel, 'p50');
@@ -491,10 +497,32 @@ describe('findFlips', () => {
     assert.match(flip.headline, /8774/);
     assert.match(flip.headline, /11142/);
     assert.match(flip.headline, /Index Scan on orders via orders_pkey → Seq Scan on orders/);
+    // The bracket ends cite the swept relation's scan estimates (~200.0K →
+    // ~360.0K), pinned to `orders`, NOT the root output (1). This is finding
+    // #1's fix at the flip-headline level: the rows moved across the flip, and
+    // the headline must say so rather than print an identical "~1 rows" twice.
+    assert.match(flip.headline, /~200\.0K rows on `orders`/);
+    assert.match(flip.headline, /~360\.0K rows on `orders`/);
+    assert.doesNotMatch(flip.headline, /~1 rows/);
   });
 
   test('identical signatures produce no flip', () => {
     const flat = points.map((p) => ({ ...p, signature: seq }));
-    assert.equal(findFlips(flat, { column: 'id', operator: '<' }).length, 0);
+    assert.equal(findFlips(flat, site).length, 0);
+  });
+
+  test('a point with no identifiable scan on the relation is bracketed without a row figure', () => {
+    // scanRows null (the swept relation was folded into a join, scanned twice by
+    // a self-join, etc.): the bracket ends must name the plan shapes only, never
+    // fall back to pairing the root output against the relation's cardinality.
+    const noScan: FlipPoint[] = [
+      { ...points[0], scanRows: null },
+      { ...points[2], scanRows: null },
+    ];
+    const flip = findFlips(noScan, site)[0];
+    assert.ok(flip, 'the signatures still differ, so there is still a flip');
+    assert.doesNotMatch(flip.headline, /rows on `orders`/);
+    assert.doesNotMatch(flip.headline, /~1 rows/);
+    assert.match(flip.headline, /the plan flips/);
   });
 });
