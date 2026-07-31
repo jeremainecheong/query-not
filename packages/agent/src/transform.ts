@@ -1362,6 +1362,21 @@ export function generateLateralTop1(
   const conjuncts = whereBool && whereBool['boolop'] === 'AND_EXPR' && Array.isArray(whereBool['args'])
     ? (whereBool['args'] as unknown[])
     : sub['whereClause'] ? [sub['whereClause']] : [];
+  // An inner column is fixed per outer row only when it is equated to an
+  // OUTER reference. Requiring the other side to positively name an outer table
+  // — not merely to "not name the inner one" — is the load-bearing distinction:
+  // `i.parent_id = alt_id`, where alt_id is another inner column, has no
+  // qualifier and would otherwise slip through, pinning a column that varies
+  // within the group. The determinism certificate then covers a column that is
+  // not fixed, and a tie on the sort key picks an arbitrary row.
+  const refsOuterName = (v: unknown): boolean =>
+    contains(v, (type, n) => {
+      if (type !== 'ColumnRef') return false;
+      const fields = n['fields'];
+      if (!Array.isArray(fields) || fields.length < 2) return false;
+      const qual = node(node(fields[fields.length - 2])?.['String'])?.['sval'];
+      return typeof qual === 'string' && qual !== innerName && outerNames.has(qual);
+    });
   const pinned = new Set<string>();
   for (const c of conjuncts) {
     const ex = node(node(c)?.['A_Expr']);
@@ -1369,7 +1384,7 @@ export function generateLateralTop1(
     for (const [colSide, otherSide] of [['lexpr', 'rexpr'], ['rexpr', 'lexpr']] as const) {
       const parts = columnParts(ex[colSide]);
       if (parts && parts.length >= 2 && parts.at(-2) === innerName &&
-          !referencesQualifier(ex[otherSide], innerName)) {
+          refsOuterName(ex[otherSide]) && !referencesQualifier(ex[otherSide], innerName)) {
         pinned.add(parts.at(-1)!);
       }
     }
@@ -1540,12 +1555,16 @@ export function generateGroupedJoin(
   if (call['agg_filter'] || call['agg_order'] || call['agg_within_group'] || call['over']) {
     return { ok: false, blocked: 'FILTER, WITHIN GROUP and window forms are out of scope for the grouped join' };
   }
-  const aggName = lastSval(call['funcname'])?.toLowerCase() ?? null;
+  // Only a pg_catalog aggregate: a schema's own `sum`/`count` shares the name
+  // but not the empty-group value the rewrite hard-codes, so resolving by name
+  // alone would certify the wrong function.
+  const aggName = catalogFuncName(call['funcname']);
   if (!aggName || !GROUPABLE_AGGREGATES.has(aggName)) {
+    const shown = lastSval(call['funcname']) ?? '?';
     return {
       ok: false,
       blocked: `the grouped join knows the empty-group value for count, sum, min, max and avg — ` +
-        `not for \`${aggName ?? '?'}\``,
+        `not for \`${shown}\` (and only for the built-in of that name, not a schema's own)`,
     };
   }
   const callArgs = call['args'];
@@ -1673,6 +1692,25 @@ export function generateGroupedJoin(
     return { ok: false, blocked: 'no equality between a subquery column and the outer query — nothing to group by' };
   }
 
+  // The scalar subquery evaluates the residual conjuncts and the aggregate's
+  // argument once per (outer row × inner row); the derived table evaluates them
+  // once, in one shared grouped pass. For a volatile function — random(),
+  // nextval(), clock_timestamp() — that changes the result, and this is the one
+  // rewrite path that restructures evaluation (the lateral and plain-join forms
+  // preserve it). Volatility is a catalog fact the generator cannot see, so a
+  // function anywhere in the residuals or the aggregate argument refuses here.
+  // Conservative — an immutable lower() is refused too — but the lateral or
+  // plain rewrite still covers those shapes; a wrong grouped join does not.
+  const hasFunc = (v: unknown): boolean => contains(v, (type) => type === 'FuncCall');
+  if (residualIdx.some((i) => hasFunc(conjuncts[i])) || (!call['agg_star'] && hasFunc(callArgs))) {
+    return {
+      ok: false,
+      blocked: 'a function appears in the subquery filter or the aggregate argument — if it is ' +
+        'volatile, evaluating it once per group instead of once per row changes the result, ' +
+        'which the grouped join cannot risk',
+    };
+  }
+
   const outerFrom = sel['fromClause'];
   if (!Array.isArray(outerFrom) || outerFrom.length !== 1) {
     return {
@@ -1737,9 +1775,13 @@ export function generateGroupedJoin(
   const aggAlias = pinCols.includes('agg') ? freshAlias(sql, 'agg') : 'agg';
   const innerQ = quoteIdent(innerName);
   const pinRefs = pinCols.map(c => `${innerQ}.${quoteIdent(c)}`);
+  // Each verbatim slice goes on its own line: a slice that ends in a `--` line
+  // comment (`i.qty > 2 -- keep`) would otherwise comment out the generated
+  // GROUP BY tail appended after it. The newline terminates any trailing
+  // comment before the next clause.
   const derived =
-    `(SELECT ${pinRefs.join(', ')}, ${aggText} AS ${aggAlias} FROM ${relText}` +
-    `${residualText ? ` WHERE ${residualText}` : ''} GROUP BY ${pinRefs.join(', ')})`;
+    `(SELECT ${pinRefs.join(', ')}, ${aggText} AS ${aggAlias}\n FROM ${relText}\n` +
+    `${residualText ? ` WHERE ${residualText}\n` : ''} GROUP BY ${pinRefs.join(', ')})`;
   const onText = pins
     .map(p => `${quoteIdent(alias)}.${quoteIdent(p.inner)} = ${p.outer.map(quoteIdent).join('.')}`)
     .join(' AND ');
@@ -1780,11 +1822,20 @@ export function generateGroupedJoin(
     limitOption: 'LIMIT_OPTION_DEFAULT',
     op: 'SETOP_NONE',
   };
-  if (residualIdx.length === 1) derivedSelect['whereClause'] = clone(conjuncts[residualIdx[0]]);
-  else if (residualIdx.length > 1) {
-    derivedSelect['whereClause'] = {
-      BoolExpr: { boolop: 'AND_EXPR', args: residualIdx.map(i => clone(conjuncts[i])) },
-    };
+  // Reparsing flattens `(a AND b) AND c` to a single AND of [a,b,c], so the
+  // expected tree must flatten every nested AND in the residuals to match —
+  // otherwise an ordinary parenthesised residual is validated against a nested
+  // shape it never reparses to, and a valid candidate is silently withheld.
+  const flattenAnd = (n: unknown): unknown[] => {
+    const b = node(node(n)?.['BoolExpr']);
+    return b && b['boolop'] === 'AND_EXPR' && Array.isArray(b['args'])
+      ? (b['args'] as unknown[]).flatMap(flattenAnd)
+      : [n];
+  };
+  const residualLeaves = residualIdx.flatMap(i => flattenAnd(conjuncts[i])).map(clone);
+  if (residualLeaves.length === 1) derivedSelect['whereClause'] = residualLeaves[0];
+  else if (residualLeaves.length > 1) {
+    derivedSelect['whereClause'] = { BoolExpr: { boolop: 'AND_EXPR', args: residualLeaves } };
   }
   const pinQuals = pins.map(p => ({
     A_Expr: {
@@ -1887,8 +1938,7 @@ export function generateCorrelatedSelect(sql: string, sel: Node, link: Node): Ca
   // ORDER BY + LIMIT 1 is the top-1-per-key idiom (the lateral generator),
   // and a bare aggregate call is the grouped-join shape. Everything else
   // falls through to the plain join below.
-  const limitConst = node(node(node(sub['limitCount'])?.['A_Const'])?.['ival']);
-  if (hasClause(sub, 'sortClause') && limitConst?.['ival'] === 1 && !hasClause(sub, 'limitOffset')) {
+  if (hasClause(sub, 'sortClause') && isLiteralOne(sub['limitCount']) && !hasClause(sub, 'limitOffset')) {
     return generateLateralTop1(sql, sel, link, sub, targetIndex);
   }
   const subVal = node(node(node((Array.isArray(sub['targetList']) ? sub['targetList'][0] : null) as Node | null)?.['ResTarget'])?.['val']);
@@ -1935,10 +1985,14 @@ export function generateCorrelatedSelect(sql: string, sel: Node, link: Node): Ca
   }
   const use = functionUse(val);
   if (use.refused === 'an aggregate call') {
+    // The grouped-join generator handles a BARE aggregate call as the whole
+    // select value; this path is reached only for an aggregate wrapped in an
+    // expression (`count(*) + 1`) or a non-groupable one (`array_agg`), where
+    // the empty-group value is not a single known constant.
     return {
       ok: false,
-      blocked: 'the subquery aggregates — count(*) over no rows is 0 where a join produces NULL, ' +
-        'so the equivalent rewrite is a grouped join, which is not generated',
+      blocked: 'the subquery aggregates inside an expression, or with an aggregate the grouped ' +
+        'join does not cover — only a bare count/sum/min/max/avg call is rewritten',
     };
   }
   if (use.refused) {
@@ -2166,7 +2220,40 @@ const lastSval = (arr: unknown): string | null => {
   return typeof s === 'string' ? s : null;
 };
 
+/**
+ * The function's name ONLY when it resolves to pg_catalog — unqualified, or
+ * schema-qualified `pg_catalog.name`. A `myschema.sum(...)` returns null.
+ *
+ * Matching a builtin by last name-part alone is a real hazard: a user aggregate
+ * `app.sum` shares a name with `pg_catalog.sum` but has its own empty-group
+ * value, so treating it as the builtin certifies the wrong semantics. The
+ * date() rewrite already guards this way; the aggregate generators must too.
+ */
+const catalogFuncName = (funcname: unknown): string | null => {
+  if (!Array.isArray(funcname) || funcname.length === 0 || funcname.length > 2) return null;
+  const last = node(node(funcname.at(-1))?.['String'])?.['sval'];
+  const schema = funcname.length === 2 ? node(node(funcname[0])?.['String'])?.['sval'] : 'pg_catalog';
+  return typeof last === 'string' && schema === 'pg_catalog' ? last.toLowerCase() : null;
+};
+
 const loc = (n: Node): number | null => (typeof n['location'] === 'number' ? n['location'] : null);
+
+/**
+ * A LIMIT that is the literal 1, however spelled — `1`, `'1'::int`, `1.0` —
+ * so the top-1 idiom is recognised whether or not the author wrote a bare
+ * integer. Peels one TypeCast (that is how `'1'::int` parses). A parameter or
+ * an expression is deliberately not one: those fall to the plain path, which
+ * refuses honestly rather than guessing the limit is 1.
+ */
+const isLiteralOne = (limitCount: unknown): boolean => {
+  const inner = node(node(limitCount)?.['TypeCast'])?.['arg'] ?? limitCount;
+  const c = node(node(inner)?.['A_Const']);
+  if (!c) return false;
+  if (node(c['ival'])?.['ival'] === 1) return true;
+  const sval = node(c['sval'])?.['sval'];
+  const fval = node(c['fval'])?.['fval'];
+  return sval === '1' || fval === '1' || fval === '1.0';
+};
 
 /**
  * Find every Tier A site in one statement and run its generator.
