@@ -613,7 +613,8 @@ check('the grouped join proves outright', grpProof.body.outcome === 'proven',
   `outcome ${grpProof.body.outcome}: ${grpProof.body.note}`);
 check('aggregate-ness is cited from pg_proc',
   grpProof.body.preconditions?.every((p) => p.established) &&
-  /pg_proc\.prokind/.test(grpProof.body.preconditions?.[0]?.evidence ?? ''),
+  /pg_proc/.test(grpProof.body.preconditions?.[0]?.evidence ?? '') &&
+  /prokind/.test(grpProof.body.preconditions?.[0]?.evidence ?? ''),
   JSON.stringify(grpProof.body.preconditions ?? []).slice(0, 200));
 check('rows match between subplan and grouped-join forms',
   grpProof.body.equivalence?.status === 'match' &&
@@ -1081,6 +1082,27 @@ check('a decision was auto-recorded with the candidate DDL', typeof orders?.deci
   (await call('/api/decisions')).body.decisions.some(
     (d) => d.kind === 'index' && d.change === orders?.ddl && d.costOnly === true),
   String(orders?.decisionId));
+
+// The claims quantify only over statements that actually re-planned — an
+// errored proof is never folded into a "regresses none" denominator, and the
+// retired "tested against" wording must not reappear.
+check('candidate summaries speak of statements re-planned, not "tested against"',
+  (cons.body.candidates ?? []).every((c) => !/tested against/.test(c.summary ?? '')) &&
+  (orders?.summary ?? '').includes('re-planned'),
+  orders?.summary);
+
+// The saved-query contribution is bounded by the request limit, disclosed on
+// the scope rather than silently truncated.
+const consCapped = await call('/api/workload/consolidate', { includeSaved: true, limit: 1 });
+check('the saved-query contribution is capped at the request limit and disclosed',
+  consCapped.body.scope?.savedExtras?.cap === 1 &&
+  typeof consCapped.body.scope?.savedExtras?.included === 'number' &&
+  typeof consCapped.body.scope?.savedExtras?.omitted === 'number',
+  JSON.stringify(consCapped.body.scope?.savedExtras));
+check('the cap is stated as a skip reason when it bites',
+  consCapped.body.scope?.savedExtras?.omitted === 0 ||
+  (consCapped.body.scope?.skipped ?? []).some((s) => /capped at/.test(s.reason)),
+  (consCapped.body.scope?.skipped ?? []).map((s) => s.reason.slice(0, 50)).join(' | '));
 
 const consNoSaved = await call('/api/workload/consolidate', { includeSaved: false });
 check('includeSaved:false leaves saved queries out — no orders candidate',
