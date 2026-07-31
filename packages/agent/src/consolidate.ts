@@ -75,6 +75,21 @@ export interface SkippedEntry {
 }
 
 /**
+ * Coverage of the saved-query contribution to scope.
+ *
+ * The window path is bounded by the request-validated `limit`; the saved-extra
+ * path must be bounded by the same number, or an unbounded saved set drives an
+ * unbounded C×Q proof matrix. `cap` is that bound, `included` the extras that
+ * made it into scope, `omitted` the admissible extras the cap left out — never
+ * silently, so a truncated saved set can never read as exhaustive.
+ */
+export interface SavedExtrasCoverage {
+  cap: number;
+  included: number;
+  omitted: number;
+}
+
+/**
  * Assemble the set of statements consolidation will reason about.
  *
  * Pure, so it unit-tests without a database. For each of the top `limit`
@@ -82,13 +97,15 @@ export interface SkippedEntry {
  * joins through a matching saved query, which supplies representative
  * parameters while the entry supplies the measured weight (the §6.1 answer);
  * anything else is skipped with its reason — parameters are never guessed.
- * With `includeSaved`, unmatched saved queries join carrying no window weight.
+ * With `includeSaved`, unmatched saved queries join carrying no window weight —
+ * but capped at `limit`, the same bound the window path already obeys, so a
+ * large saved set cannot grow the proof matrix past what the request validated.
  */
 export function buildScope(
   ranked: RankedEntry[],
   saved: SavedQuery[],
   opts: { limit: number; includeSaved: boolean },
-): { members: ScopeMember[]; skipped: SkippedEntry[] } {
+): { members: ScopeMember[]; skipped: SkippedEntry[]; savedExtras: SavedExtrasCoverage } {
   const members = new Map<string, ScopeMember>();
   const skipped: SkippedEntry[] = [];
 
@@ -152,6 +169,12 @@ export function buildScope(
     });
   }
 
+  // Saved extras are capped by `limit`, the same bound the window obeys. The
+  // cap gates only the members that would cost EXPLAINs (the ones actually
+  // added): inadmissible and already-in-scope saved queries are filtered first
+  // and cost nothing, so they are not charged against the cap.
+  let savedIncluded = 0;
+  let savedOmitted = 0;
   if (opts.includeSaved) {
     for (const s of saved) {
       if (matchedNames.has(s.name)) continue;
@@ -168,6 +191,10 @@ export function buildScope(
       const fp = fingerprint(s.sql);
       // Already in scope through the window — the saved copy adds nothing.
       if (members.has(fp)) continue;
+      if (savedIncluded >= opts.limit) {
+        savedOmitted += 1;
+        continue;
+      }
       add({
         source: 'saved-extra',
         sql: s.sql,
@@ -176,10 +203,31 @@ export function buildScope(
         savedName: s.name,
         fingerprint: fp,
       });
+      savedIncluded += 1;
     }
   }
 
-  return { members: [...members.values()], skipped };
+  // One aggregate skip when the cap bit — bounded regardless of how many saved
+  // queries exist, so a 10k-row saved set discloses the truncation in a single
+  // line rather than flooding the report.
+  if (savedOmitted > 0) {
+    skipped.push({
+      queryId: null,
+      savedName: null,
+      share: 0,
+      reason:
+        `${savedOmitted} more saved quer${savedOmitted === 1 ? 'y was' : 'ies were'} not proved: the ` +
+        `saved-query contribution is capped at ${opts.limit} (the request's \`limit\`), so a large saved ` +
+        'set cannot drive an unbounded proof.',
+      hint: 'Raise "limit" (max 25) or prune the saved set to include more.',
+    });
+  }
+
+  return {
+    members: [...members.values()],
+    skipped,
+    savedExtras: { cap: opts.limit, included: savedIncluded, omitted: savedOmitted },
+  };
 }
 
 export interface ConsolidationPerQuery {
@@ -238,6 +286,8 @@ export interface ConsolidationReport {
     skipped: SkippedEntry[];
     /** Share of window time the in-scope statements account for. */
     explainableShare: number;
+    /** How the request's `limit` bounded the saved-query contribution. */
+    savedExtras: SavedExtrasCoverage;
   };
   candidates: ConsolidationCandidateReport[];
   standalone: Array<{ relation: string; columns: string[]; fingerprints: string[] }>;
@@ -359,7 +409,7 @@ export async function consolidateWorkload(
   // includeSaved gates saved queries entirely — stand-ins and extras both —
   // matching the UI checkbox's plain reading.
   const saved = opts.includeSaved ? store.listSavedQueries() : [];
-  const { members, skipped } = buildScope(ranked, saved, {
+  const { members, skipped, savedExtras } = buildScope(ranked, saved, {
     limit: opts.limit,
     includeSaved: opts.includeSaved,
   });
@@ -549,7 +599,7 @@ export async function consolidateWorkload(
       totalMs,
       resetDetected,
     },
-    scope: { queries: scopeQueries, skipped, explainableShare },
+    scope: { queries: scopeQueries, skipped, explainableShare, savedExtras },
     candidates,
     standalone: mergeResult.standalone,
     omitted: mergeResult.omitted,

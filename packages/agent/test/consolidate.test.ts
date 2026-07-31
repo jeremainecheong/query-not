@@ -186,3 +186,55 @@ describe('buildScope', () => {
     assert.equal(members[0]?.queryId, '1');
   });
 });
+
+describe('buildScope — the saved-query contribution is capped by `limit`', () => {
+  test('saved extras stop at `limit`; the overflow is disclosed, never silent', () => {
+    // Each saved extra becomes a scope member that costs an EXPLAIN plus a
+    // whatIfIndex per candidate — so an unbounded saved set is exactly the
+    // unbounded-proof-matrix defect. The cap bounds it to `limit`.
+    // Distinct tables so each has its own fingerprint — identical fingerprints
+    // would dedupe before the cap, which is a different (also-correct) path.
+    const saved = Array.from({ length: 5 }, (_, i) =>
+      savedQuery(`s${i}`, `SELECT * FROM t${i} WHERE col = 'x'`),
+    );
+    const { members, skipped, savedExtras } = buildScope([], saved, {
+      limit: 2,
+      includeSaved: true,
+    });
+    assert.equal(members.filter((m) => m.source === 'saved-extra').length, 2, 'only `limit` extras admitted');
+    assert.deepEqual(savedExtras, { cap: 2, included: 2, omitted: 3 });
+    // The truncation surfaces in a single bounded skip entry, no matter how
+    // large the saved set is.
+    const capSkip = skipped.find((s) => /capped at 2/.test(s.reason));
+    assert.ok(capSkip, 'the cap is disclosed in skipped');
+    assert.match(capSkip?.reason ?? '', /3 more saved queries were not proved/);
+  });
+
+  test('inadmissible and already-in-scope saved queries are not charged against the cap', () => {
+    // Neither a saved query already covered by the window nor an inadmissible
+    // one costs an EXPLAIN, so neither consumes a cap slot — a single genuine
+    // extra still gets in under limit 1.
+    const { members, savedExtras, skipped } = buildScope(
+      [entry('11', "SELECT * FROM orders WHERE status = 'a'", 0.4)],
+      [
+        savedQuery('dupe', "SELECT * FROM orders WHERE status = 'a'"),
+        savedQuery('bad', 'DELETE FROM orders'),
+        savedQuery('extra', "SELECT * FROM customers WHERE country = 'sg'"),
+      ],
+      { limit: 1, includeSaved: true },
+    );
+    assert.deepEqual(savedExtras, { cap: 1, included: 1, omitted: 0 });
+    assert.equal(members.filter((m) => m.source === 'saved-extra').length, 1);
+    assert.ok(skipped.some((s) => s.savedName === 'bad'), 'the inadmissible one is skipped for its own reason');
+    assert.ok(!skipped.some((s) => /capped/.test(s.reason)), 'nothing was capped, so no cap skip');
+  });
+
+  test('includeSaved: false reports an empty, un-capped saved contribution', () => {
+    const { savedExtras } = buildScope(
+      [],
+      [savedQuery('extra', "SELECT * FROM orders WHERE status = 'p'")],
+      { limit: 5, includeSaved: false },
+    );
+    assert.deepEqual(savedExtras, { cap: 5, included: 0, omitted: 0 });
+  });
+});
