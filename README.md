@@ -51,7 +51,7 @@ itself tells you not to apply. The CI gate fails a build on camera.
   `NOT IN` null semantics, deep `OFFSET`, leading-wildcard `LIKE`, `OR` across columns,
   and scalar subqueries in the select list. Rewrites that change *results* rather than
   just speed say so explicitly.
-- **Generated rewrites, proven** — for five kinds, the advisor writes the optimised
+- **Generated rewrites, proven** — for seven kinds, the advisor writes the optimised
   statement itself: `NOT IN (SELECT …)` → `NOT EXISTS`, `NOT IN (list)` → a VALUES
   anti-join, `date(col) = 'D'` → a half-open range an index can serve, `WHERE a OR b`
   → `UNION ALL` arms guarded with `AND (earlier arm) IS NOT TRUE` so they partition
@@ -70,8 +70,34 @@ itself tells you not to apply. The CI gate fails a build on camera.
   exactly it. On the seeded database the subquery-to-join proves with a 99% estimated
   cost drop, while the unindexed OR split honestly reports **regressed — do not
   apply** with its rows still matching: the tool argues from evidence either way.
+  Two further correlated shapes generate too: `ORDER BY … LIMIT 1` (top-1-per-key)
+  hoists verbatim into a `LEFT JOIN LATERAL` — deterministic only under a unique
+  index within the correlation and sort columns, with NOT NULL established on the
+  sort keys because a unique index leaves NULLs tied — and a bare aggregate call
+  becomes a `GROUP BY` derived table (`COALESCE(…, 0)` restoring count's zero),
+  where the fact to prove is that the call *is* an aggregate (`pg_proc.prokind`),
+  the mirror image of the check the other kinds already make.
 - **What-if engine** — hypothetical indexes via HypoPG, and `work_mem` /
   planner-GUC changes. Every suggestion re-planned and diffed.
+- **Extended-statistics advisor** — when a node underestimates badly and its
+  predicate is an equality conjunction over several columns of one table (the
+  correlated-columns case per-column statistics cannot represent), the advisor
+  suggests `CREATE STATISTICS (dependencies, ndistinct)` with the measured
+  ratio cited, confirms the columns against the SQL's AST, and reports whether
+  a covering object already exists — including the exists-but-never-ANALYZEd
+  state read from `pg_stats_ext`. With an opt-in sandbox
+  (`QUERYNOT_SANDBOX_URL`) "Prove it" runs the DDL and an `ANALYZE` inside a
+  single rolled-back transaction and diffs estimate accuracy before and after:
+  on the seeded database, 2,036 → ~10,100 estimated against 10,000 actual, with
+  the functional dependency cited by degree from `pg_stats_ext.dependencies`.
+  Nothing persists. Without the sandbox the suggestion stands as advice with
+  exact DDL.
+- **Parameter sensitivity** — the same query planned along the column's own statistics:
+  constants drawn from the `pg_stats` histogram (p10/p50/p90 positions) or the
+  most_common_vals list, each re-planned with plain EXPLAIN, and the flip boundary
+  reported as a bracket between sweep points — planner estimates by declaration, with
+  the tool refusing (and saying why, citing `pg_stats`) when the statistics cannot
+  support a sweep.
 - **Plan diff** — structural tree alignment with access-method change detection,
   surfaced node by node in the UI.
 - **Collector agent** — holds the database connection, runs the what-if loop, and
@@ -93,11 +119,28 @@ itself tells you not to apply. The CI gate fails a build on camera.
   **total** time. The 4ms query running two million times a day costs more than the
   eight-second report, and only one of those shows up in a slow-query log. Handles
   counter resets and entry eviction, both of which produce plausible nonsense if ignored.
+- **Index consolidation** — one index proven against many queries: the workload
+  window's demands merge per relation (equality columns first, range column
+  pinned last), and each consolidated candidate is proven with a hypothetical
+  index against every statement it claims to serve — per-query verdicts, the
+  share of window time covered, and the narrower suggestions it would replace.
+  Candidates are proven in isolation, and the response says so.
 - **CI gate** — `querynot ci` plans your queries against a committed baseline and fails
   the build when an index stops being used or cost jumps. Baselines record plan *shape*,
   not timing, because a committed baseline gets compared on someone else's machine.
 - **Decisions** — every proven change is recorded automatically with its verdict and
   numbers, plus whether it was ever actually shipped.
+- **Drop-safety proofs** — every user index listed with its size, definition and
+  `idx_scan` count, each sentence carrying the counter's blind spots (resets, replica
+  reads, constraint enforcement); indexes that enforce semantics — primary keys,
+  unique and exclusion constraints, replica identities, FK-referenced — are flagged
+  not-droppable-for-performance and refused outright. "Prove drop" hides the index
+  with hypopg 1.4's `hypopg_hide_index` in one session, re-plans every query the
+  agent knows about (recorded analyses plus admissible `pg_stat_statements` entries,
+  each re-admitted, capped and fully enumerated), and diffs each plan. A load-bearing
+  index comes back **regressed — do not drop** with the collapsing query and its cost
+  pair; a quiet one is **safe to drop against these queries** — never "safe", full
+  stop, because queries the agent has not seen are not covered and the note says so.
 
 Every phase in [REQUIREMENTS.md](REQUIREMENTS.md) is now built.
 
@@ -159,11 +202,26 @@ CREATE EXTENSION hypopg;
 Without it everything else still works; the UI shows a `no hypopg` badge and disables
 "Prove it" rather than silently offering a broken button.
 
+### GitHub Action
+
+The gate is also packaged as a reusable action, so a repository can gate its pull
+requests on plan regressions with one step:
+
+```yaml
+- uses: jeremainecheong/query-not@main
+  with:
+    database-url: postgres://postgres:postgres@localhost:5432/app
+```
+
+[docs/github-action.md](docs/github-action.md) has the full setup — the service
+container, recording the baseline, and what the gate does and does not prove.
+
 ### Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `QUERYNOT_DATABASE_URL` | `postgres://localhost/postgres` | Target database |
+| `QUERYNOT_SANDBOX_URL` | unset | Opt-in DDL sandbox for statistics proofs — a **disposable** copy, never production |
 | `QUERYNOT_STATEMENT_TIMEOUT_MS` | `15000` | Hard ceiling on any statement |
 | `QUERYNOT_MAX_CONNECTIONS` | `4` | Pool size |
 | `QUERYNOT_PORT` | `5174` | Agent HTTP port |
@@ -187,6 +245,25 @@ attackers. Layers 2–4 are what hold, which is why none are optional.
 
 **What a rollback does not undo:** sequence advancement, and side effects from triggers
 that reach outside the database.
+
+### The statistics sandbox is the one deliberate exception
+
+`CREATE STATISTICS` cannot be tested hypothetically, so proving one needs real
+DDL — which is exactly what the main connection must never be able to run.
+Setting `QUERYNOT_SANDBOX_URL` opts into a second connection whose transactions
+are **read-write by necessity** (DDL forbids `BEGIN READ ONLY`) and always
+rolled back: `CREATE STATISTICS` → `ANALYZE` → re-`EXPLAIN` → `ROLLBACK`, in
+one transaction, on one connection. Three things follow, and the proof note
+states them too: the analysed query runs there without the read-only-transaction
+backstop (admission control, the statement timeout and the unconditional
+rollback still apply); the in-transaction `ANALYZE` holds a
+`ShareUpdateExclusive` lock on the table until the rollback; and sequences and
+externally-visible trigger effects still do not roll back. The contract is
+therefore that the sandbox is **disposable** — a copy, or a dev database whose
+locks and resampled statistics nobody will miss — and never production. The
+sandbox role must own the target tables (`CREATE STATISTICS` and
+in-transaction `ANALYZE` both require ownership; PG16's `MAINTAIN` privilege
+covers `ANALYZE` only).
 
 ### Privacy
 
@@ -231,12 +308,12 @@ rests on.
 ## Development
 
 ```bash
-npm test          # 317 unit tests across core and agent
+npm test          # 514 unit tests across core and agent
 npm run typecheck
-npm run test:e2e  # full stack, cold: 476 checks plus a production-bundle run
+npm run test:e2e  # full stack, cold: 465 checks plus a production-bundle run
 ```
 
-**793 checks in total** — 317 unit, 152 API end-to-end, 162 browser end-to-end, and the
+**979 checks in total** — 514 unit, 270 API end-to-end, 195 browser end-to-end, and the
 whole browser suite again against the production bundle served by the agent. The dev
 server and the built artifact are different things; verifying only the first ships a
 build nobody ran.
@@ -291,15 +368,14 @@ graph is still there, under the Plan tab, where nesting is what you actually wan
 
 ### Typography
 
-SF Pro and SF Mono are vendored under `packages/web/src/fonts` — the variable SF Pro
-subset to 79KB from 21MB, SF Mono at 13KB per weight.
-
-⚠️ **Read [`packages/web/src/fonts/LICENSE-NOTE.md`](packages/web/src/fonts/LICENSE-NOTE.md)
-before deploying this publicly.** Apple's licence for the SF fonts covers UI mockups for
-Apple-platform apps and does not grant redistribution — which is what serving them to a
-browser is. The note documents the compliant fallback (`-apple-system` plus Inter) and
-the two-line change to switch back; `@fontsource-variable/inter` is kept in
-`package.json` for exactly that reason.
+The interface is set in SF on Apple devices and [Inter](https://rsms.me/inter/)
+everywhere else — and nothing Apple-made ships in the repo. `-apple-system` at the
+front of the stack renders genuine SF Pro straight from the OS, which Apple's licence
+permits because nothing is redistributed; Inter (SIL OFL 1.1, licence vendored at
+`packages/web/src/fonts/LICENSE.txt`) is the single variable `InterVariable.woff2`
+and covers every other platform. Mono is a pure system stack — `ui-monospace`
+falling through to SF Mono, Menlo, Consolas or DejaVu — so no mono font is vendored
+at all.
 
 ## Prior art
 

@@ -3,7 +3,11 @@
 A PostgreSQL query optimiser that doesn't just *show* you a slow plan — it proves what
 would fix it.
 
-Status: **all five phases built**. This document captures decisions
+Status: **all five phases built**, plus a post-phase sprint: seven generated-rewrite
+shapes, drop-safety proofs (`hypopg_hide_index`), workload index consolidation,
+parameter sensitivity from `pg_stats`, an extended-statistics advisor with an opt-in
+sandbox prove (`QUERYNOT_SANDBOX_URL`), a reusable GitHub Action, MIT licensing and
+a vendored-font swap to Inter. This document captures decisions
 made, problems identified, and questions still open. See §8 for what exists today,
 or watch the [narrated demo](docs/demo/query-not-demo.mp4) — four minutes of real,
 measured output, including a generated rewrite proven end-to-end and one the tool

@@ -17,6 +17,27 @@ import { api, type Decision } from '../api';
 import { Link } from '../router';
 import { relative } from './SavedPage';
 
+// Every verdict vocabulary that reaches the store: index/settings what-ifs,
+// generated-rewrite outcomes, drop proofs, statistics proofs. An unknown
+// verdict shows its raw value rather than borrowing a label — mislabelling a
+// result is worse than looking unpolished.
+const VERDICT_STYLE: Record<string, { label: string; dot: 'good' | 'critical' | 'muted' }> = {
+  improved: { label: 'Proven', dot: 'good' },
+  regressed: { label: 'Made it worse', dot: 'critical' },
+  unchanged: { label: 'No change', dot: 'muted' },
+  proven: { label: 'Proven', dot: 'good' },
+  'improved-unverified': { label: 'Improved, rows unverified', dot: 'muted' },
+  'no-effect': { label: 'No effect', dot: 'muted' },
+  differed: { label: 'Returns different rows', dot: 'critical' },
+  'advice-only': { label: 'Not executed', dot: 'muted' },
+  // "No plan changed" bounded to the tested queries, matching the indexes
+  // page — never an unbounded green "safe to drop" on the decisions list.
+  'no-plan-changed': { label: 'No plan changed', dot: 'good' },
+  'plans-changed-not-worse': { label: 'Plans changed, none worse', dot: 'muted' },
+  'estimates-fixed': { label: 'Estimates fixed', dot: 'good' },
+  'estimates-improved': { label: 'Estimates improved', dot: 'good' },
+};
+
 export function DecisionsPage() {
   const [decisions, setDecisions] = useState<Decision[] | null>(null);
 
@@ -66,7 +87,9 @@ export function DecisionsPage() {
   }
 
   const applied = decisions.filter((d) => d.applied).length;
-  const proven = decisions.filter((d) => d.verdict === 'improved').length;
+  // "Proven" spans vocabularies: an improved what-if, a proven rewrite, a
+  // safe-to-drop index and fixed estimates are all positive verdicts.
+  const proven = decisions.filter((d) => VERDICT_STYLE[d.verdict]?.dot === 'good').length;
 
   return (
     <div className="stack stack--tight">
@@ -85,17 +108,14 @@ export function DecisionsPage() {
       </section>
 
       <div className="group">
-        {decisions.map((d) => (
+        {decisions.map((d) => {
+          const style = VERDICT_STYLE[d.verdict] ?? { label: d.verdict, dot: 'muted' as const };
+          return (
           <div className="group__row decision-row" key={d.id}>
             <div className="decision-row__main">
               <div className="decision-row__head">
-                <span
-                  className={`dot dot--${d.verdict === 'improved' ? 'good' : d.verdict === 'regressed' ? 'critical' : 'muted'}`}
-                  aria-hidden="true"
-                />
-                <span className="decision-row__verdict">
-                  {d.verdict === 'improved' ? 'Proven' : d.verdict === 'regressed' ? 'Made it worse' : 'No effect'}
-                </span>
+                <span className={`dot dot--${style.dot}`} aria-hidden="true" />
+                <span className="decision-row__verdict">{style.label}</span>
                 <span className="pill">{d.kind}</span>
                 <span className="t-small">{relative(d.createdAt)}</span>
               </div>
@@ -133,7 +153,8 @@ export function DecisionsPage() {
               </label>
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );

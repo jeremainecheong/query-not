@@ -592,6 +592,63 @@ check('yet the rows still match — exact even when slower',
   orProof.body.equivalence.rowsOriginal === orProof.body.equivalence.rowsRewritten,
   JSON.stringify(orProof.body.equivalence ?? {}).slice(0, 160));
 
+section('Prove a grouped-join rewrite (aggregate subquery)');
+
+// count(*) per outer row — the aggregate flavour of the hidden N+1. The
+// derived table groups by the correlation column, so fan-out is impossible by
+// construction; what must be proven is that count IS an aggregate.
+const GRP_SQL =
+  'SELECT o.id, (SELECT count(*) FROM order_items i WHERE i.order_id = o.id) AS items ' +
+  'FROM orders o WHERE o.id < 15000';
+const grpRw = await call('/api/rewrite', { sql: GRP_SQL });
+const grpFinding = (grpRw.body.rewrites ?? []).find((r) => r.kind === 'correlated-subquery-in-select');
+check('the finding carries the grouped derived table with COALESCE',
+  /LEFT JOIN \(SELECT i\.order_id, count\(\*\) AS agg\s+FROM order_items i\s+GROUP BY i\.order_id\)/.test(grpFinding?.candidate?.sql ?? '') &&
+  /COALESCE\(qn_0\.agg, 0\)/.test(grpFinding?.candidate?.sql ?? ''),
+  grpFinding?.candidateBlocked ?? 'no candidate');
+const grpProof = await call('/api/whatif/rewrite', {
+  sql: GRP_SQL, kind: 'correlated-subquery-in-select', location: grpFinding?.location ?? null,
+});
+check('the grouped join proves outright', grpProof.body.outcome === 'proven',
+  `outcome ${grpProof.body.outcome}: ${grpProof.body.note}`);
+check('aggregate-ness is cited from pg_proc',
+  grpProof.body.preconditions?.every((p) => p.established) &&
+  /pg_proc/.test(grpProof.body.preconditions?.[0]?.evidence ?? '') &&
+  /prokind/.test(grpProof.body.preconditions?.[0]?.evidence ?? ''),
+  JSON.stringify(grpProof.body.preconditions ?? []).slice(0, 200));
+check('rows match between subplan and grouped-join forms',
+  grpProof.body.equivalence?.status === 'match' &&
+  grpProof.body.equivalence.rowsOriginal === grpProof.body.equivalence.rowsRewritten,
+  JSON.stringify(grpProof.body.equivalence ?? {}).slice(0, 160));
+
+section('Prove a lateral top-1 rewrite');
+
+// Latest promotion per order. promotions_pkey covers (id) ⊆ {order_id, id},
+// so the pick is deterministic and the precondition establishes — while with
+// no index on order_id to drive the lateral, the honest verdict is no effect.
+const LAT_SQL =
+  'SELECT o.id, (SELECT p.applied_at FROM promotions p WHERE p.order_id = o.id ' +
+  'ORDER BY p.id DESC LIMIT 1) AS last_promo FROM orders o WHERE o.id < 40';
+const latRw = await call('/api/rewrite', { sql: LAT_SQL });
+const latFinding = (latRw.body.rewrites ?? []).find((r) => r.kind === 'correlated-subquery-in-select');
+check('the finding carries the verbatim lateral candidate',
+  /LEFT JOIN LATERAL \(SELECT p\.applied_at FROM promotions p WHERE p\.order_id = o\.id ORDER BY p\.id DESC LIMIT 1\) qn_0 ON true/
+    .test(latFinding?.candidate?.sql ?? ''),
+  latFinding?.candidateBlocked ?? 'no candidate');
+check('the outer AS alias survives the hoist',
+  /qn_0\.applied_at AS last_promo/.test(latFinding?.candidate?.sql ?? ''));
+const latProof = await call('/api/whatif/rewrite', {
+  sql: LAT_SQL, kind: 'correlated-subquery-in-select', location: latFinding?.location ?? null,
+});
+check('the tie-break precondition establishes via the primary key',
+  latProof.body.preconditions?.every((p) => p.established) &&
+  /promotions_pkey/.test(latProof.body.preconditions?.[0]?.evidence ?? ''),
+  JSON.stringify(latProof.body.preconditions ?? []).slice(0, 200));
+check('rows match and the verdict is honest, never differed',
+  latProof.body.equivalence?.status === 'match' &&
+  latProof.body.outcome !== 'differed' && latProof.body.outcome !== 'advice-only',
+  `outcome ${latProof.body.outcome}`);
+
 // An OR inside a subquery is out of the generator's scope, and the prove
 // endpoint must refuse it with the same reason the finding carries.
 const NESTED_OR_SQL =
@@ -603,6 +660,458 @@ const nestedOr = await call('/api/whatif/rewrite', {
 });
 check('a nested-scope OR refuses with the reason', nestedOr.status === 409 && /nested subquery/.test(nestedOr.body.error ?? ''),
   JSON.stringify(nestedOr.body).slice(0, 160));
+
+// ── Index drop proofs ────────────────────────────────────────────────────────
+
+section('Index drop candidates');
+const dropHealth = await call('/api/health');
+check('hypopg_hide_index detected on the seeded hypopg 1.4 database',
+  dropHealth.body.database?.hypopgHideIndex === true);
+check('drop proofs advertised as a capability', dropHealth.body.capabilities?.dropIndex === true);
+
+const inventory = await call('/api/indexes');
+check('inventory responds', inventory.status === 200, JSON.stringify(inventory.body).slice(0, 160));
+check('a page-level stats note frames what idx_scan can and cannot see',
+  typeof inventory.body.statsNote === 'string' && /replica/.test(inventory.body.statsNote));
+const invByName = new Map((inventory.body.indexes ?? []).map((i) => [i.index, i]));
+for (const pkey of ['orders_pkey', 'customers_pkey', 'order_items_pkey', 'promotions_pkey']) {
+  const row = invByName.get(pkey);
+  check(`${pkey} is not droppable for performance, citing indisprimary`,
+    row?.droppableForPerformance === false &&
+    row.disqualifiers.some((d) => d.kind === 'primary-key' && /indisprimary/.test(d.evidence)),
+    JSON.stringify(row?.disqualifiers ?? null));
+}
+check('the plain indexes are listed as candidates',
+  invByName.get('order_items_order_id_idx')?.droppableForPerformance === true &&
+  invByName.get('promotions_applied_at_idx')?.droppableForPerformance === true);
+check('every row carries a definition, a size and a since-caveat evidence sentence',
+  (inventory.body.indexes ?? []).length >= 6 &&
+  inventory.body.indexes.every((i) =>
+    /CREATE .*INDEX/.test(i.definition) && i.sizeBytes > 0 && /since/.test(i.evidence)));
+check('no listing row ever claims safety — that is the prove endpoint’s job',
+  !/safe to drop/i.test(JSON.stringify(inventory.body.indexes)));
+
+section('Prove an index is safe to drop');
+// Make the index load-bearing for a known query first: this equality shape
+// plans as an Index Scan using order_items_order_id_idx (measured cost ~11),
+// and analysing it records it in the store the proof reads.
+const loadBearing = await call('/api/analyze', {
+  sql: 'SELECT * FROM order_items WHERE order_id = 12345', analyze: false,
+});
+check('the order_id query plans through the index before anything is hidden',
+  loadBearing.body.plan?.nodes?.some((n) => n.indexName === 'order_items_order_id_idx'),
+  JSON.stringify(loadBearing.body.plan?.nodes?.map((n) => [n.nodeType, n.indexName]) ?? []));
+
+const dropProof = await call('/api/whatif/drop-index', { index: 'order_items_order_id_idx' });
+check('the proof endpoint answers', dropProof.status === 200, JSON.stringify(dropProof.body).slice(0, 200));
+check('a load-bearing index comes back regressed', dropProof.body.outcome === 'regressed',
+  `outcome ${dropProof.body.outcome}`);
+const regressedRow = (dropProof.body.perQuery ?? []).find(
+  (q) => q.usedIndex === true && q.verdict === 'regressed');
+check('the regressing query used the index and its plan collapsed without it',
+  Boolean(regressedRow), JSON.stringify(dropProof.body.perQuery ?? []).slice(0, 300));
+check('the regression is measured in the costs: two orders of magnitude or more',
+  regressedRow && regressedRow.costAfter > regressedRow.costBefore * 100,
+  `cost ${regressedRow?.costBefore} → ${regressedRow?.costAfter}`);
+check('the access change names the lost index',
+  (regressedRow?.accessChanges ?? []).some((c) => c.includes('order_items_order_id_idx')),
+  JSON.stringify(regressedRow?.accessChanges ?? []));
+check('the proof is cost-only and says so', dropProof.body.costOnly === true &&
+  /estimate/i.test(dropProof.body.note ?? ''));
+check('the note refuses the drop in plain words',
+  /load-bearing|do not/i.test(dropProof.body.note ?? ''), dropProof.body.note);
+check('coverage is enumerated, never implied',
+  dropProof.body.coverage?.tested > 0 && dropProof.body.coverage?.cap === 20 &&
+  typeof dropProof.body.coverage?.fromStore === 'number' &&
+  Array.isArray(dropProof.body.coverage?.skipped));
+
+// The safe case: nothing this agent knows about plans through this index —
+// the date() originals in the store cannot use it.
+const safeProof = await call('/api/whatif/drop-index', {
+  index: 'promotions_applied_at_idx', schema: 'public',
+});
+check('an unused index comes back no-plan-changed', safeProof.body.outcome === 'no-plan-changed',
+  `outcome ${safeProof.body.outcome}: ${safeProof.body.note}`);
+check('the verdict is bounded to the enumerated queries',
+  /queries this agent knows about/.test(safeProof.body.note ?? '') &&
+  /never analysed here are not covered/.test(safeProof.body.note ?? ''), safeProof.body.note);
+check('the counter evidence is cited with its blind spots',
+  /idx_scan|stats/.test(safeProof.body.note ?? ''), safeProof.body.note);
+check('the safe proof actually tested stored queries',
+  safeProof.body.coverage?.tested > 0 && safeProof.body.coverage?.fromStore > 0,
+  JSON.stringify(safeProof.body.coverage ?? {}));
+check('every tested plan stood still (or errored and was excluded)',
+  (safeProof.body.perQuery ?? []).every((q) => q.verdict === 'unchanged' || q.error !== null));
+
+// The unhide hazard: hidden-index state is backend memory that survives
+// ROLLBACK. If any exit path skipped hypopg_unhide_all_indexes(), the pooled
+// connection would now plan this query without the index.
+const afterUnhide = await call('/api/analyze', {
+  sql: 'SELECT * FROM order_items WHERE order_id = 12345', analyze: false,
+});
+check('hidden indexes do not leak into later queries',
+  afterUnhide.body.plan?.nodes?.some((n) => n.indexName === 'order_items_order_id_idx'),
+  'hypopg_unhide_all_indexes() must run before the connection returns to the pool');
+check('and the plan cost is the indexed one, not the seq-scan one',
+  afterUnhide.body.plan?.totalCost < 1000,
+  `totalCost ${afterUnhide.body.plan?.totalCost} — measured ~11 with the index, ~11050 without`);
+
+section('Drop-proof refusals');
+const pkeyProof = await call('/api/whatif/drop-index', { index: 'orders_pkey' });
+check('a primary key is refused with the catalog evidence',
+  pkeyProof.status === 409 && /indisprimary|primary key/.test(pkeyProof.body.error ?? ''),
+  JSON.stringify(pkeyProof.body).slice(0, 160));
+check('the refusal says it is a refusal, not a verdict',
+  /refusal, not a verdict/.test(pkeyProof.body.error ?? ''));
+check('an unknown index 404s',
+  (await call('/api/whatif/drop-index', { index: 'no_such_index' })).status === 404);
+check('a missing index field is rejected',
+  (await call('/api/whatif/drop-index', {})).status === 400);
+const dropDecision = await call('/api/decisions', {
+  kind: 'drop-index', change: 'DROP INDEX "public"."promotions_applied_at_idx";',
+  verdict: safeProof.body.outcome ?? 'no-plan-changed', headline: safeProof.body.note ?? '',
+  fingerprint: 'public.promotions_applied_at_idx', costOnly: true,
+});
+check('decisions accept kind drop-index', dropDecision.status === 200 &&
+  dropDecision.body.kind === 'drop-index', JSON.stringify(dropDecision.body).slice(0, 120));
+
+// ── Extended statistics: detect, prove on the sandbox, nothing persists ──────
+
+section('Extended statistics advisor');
+
+// The seed's flagship case: country and currency are perfectly correlated, so
+// the conjunction estimate lands a factor of ~5 under reality (measured 4.9x —
+// ANALYZE samples, so the true 5.0x wobbles a few percent run to run).
+const STATS_SQL = "SELECT count(*) FROM customers WHERE country = 'US' AND currency = 'USD'";
+const corrStats = await call('/api/analyze', { sql: STATS_SQL, analyze: true });
+const statsSuggestions = corrStats.body.statisticsSuggestions ?? [];
+check('the correlated pair produces exactly one statistics suggestion', statsSuggestions.length === 1,
+  JSON.stringify(statsSuggestions).slice(0, 160));
+const statsSug = statsSuggestions[0] ?? {};
+check('the DDL is the dependencies+ndistinct object on both columns',
+  /^CREATE STATISTICS \w+ \(dependencies, ndistinct\) ON country, currency FROM customers;$/.test(statsSug.ddl ?? ''),
+  statsSug.ddl);
+check('the columns were confirmed against the SQL, not just plan text', statsSug.source === 'ast');
+check('no covering object exists yet', statsSug.existingState === 'none');
+check('the measured ratio sits in the 5x band and is cited in the evidence',
+  statsSug.ratio >= 4.5 && statsSug.ratio <= 5.5 && /\dx under/.test(statsSug.reason ?? ''),
+  `ratio ${statsSug.ratio}`);
+check('the evidence cites both columns, backticked',
+  /`country`/.test(statsSug.reason ?? '') && /`currency`/.test(statsSug.reason ?? ''));
+check('the underestimate itself is pinned: ~2.0K estimated, exactly 10000 actual',
+  statsSug.estimatedRows > 1500 && statsSug.estimatedRows < 2500 && statsSug.actualRows === 10000,
+  `est ${statsSug.estimatedRows}, actual ${statsSug.actualRows}`);
+const corrReopened = await call(`/api/analysis/${corrStats.body.slug}`);
+check('the reopened slug carries the statistics suggestions',
+  (corrReopened.body.statisticsSuggestions ?? []).length === 1);
+
+const noActuals = await call('/api/analyze', { sql: STATS_SQL, analyze: false });
+check('no actuals, no suggestion — misestimates need measurements',
+  (noActuals.body.statisticsSuggestions ?? []).length === 0);
+const oneCol = await call('/api/analyze', { sql: "SELECT count(*) FROM customers WHERE country = 'US'", analyze: true });
+check('a single equality column is refused', (oneCol.body.statisticsSuggestions ?? []).length === 0);
+const orCase = await call('/api/analyze', {
+  sql: "SELECT count(*) FROM customers WHERE country = 'US' OR currency = 'USD'", analyze: true,
+});
+check('an OR is refused — a disjunction is not a conjunction',
+  (orCase.body.statisticsSuggestions ?? []).length === 0);
+
+const statsHealth = await call('/api/health');
+if (statsHealth.body.capabilities?.proveStatistics) {
+  check('the sandbox advertises DDL rights on the named database',
+    statsHealth.body.sandbox?.canDdl === true && typeof statsHealth.body.sandbox?.database === 'string',
+    JSON.stringify(statsHealth.body.sandbox));
+
+  const statsProof = await call('/api/whatif/statistics', {
+    sql: STATS_SQL, relation: 'customers', columns: ['country', 'currency'],
+    // Must be ignored: every statement is composed server-side.
+    ddl: 'DROP TABLE customers',
+  });
+  check('the proof endpoint answers', statsProof.status === 200, JSON.stringify(statsProof.body).slice(0, 200));
+  const acc = statsProof.body.accuracy ?? {};
+  check('before: the estimate sits ~5x under the 10000 actual',
+    acc.before?.ratio >= 4.5 && acc.before?.ratio <= 5.5 && acc.before?.actualRows === 10000,
+    JSON.stringify(acc.before));
+  check('after: the estimate lands on reality (measured 2036 → ~10.1K estimated)',
+    acc.after?.ratio <= 2 && acc.after?.estimatedRows > 9000 && acc.after?.estimatedRows < 11000,
+    JSON.stringify(acc.after));
+  check('outcome is estimates-fixed', statsProof.body.outcome === 'estimates-fixed', statsProof.body.outcome);
+  check('the plan diff records a statistics change, measured not cost-only',
+    statsProof.body.planDiff?.change?.kind === 'statistics' && statsProof.body.planDiff?.costOnly === false);
+  check('the functional dependency is cited with degree ~1',
+    (statsProof.body.dependency?.pairs ?? []).length >= 1 &&
+    statsProof.body.dependency.pairs.every((p) => p.degree >= 0.99),
+    JSON.stringify(statsProof.body.dependency));
+  check('the note says rolled back and names the sandbox database',
+    /rolled back/.test(statsProof.body.note ?? '') &&
+    (statsProof.body.note ?? '').includes(`\`${statsProof.body.sandbox?.database}\``),
+    (statsProof.body.note ?? '').slice(0, 120));
+  check('the advice DDL is the durable named object plus its ANALYZE',
+    /^CREATE STATISTICS \w+ \(dependencies, ndistinct\)/.test(statsProof.body.adviceDdl ?? '') &&
+    /ANALYZE customers;$/.test(statsProof.body.adviceDdl ?? ''));
+
+  // Nothing persisted: a second proof starts from the same bad estimate, the
+  // definition catalog stays empty even read through the sandbox's own
+  // database (the read-only main connection), and re-analysis agrees.
+  const statsProof2 = await call('/api/whatif/statistics', {
+    sql: STATS_SQL, relation: 'customers', columns: ['country', 'currency'],
+  });
+  check('a second proof starts from nothing — the object did not persist',
+    statsProof2.body.accuracy?.before?.ratio >= 4.5, JSON.stringify(statsProof2.body.accuracy?.before));
+  const statsCatalog = await call('/api/analyze', {
+    sql: "SELECT stxname FROM pg_statistic_ext WHERE stxrelid = 'customers'::regclass", analyze: true,
+  });
+  check('pg_statistic_ext holds nothing for customers afterwards',
+    statsCatalog.body.plan?.root?.actualRowsTotal === 0,
+    `rows ${statsCatalog.body.plan?.root?.actualRowsTotal}`);
+  const reAnalysed = await call('/api/analyze', { sql: STATS_SQL, analyze: true });
+  check('re-analysis still reports no existing object',
+    (reAnalysed.body.statisticsSuggestions ?? [])[0]?.existingState === 'none');
+
+  const staleStats = await call('/api/whatif/statistics', {
+    sql: STATS_SQL, relation: 'customers', columns: ['country', 'signed_up_at'],
+  });
+  check('columns the SQL does not pin are a conflict, not a guess', staleStats.status === 409,
+    `status ${staleStats.status}`);
+  const oneColProof = await call('/api/whatif/statistics', {
+    sql: STATS_SQL, relation: 'customers', columns: ['country'],
+  });
+  check('a single column is rejected up front', oneColProof.status === 400, `status ${oneColProof.status}`);
+} else {
+  const refused = await call('/api/whatif/statistics', {
+    sql: STATS_SQL, relation: 'customers', columns: ['country', 'currency'],
+  });
+  check('without a sandbox the proof refuses with the recipe', refused.status === 412 &&
+    /QUERYNOT_SANDBOX_URL/.test(refused.body.hint ?? ''), JSON.stringify(refused.body).slice(0, 160));
+}
+
+const statsDecision = await call('/api/decisions', {
+  kind: 'statistics', change: statsSug.ddl ?? 'CREATE STATISTICS x', verdict: 'estimates-fixed',
+  headline: 'estimate matched reality on the sandbox', fingerprint: 'e2e-statistics', costOnly: false,
+});
+check('decisions accept kind statistics', statsDecision.status === 200,
+  JSON.stringify(statsDecision.body).slice(0, 120));
+
+// ── Parameter sensitivity ────────────────────────────────────────────────────
+
+section('Parameter sensitivity (plan flips across pg_stats)');
+const senseHealth = await call('/api/health');
+check('sensitivity capability advertised', senseHealth.body.capabilities?.sensitivity === true);
+
+// Range sweep with no flip: orders has only its pkey, so total_cents seq-scans
+// at every histogram point — a first-class outcome, not an error.
+const noFlip = await call('/api/whatif/sensitivity', { sql: 'SELECT id FROM orders WHERE total_cents > 495000' });
+check('range sweep returns 200', noFlip.status === 200, JSON.stringify(noFlip.body).slice(0, 160));
+check('basis is the histogram, citing pg_stats',
+  noFlip.body.basis?.kind === 'histogram' && /pg_stats/.test(noFlip.body.basis?.evidence ?? ''),
+  noFlip.body.basis?.evidence);
+check('variants are ordered p10 → p50 → p90',
+  (noFlip.body.variants ?? []).map((v) => v.label).join(',') === 'p10,p50,p90');
+check('sweep values are real histogram bounds in ascending order', (() => {
+  const nums = (noFlip.body.variants ?? []).map((v) => Number(v.value));
+  return nums.length === 3 && nums.every((n, i) => Number.isFinite(n) && (i === 0 || nums[i - 1] < n));
+})(), JSON.stringify((noFlip.body.variants ?? []).map((v) => v.value)));
+check('an all-seq-scan sweep reports no flip, saying the plan held',
+  noFlip.body.flips?.length === 0 && /same way/.test(noFlip.body.narrative ?? ''),
+  noFlip.body.narrative?.slice(0, 160));
+check('no-flip payload discipline: just the base plan ships, variants stay summaries',
+  noFlip.body.baseline?.plan !== null &&
+  (noFlip.body.variants ?? []).every((v) => v.plan === null && v.diff === null));
+check('baseline is labelled as written and never interleaved into the sweep',
+  noFlip.body.baseline?.label === 'as written' && typeof noFlip.body.baselineMatchesLabel === 'string');
+check('estimate-only by declaration: costOnly, with the why in the note',
+  noFlip.body.costOnly === true && /planner estimate/.test(noFlip.body.note ?? ''));
+check('nothing was executed: the shipped plan is not analyzed',
+  noFlip.body.baseline?.plan?.analyzed === false);
+
+// The pkey flip: SELECT * makes the index scan pay heap visits, so the plan
+// flips Index Scan → Seq Scan between p50 (~200K rows) and p90 (~360K).
+const flip = await call('/api/whatif/sensitivity', { sql: 'SELECT * FROM orders WHERE id < 201178' });
+check('pkey sweep returns 200', flip.status === 200, JSON.stringify(flip.body).slice(0, 160));
+check('the plan flips exactly once, between p50 and p90',
+  flip.body.flips?.length === 1 &&
+  flip.body.flips[0].fromLabel === 'p50' && flip.body.flips[0].toLabel === 'p90',
+  JSON.stringify(flip.body.flips ?? []).slice(0, 200));
+check('the flip is Index Scan via orders_pkey → Seq Scan',
+  /orders_pkey/.test((flip.body.flips?.[0]?.before ?? []).join(' ')) &&
+  (flip.body.flips?.[0]?.after ?? []).includes('Seq Scan on orders'));
+check('the headline brackets the boundary with both costs and disclaims measurement',
+  /→/.test(flip.body.flips?.[0]?.headline ?? '') &&
+  /estimates, not measurements/.test(flip.body.flips?.[0]?.headline ?? ''),
+  flip.body.flips?.[0]?.headline);
+check('full plans and diffs ship only for the two points flanking the flip', (() => {
+  const withPlan = (flip.body.variants ?? []).filter((v) => v.plan !== null);
+  return withPlan.length === 2 &&
+    withPlan.every((v) => ['p50', 'p90'].includes(v.label) && v.diff !== null && v.plan.analyzed === false) &&
+    flip.body.baseline?.plan === null;
+})(), JSON.stringify((flip.body.variants ?? []).map((v) => [v.label, v.plan !== null])));
+check('every variant still carries its summary: cost, rows and access signature',
+  (flip.body.variants ?? []).every((v) =>
+    typeof v.totalCost === 'number' && typeof v.estimatedRows === 'number' &&
+    Array.isArray(v.signature) && typeof v.verdict === 'string'));
+
+// Equality sweep on the skewed status column (97% 'complete'): only the
+// parallel degree moves with frequency, so the access path holds at every MCV.
+const eqSweep = await call('/api/whatif/sensitivity', { sql: "SELECT id FROM orders WHERE status = 'disputed'" });
+check('equality basis is the MCV list', eqSweep.status === 200 && eqSweep.body.basis?.kind === 'mcv');
+check('the most common value carries its sampled frequency (> 0.9)', (() => {
+  const mc = (eqSweep.body.variants ?? []).find((v) => v.label === 'most common');
+  return mc != null && mc.frequency > 0.9;
+})(), JSON.stringify((eqSweep.body.variants ?? []).map((v) => [v.label, v.frequency])));
+check('with no index on status the plan holds at every frequency',
+  eqSweep.body.flips?.length === 0 && /same way/.test(eqSweep.body.narrative ?? ''));
+check('the all-MCV column explains why no rarer value was tested',
+  /no rarer value exists to test/.test(eqSweep.body.narrative ?? ''), eqSweep.body.narrative?.slice(0, 200));
+
+// Choice and the candidates list: order_items.qty holds four distinct values,
+// all MCVs, so a range sweep on it must be skipped with the pg_stats evidence
+// — reported, never silently dropped — leaving total_cents chosen.
+const MULTI_SQL =
+  'SELECT o.id FROM orders o JOIN order_items oi ON oi.order_id = o.id WHERE o.total_cents > 400000 AND oi.qty > 2';
+const multi = await call('/api/whatif/sensitivity', { sql: MULTI_SQL });
+check('every candidate is returned, skipped ones citing pg_stats', (() => {
+  const cands = multi.body.candidates ?? [];
+  const qty = cands.find((c) => c.column === 'oi.qty');
+  return multi.status === 200 && cands.length === 2 &&
+    qty != null && /pg_stats/.test(qty.skipped ?? '') &&
+    cands.find((c) => c.column === 'o.total_cents')?.chosen === true;
+})(), JSON.stringify(multi.body.candidates ?? []).slice(0, 240));
+check('the choice cites its evidence from pg_class', /pg_class\.reltuples/.test(multi.body.predicate?.why ?? ''),
+  multi.body.predicate?.why);
+const pinLoc = (multi.body.candidates ?? []).find((c) => c.column === 'o.total_cents')?.location ?? null;
+const pinned = await call('/api/whatif/sensitivity', { sql: MULTI_SQL, location: pinLoc });
+check('a location pin overrides the choice and says so',
+  pinned.status === 200 && /pinned by request/.test(pinned.body.predicate?.why ?? ''));
+check('a stale pinned location is a conflict, not a guess',
+  (await call('/api/whatif/sensitivity', { sql: 'SELECT id FROM orders WHERE total_cents > 495000', location: 424242 }))
+    .status === 409);
+
+// Refusals: each names the shape or the statistic that stopped it.
+const noPred = await call('/api/whatif/sensitivity', { sql: 'SELECT count(*) FROM orders' });
+check('no comparison predicate refuses with the shape it needs',
+  noPred.status === 400 && /comparison/.test(noPred.body.error ?? ''));
+const paramRefusal = await call('/api/whatif/sensitivity', { sql: 'SELECT id FROM orders WHERE id = $1' });
+check('a parameterised query refuses, naming the placeholder',
+  paramRefusal.status === 400 && /parameterised|\$n/.test(paramRefusal.body.error ?? ''));
+const noHist = await call('/api/whatif/sensitivity', { sql: "SELECT id FROM orders WHERE note > 'a'" });
+check('a single-valued column refuses citing pg_stats',
+  noHist.status === 400 && /pg_stats/.test(noHist.body.error ?? ''), noHist.body.error);
+const uniqueEq = await call('/api/whatif/sensitivity', { sql: 'SELECT id FROM orders WHERE id = 42' });
+check('equality on a unique column refuses with the n_distinct lesson',
+  uniqueEq.status === 400 && /n_distinct/.test(uniqueEq.body.error ?? ''), uniqueEq.body.error);
+check('a write refuses through the same admission gate',
+  (await call('/api/whatif/sensitivity', { sql: 'DELETE FROM orders WHERE id < 5' })).status === 400);
+// ── Workload consolidation ───────────────────────────────────────────────────
+
+section('Workload consolidation (one index proven against many queries)');
+check('consolidation is advertised as a capability',
+  (await call('/api/health')).body.capabilities?.consolidateIndexes === true);
+
+// Four saved queries with overlapping demands on orders: wl-b's status-only
+// demand must fold into wl-a's (status, created_at) as its prefix; wl-c fails
+// the selectivity gate (qty > 3 keeps a quarter of the table) and becomes a
+// regression sentinel; wl-d is a single-query demand that belongs to the
+// per-query advisor, not to consolidation.
+const WL_A = "SELECT * FROM orders WHERE status = 'disputed' AND created_at > '2024-03-01'";
+const WL_B = "SELECT * FROM orders WHERE status = 'disputed'";
+const WL_C = 'SELECT * FROM order_items WHERE qty > 3';
+const WL_D = 'SELECT * FROM orders WHERE customer_id = 4242';
+for (const [name, sql] of [['wl-a', WL_A], ['wl-b', WL_B], ['wl-c', WL_C], ['wl-d', WL_D]]) {
+  await call('/api/saved', { name, sql });
+}
+
+// A window must exist — consolidate never auto-snapshots.
+await call('/api/workload/snapshot', {});
+for (const sql of [WL_A, WL_B, WL_C, WL_D]) await call('/api/analyze', { sql, analyze: true });
+await call('/api/workload/snapshot', {});
+
+const cons = await call('/api/workload/consolidate', { includeSaved: true, limit: 25 });
+check('consolidate answers 200 with a delta window', cons.status === 200 && cons.body.window?.isDelta === true,
+  JSON.stringify(cons.body).slice(0, 160));
+
+// The agent's own traffic records as EXPLAIN utility statements and $n-normalised
+// internals, so the window entries are skipped with their reasons and the saved
+// queries join the scope as runnable stand-ins.
+check('unexplainable window entries are skipped with the normalised-form reason',
+  (cons.body.scope?.skipped ?? []).some((s) => /normalised form/.test(s.reason)),
+  (cons.body.scope?.skipped ?? []).map((s) => s.reason.slice(0, 40)).join(' | '));
+check('the report says how many entries were skipped as unexplainable',
+  /\d+ of the \d+ window entries considered were skipped as unexplainable/.test(cons.body.summary ?? ''),
+  cons.body.summary);
+
+const orders = (cons.body.candidates ?? []).find((c) => c.relation === 'orders');
+check('the status-only demand folds into one orders candidate', Boolean(orders),
+  JSON.stringify((cons.body.candidates ?? []).map((c) => [c.relation, c.columns])));
+check('columns are exactly (status, created_at) — equality first',
+  orders?.columns?.join(',') === 'status,created_at', orders?.columns?.join(','));
+check('roles mark created_at as the range column', orders?.roles?.join(',') === 'eq,range');
+check('the candidate claims both merged statements',
+  orders?.claims?.includes('select * from orders where status = ?') &&
+  orders?.claims?.includes('select * from orders where status = ? and created_at > ?'),
+  JSON.stringify(orders?.claims));
+check('it would replace the narrower status-only index',
+  JSON.stringify(orders?.replaces) === '[{"relation":"orders","columns":["status"]}]' &&
+  /replace 1 narrower single-query index/.test(orders?.summary ?? ''),
+  orders?.summary);
+
+const claimedRows = (orders?.perQuery ?? []).filter((r) => r.claimed);
+check('both claimed statements prove improved, cost measured lower',
+  claimedRows.length === 2 &&
+  claimedRows.every((r) => r.verdict === 'improved' && r.costAfter < r.costBefore),
+  JSON.stringify(claimedRows.map((r) => [r.savedName, r.verdict, r.costBefore, r.costAfter])));
+const sentinelC = (orders?.perQuery ?? []).find((r) => r.savedName === 'wl-c');
+check('the below-gate query rides along as an unclaimed sentinel',
+  sentinelC?.claimed === false && sentinelC?.verdict === 'unchanged',
+  JSON.stringify(sentinelC));
+check('the sentinel query is marked noDemand in scope',
+  cons.body.scope?.queries?.find((q) => q.savedName === 'wl-c')?.noDemand === true);
+check('nothing regressed and the portfolio verdict is improved',
+  orders?.regressed === 0 && orders?.verdict === 'improved');
+check('saved extras carry no window weight and the summary says so',
+  orders?.servedShare === 0 && /outside the measured window/.test(orders?.summary ?? ''),
+  orders?.summary);
+check('the result is cost-only with the isolation caveat',
+  orders?.costOnly === true && /planner cost estimates/.test(orders?.note ?? '') &&
+  /proven alone/.test(orders?.note ?? ''), orders?.note);
+
+check('the single-query customer_id demand is refused into standalone',
+  (cons.body.standalone ?? []).some((s) => s.relation === 'orders' && s.columns.join(',') === 'customer_id'),
+  JSON.stringify(cons.body.standalone));
+
+check('a decision was auto-recorded with the candidate DDL', typeof orders?.decisionId === 'number' &&
+  (await call('/api/decisions')).body.decisions.some(
+    (d) => d.kind === 'index' && d.change === orders?.ddl && d.costOnly === true),
+  String(orders?.decisionId));
+
+// The claims quantify only over statements that actually re-planned — an
+// errored proof is never folded into a "regresses none" denominator, and the
+// retired "tested against" wording must not reappear.
+check('candidate summaries speak of statements re-planned, not "tested against"',
+  (cons.body.candidates ?? []).every((c) => !/tested against/.test(c.summary ?? '')) &&
+  (orders?.summary ?? '').includes('re-planned'),
+  orders?.summary);
+
+// The saved-query contribution is bounded by the request limit, disclosed on
+// the scope rather than silently truncated.
+const consCapped = await call('/api/workload/consolidate', { includeSaved: true, limit: 1 });
+check('the saved-query contribution is capped at the request limit and disclosed',
+  consCapped.body.scope?.savedExtras?.cap === 1 &&
+  typeof consCapped.body.scope?.savedExtras?.included === 'number' &&
+  typeof consCapped.body.scope?.savedExtras?.omitted === 'number',
+  JSON.stringify(consCapped.body.scope?.savedExtras));
+check('the cap is stated as a skip reason when it bites',
+  consCapped.body.scope?.savedExtras?.omitted === 0 ||
+  (consCapped.body.scope?.skipped ?? []).some((s) => /capped at/.test(s.reason)),
+  (consCapped.body.scope?.skipped ?? []).map((s) => s.reason.slice(0, 50)).join(' | '));
+
+const consNoSaved = await call('/api/workload/consolidate', { includeSaved: false });
+check('includeSaved:false leaves saved queries out — no orders candidate',
+  consNoSaved.status === 200 &&
+  !(consNoSaved.body.candidates ?? []).some((c) => c.relation === 'orders'),
+  JSON.stringify((consNoSaved.body.candidates ?? []).map((c) => c.relation)));
+check('a zero limit is rejected', (await call('/api/workload/consolidate', { limit: 0 })).status === 400);
+check('a non-boolean includeSaved is rejected',
+  (await call('/api/workload/consolidate', { includeSaved: 'yes' })).status === 400);
 
 // ── Verify the database was never mutated ────────────────────────────────────
 

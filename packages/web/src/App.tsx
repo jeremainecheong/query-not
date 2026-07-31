@@ -9,6 +9,7 @@ import { LandingPage } from './pages/LandingPage';
 import { QueriesPage } from './pages/QueriesPage';
 import { ReferencePage } from './pages/ReferencePage';
 import { WorkloadPage } from './pages/WorkloadPage';
+import { IndexesPage } from './pages/IndexesPage';
 import { DecisionsPage } from './pages/DecisionsPage';
 import { CommandPalette } from './components/CommandPalette';
 import { FlameGraph } from './components/FlameGraph';
@@ -17,6 +18,8 @@ import { Hotspots } from './components/Hotspots';
 import { NodeDetail, PlanTree } from './components/PlanTree';
 import { PlanGraph } from './components/PlanGraph';
 import { Rewrites } from './components/Rewrites';
+import { StatisticsAdvice } from './components/StatisticsAdvice';
+import { Sensitivity } from './components/Sensitivity';
 import { Suggestions } from './components/Suggestions';
 import { WhatIfSettings } from './components/WhatIfSettings';
 
@@ -33,7 +36,7 @@ GROUP BY c.country
 ORDER BY cents DESC`;
 
 type Theme = 'system' | 'light' | 'dark';
-type Tab = 'graph' | 'findings' | 'rewrites' | 'indexes' | 'settings' | 'plan';
+type Tab = 'graph' | 'findings' | 'rewrites' | 'indexes' | 'settings' | 'sensitivity' | 'plan';
 
 export function App() {
   const [sql, setSql] = useState(SAMPLE);
@@ -146,6 +149,12 @@ export function App() {
             Workload
           </Link>
           <Link
+            className={`header__link${route.name === 'indexes' ? ' header__link--active' : ''}`}
+            to={{ name: 'indexes' }}
+          >
+            Indexes
+          </Link>
+          <Link
             className={`header__link${route.name === 'queries' || route.name === 'history' ? ' header__link--active' : ''}`}
             to={{ name: 'queries' }}
           >
@@ -199,7 +208,10 @@ export function App() {
               setSql(q);
               navigate({ name: 'analyse' });
             }}
+            canConsolidate={health?.capabilities.consolidateIndexes ?? false}
           />
+        ) : route.name === 'indexes' ? (
+          <IndexesPage canProve={health?.capabilities.dropIndex ?? false} />
         ) : route.name === 'decisions' ? (
           <DecisionsPage />
         ) : route.name === 'reference' ? (
@@ -320,8 +332,15 @@ export function App() {
                   <Segment id="graph" tab={tab} setTab={setTab} label="Hotspots" />
                   <Segment id="findings" tab={tab} setTab={setTab} label="Findings" count={analysis.findings.length} />
                   <Segment id="rewrites" tab={tab} setTab={setTab} label="Rewrites" count={analysis.rewrites.length} />
-                  <Segment id="indexes" tab={tab} setTab={setTab} label="Indexes" count={analysis.indexSuggestions.length} />
+                  <Segment
+                    id="indexes"
+                    tab={tab}
+                    setTab={setTab}
+                    label="Indexes"
+                    count={analysis.indexSuggestions.length + (analysis.statisticsSuggestions?.length ?? 0)}
+                  />
                   <Segment id="settings" tab={tab} setTab={setTab} label="What-if" />
+                  <Segment id="sensitivity" tab={tab} setTab={setTab} label="Sensitivity" />
                   <Segment id="plan" tab={tab} setTab={setTab} label="Plan" />
                 </div>
 
@@ -376,20 +395,52 @@ export function App() {
                   )}
 
                   {tab === 'indexes' && (
-                    <div className="group">
-                      <Suggestions
-                        suggestions={analysis.indexSuggestions}
-                        sql={sql}
-                        canProve={health?.capabilities.whatIfIndex ?? false}
-                        fingerprint={analysis.fingerprint}
-                        analysisSlug={analysis.slug ?? null}
-                      />
-                    </div>
+                    <>
+                      {(analysis.statisticsSuggestions?.length ?? 0) > 0 && (
+                        <div className="section-label">
+                          <span className="t-caption">Index suggestions</span>
+                        </div>
+                      )}
+                      <div className="group">
+                        <Suggestions
+                          suggestions={analysis.indexSuggestions}
+                          sql={sql}
+                          canProve={health?.capabilities.whatIfIndex ?? false}
+                          fingerprint={analysis.fingerprint}
+                          analysisSlug={analysis.slug ?? null}
+                        />
+                      </div>
+                      {(analysis.statisticsSuggestions?.length ?? 0) > 0 && (
+                        <div style={{ marginTop: 'var(--sp-6)' }}>
+                          <div className="section-label">
+                            <span className="t-caption">Extended statistics</span>
+                            <div className="section-label__spacer" />
+                            <span className="t-small">for correlated columns</span>
+                          </div>
+                          <div className="group">
+                            <StatisticsAdvice
+                              suggestions={analysis.statisticsSuggestions ?? []}
+                              sql={sql}
+                              canProve={health?.capabilities.proveStatistics ?? false}
+                              sandboxDatabase={health?.sandbox?.database ?? null}
+                              fingerprint={analysis.fingerprint}
+                              analysisSlug={analysis.slug ?? null}
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </>
                   )}
 
                   {tab === 'settings' && (
                     <div className="group">
                       <WhatIfSettings sql={sql} measure={measure} />
+                    </div>
+                  )}
+
+                  {tab === 'sensitivity' && (
+                    <div className="group">
+                      <Sensitivity sql={sql} canRun={health?.capabilities.sensitivity ?? false} />
                     </div>
                   )}
 

@@ -7,6 +7,7 @@ import {
   buildUniqueIndexProbe,
   buildVolatilityProbe,
   interpretAggregateChecks,
+  interpretIsAggregateChecks,
   interpretChecks,
   interpretUniqueChecks,
   relationKey,
@@ -164,6 +165,12 @@ const aggSpec = (functions: string[]) => ({
   why: 'The arms each run the select list; an aggregate there would collapse each arm separately.',
 });
 
+const isAggSpec = (functions: string[]) => ({
+  kind: 'function-is-aggregate' as const,
+  functions,
+  why: 'The grouped-join rewrite moves the call into a GROUP BY derived table; a plain function of the same name would compute something else.',
+});
+
 describe('unique-index probe', () => {
   test('one statement: unique, non-partial, non-expression, key within the pinned set', () => {
     const probe = buildUniqueIndexProbe([uniqueSpec(['public', 'users'], ['id'])]);
@@ -230,5 +237,28 @@ describe('aggregate probe', () => {
     const [miss] = interpretAggregateChecks([aggSpec(['upper', 'coalesce'])], []);
     assert.equal(miss.established, true);
     assert.match(miss.evidence, /not aggregate functions/);
+  });
+});
+
+describe('is-aggregate probe (mirror direction)', () => {
+  // The probe is name-based, so the positive claim is only ever about the
+  // NAME: search_path could resolve `count` to a plain function even while
+  // pg_catalog.count exists. The note must say the name "names an aggregate",
+  // not that this call "is" one — a resolution the probe cannot see.
+  test('a name-match establishes the name, not the call — no `()`, no resolution asserted', () => {
+    const [check] = interpretIsAggregateChecks([isAggSpec(['count'])], ['count']);
+    assert.equal(check.established, true);
+    assert.match(check.evidence, /`count` names an aggregate in pg_proc \(prokind = 'a'\)/);
+    assert.doesNotMatch(check.evidence, /`count\(\)`/);
+    assert.doesNotMatch(check.evidence, /is an aggregate/);
+  });
+
+  // The negative direction IS sound for the call: if no aggregate of that name
+  // exists anywhere in pg_proc, nothing can resolve to one — so here we may
+  // speak of `count()` and its resolution directly.
+  test('a name with no aggregate anywhere refuses, citing the call it can see', () => {
+    const [check] = interpretIsAggregateChecks([isAggSpec(['count'])], []);
+    assert.equal(check.established, false);
+    assert.match(check.evidence, /`count\(\)` does not resolve to an aggregate/);
   });
 });

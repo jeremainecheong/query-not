@@ -5,7 +5,12 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { parseExplainJson } from '../src/parse.ts';
-import { analyze, suggestIndexes } from '../src/analyze.ts';
+import {
+  analyze,
+  composeExtendedStatisticsDdl,
+  suggestExtendedStatistics,
+  suggestIndexes,
+} from '../src/analyze.ts';
 import type { Finding, FindingKind, QueryPlan } from '../src/types.ts';
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
@@ -241,5 +246,132 @@ describe('suggestIndexes', () => {
     const suggestions = suggestIndexes(loadFixture('join-agg.json'));
     const keys = suggestions.map((s) => `${s.relation}(${s.columns.join(',')})`);
     assert.equal(new Set(keys).size, keys.length);
+  });
+});
+
+describe('suggestExtendedStatistics', () => {
+  /** An ANALYZEd single-scan plan with the given quals and cardinalities. */
+  function scanPlan(over: Record<string, unknown> = {}, analyzed = true): QueryPlan {
+    return parseExplainJson(
+      JSON.stringify([
+        {
+          Plan: {
+            'Node Type': 'Seq Scan',
+            'Relation Name': 'customers',
+            Filter: "((country = 'DE'::text) AND (currency = 'EUR'::text))",
+            'Plan Rows': 2000,
+            ...(analyzed ? { 'Actual Rows': 10000, 'Actual Loops': 1, 'Actual Total Time': 12 } : {}),
+            'Total Cost': 1218,
+            ...over,
+          },
+          ...(analyzed ? { 'Execution Time': 13 } : {}),
+        },
+      ]),
+    );
+  }
+
+  test('the correlated-pair underestimate produces exactly one suggestion with the ratio cited', () => {
+    const suggestions = suggestExtendedStatistics(scanPlan());
+    assert.equal(suggestions.length, 1);
+    const s = suggestions[0]!;
+    assert.equal(s.relation, 'customers');
+    assert.deepEqual(s.columns, ['country', 'currency']);
+    assert.equal(
+      s.ddl,
+      'CREATE STATISTICS customers_country_currency_stats (dependencies, ndistinct) ON country, currency FROM customers;',
+    );
+    assert.equal(s.ratio, 5);
+    assert.equal(s.estimatedRows, 2000);
+    assert.equal(s.actualRows, 10000);
+    assert.equal(s.confidence, 'high');
+    // The evidence must cite the measured ratio and both columns, backticked.
+    assert.match(s.reason, /5\.0x under/);
+    assert.match(s.reason, /`country`/);
+    assert.match(s.reason, /`currency`/);
+    assert.match(s.reason, /pg_statistic_ext/);
+  });
+
+  test('the gate admits ANALYZE sampling error around the 5x bar, and nothing below it', () => {
+    // The seeded demo's true 5x dependency samples at ~4.9x; it must fire.
+    const sampled = scanPlan({ 'Plan Rows': 2036 }); // 10000 / 2036 = 4.91x
+    assert.equal(suggestExtendedStatistics(sampled).length, 1);
+    // 3.9x is imprecision territory, not a dependency signature.
+    const below = scanPlan({ 'Plan Rows': 2564 }); // 10000 / 2564 = 3.90x
+    assert.equal(suggestExtendedStatistics(below).length, 0);
+  });
+
+  test('refuses a single equality column', () => {
+    const plan = scanPlan({ Filter: "(country = 'DE'::text)" });
+    assert.equal(suggestExtendedStatistics(plan).length, 0);
+  });
+
+  test('refuses an overestimate — dependencies can only raise estimates', () => {
+    const plan = scanPlan({ 'Plan Rows': 50000 }); // 5x over
+    assert.equal(suggestExtendedStatistics(plan).length, 0);
+  });
+
+  test('emits nothing for an un-analyzed plan', () => {
+    assert.equal(suggestExtendedStatistics(scanPlan({}, false)).length, 0);
+  });
+
+  test('refuses when the predicate contains an OR — a disjunction is not a conjunction', () => {
+    const plan = scanPlan({
+      Filter: "(((country = 'DE'::text) AND (currency = 'EUR'::text)) OR (country = 'JP'::text))",
+    });
+    assert.equal(suggestExtendedStatistics(plan).length, 0);
+  });
+
+  test('a function-wrapped column is excluded, and the pair collapsing below two refuses', () => {
+    const plan = scanPlan({
+      Filter: "((date(signed_up_at) = '2024-01-01'::date) AND (country = 'DE'::text))",
+    });
+    assert.equal(suggestExtendedStatistics(plan).length, 0);
+  });
+
+  test('refuses more than eight equality columns — the CREATE STATISTICS limit', () => {
+    const filter = `(${Array.from({ length: 9 }, (_, i) => `(c${i} = ${i})`).join(' AND ')})`;
+    assert.equal(suggestExtendedStatistics(scanPlan({ Filter: filter })).length, 0);
+  });
+
+  test('deduplicates the same relation and column set across nodes', () => {
+    const plan = parseExplainJson(
+      JSON.stringify([
+        {
+          Plan: {
+            'Node Type': 'Append',
+            'Plan Rows': 4000,
+            'Actual Rows': 20000,
+            'Actual Loops': 1,
+            'Actual Total Time': 25,
+            'Total Cost': 2500,
+            Plans: [0, 1].map(() => ({
+              'Node Type': 'Seq Scan',
+              'Relation Name': 'customers',
+              Filter: "((country = 'DE'::text) AND (currency = 'EUR'::text))",
+              'Plan Rows': 2000,
+              'Actual Rows': 10000,
+              'Actual Loops': 1,
+              'Actual Total Time': 12,
+              'Total Cost': 1218,
+            })),
+          },
+          'Execution Time': 26,
+        },
+      ]),
+    );
+    assert.equal(suggestExtendedStatistics(plan).length, 1);
+  });
+
+  test('quotes identifiers that need it, and hashes a name that overflows 63 bytes', () => {
+    const short = composeExtendedStatisticsDdl('Orders', ['Country', 'currency']);
+    assert.match(short.ddl, /^CREATE STATISTICS "Orders_Country_currency_stats" \(dependencies, ndistinct\) ON "Country", currency FROM "Orders";$/);
+
+    const longCols = ['a_very_long_column_name_one', 'a_very_long_column_name_two', 'a_very_long_column_name_three'];
+    const long = composeExtendedStatisticsDdl('a_rather_long_relation_name', longCols);
+    assert.ok(Buffer.byteLength(long.statName, 'utf8') <= 63, `name too long: ${long.statName}`);
+    assert.match(long.statName, /_[0-9a-f]{8}$/);
+    // Distinct long names must not collide after truncation.
+    const sibling = composeExtendedStatisticsDdl('a_rather_long_relation_name', [...longCols.slice(0, 2), 'a_very_long_column_name_four']);
+    assert.notEqual(long.statName, sibling.statName);
   });
 });

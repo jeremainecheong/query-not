@@ -5,7 +5,7 @@
  * tab, prove an index, run a settings what-if, open the plan diff, select nodes
  * from both the graph and the list, switch theme, and the failure paths. Also
  * checks the things only observable in a browser — layout overflow, console
- * errors, whether the vendored fonts actually applied, and measured colour
+ * errors, whether the vendored font actually applied, and measured colour
  * contrast.
  *
  *   node e2e/ui.e2e.mjs
@@ -102,6 +102,8 @@ section('Initial load');
     (await page.locator('.hero__actions a:has-text("Analyse a query")').count()) > 0);
   check('the landing page links every section',
     (await page.locator('.card-tile').count()) >= 4);
+  check('the landing page includes the indexes page',
+    (await page.locator('.card-tile__title', { hasText: 'Indexes' }).count()) > 0);
   check('the landing page reports connection state',
     (await page.locator('.hero__status').count()) > 0);
 
@@ -109,29 +111,30 @@ section('Initial load');
     await document.fonts.ready;
     return [...document.fonts].map((f) => ({ family: f.family, status: f.status }));
   });
-  check('SF Pro loaded', fonts.some((f) => /SF Pro/i.test(f.family) && f.status === 'loaded'),
+  check('Inter loaded', fonts.some((f) => /Inter/i.test(f.family) && f.status === 'loaded'),
     JSON.stringify(fonts));
-  check('body renders in SF Pro',
-    await page.evaluate(() => getComputedStyle(document.body).fontFamily.startsWith('"SF Pro"')),
+  // The stack leads with -apple-system by design — Apple devices render SF from
+  // the OS — so on this Linux runner Inter is the first family that resolves,
+  // and webfonts only load on use, so 'loaded' means it is what rendered.
+  check('body renders in Inter', await page.evaluate(() =>
+    /\bInter\b/.test(getComputedStyle(document.body).fontFamily) && document.fonts.check('15px Inter')),
     await page.evaluate(() => getComputedStyle(document.body).fontFamily));
-  check('vendored subset covers the UI glyph set', await page.evaluate(async () => {
+  check('Inter answers for the UI glyph set', await page.evaluate(async () => {
     await document.fonts.ready;
-    return ['→', '—', '…', '×', '·', '▸', '▾'].every((g) => document.fonts.check('15px "SF Pro"', g));
+    return ['→', '—', '…', '×', '·', '▸', '▾'].every((g) => document.fonts.check('15px Inter', g));
   }));
 
-  // SF Mono has to be checked where mono text actually renders — webfonts load
-  // lazily on first use, so it is legitimately absent on a page with no code.
+  // Mono is deliberately not vendored — every platform ships a usable
+  // monospace — so Inter must be the only registered webfont, and the editor
+  // must draw its type from the system stack.
   await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
-  const monoFonts = await page.evaluate(async () => {
+  check('no webfont beyond Inter is registered', await page.evaluate(async () => {
     await document.fonts.ready;
-    return [...document.fonts].map((f) => ({ family: f.family, status: f.status }));
-  });
-  check('SF Mono loaded where code renders',
-    monoFonts.some((f) => /SF Mono/i.test(f.family) && f.status === 'loaded'),
-    JSON.stringify(monoFonts));
-  check('editor renders in SF Mono', await page.evaluate(() => {
+    return [...document.fonts].every((f) => /Inter/i.test(f.family));
+  }));
+  check('editor renders from the system mono stack', await page.evaluate(() => {
     const el = document.querySelector('.editor');
-    return el ? getComputedStyle(el).fontFamily.startsWith('"SF Mono"') : false;
+    return el ? getComputedStyle(el).fontFamily.startsWith('ui-monospace') : false;
   }));
 
   check('no console errors', errors.length === 0, errors.join('; '));
@@ -177,7 +180,7 @@ section('Progressive disclosure');
   await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
   await analyse(page);
 
-  check('segmented control rendered', (await page.locator('.segmented__item').count()) === 6);
+  check('segmented control rendered', (await page.locator('.segmented__item').count()) === 7);
   check('Hotspots selected by default',
     (await page.locator('.segmented__item[aria-selected="true"]').innerText()).includes('Hotspots'));
   check('only one view is shown at a time', (await page.locator('.segmented__item[aria-selected="true"]').count()) === 1);
@@ -315,6 +318,40 @@ section('Proof loop (hypothetical index)');
 
   check('no console errors', errors.length === 0, errors.join('; '));
   if (OUT) await page.screenshot({ path: `${OUT}/e2e-proof.png`, fullPage: true });
+  await ctx.close();
+}
+
+// ── Extended statistics (sandbox proof) ──────────────────────────────────────
+
+section('Extended statistics advisor');
+{
+  const { ctx, page, errors } = await newPage();
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
+  // The seeded correlated pair: the estimate lands ~5x under and the advisor
+  // must offer CREATE STATISTICS with a sandbox proof behind it.
+  await setSql(page, "SELECT count(*) FROM customers WHERE country = 'US' AND currency = 'USD'");
+  await analyse(page);
+  await tab(page, 'Indexes');
+
+  check('the Extended statistics section renders',
+    (await page.locator('.section-label', { hasText: 'Extended statistics' }).count()) > 0);
+  const statsRow = page.locator('.suggestion', { has: page.locator('.code', { hasText: 'CREATE STATISTICS' }) }).first();
+  check('the DDL names dependencies and ndistinct',
+    /\(dependencies, ndistinct\)/.test(await statsRow.locator('.code').first().innerText()));
+  check('the evidence cites the measured ratio',
+    /\d\.\dx under/.test(await statsRow.innerText()));
+
+  await statsRow.locator('button:has-text("Prove it")').click();
+  await page.waitForSelector('.proof__verdict', { timeout: 90000 });
+
+  const statsPanel = await statsRow.locator('.proof').first().innerText();
+  check('the estimate verdict is Estimates fixed', /Estimates fixed/.test(statsPanel), statsPanel.slice(0, 80));
+  check('the accuracy line reports estimated against actual',
+    /estimated against [\d,]+ actual/.test(statsPanel), statsPanel.slice(0, 160));
+  check('the note says everything rolled back', /rolled back/.test(statsPanel));
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-statistics.png`, fullPage: true });
   await ctx.close();
 }
 
@@ -459,6 +496,42 @@ section('Tier B rewrite proofs');
 
   check('no console errors', errors.length === 0, errors.join('; '));
   if (OUT) await page.screenshot({ path: `${OUT}/e2e-tierb-orsplit.png`, fullPage: true });
+  await ctx.close();
+}
+
+// ── Parameter sensitivity ────────────────────────────────────────────────────
+
+section('Parameter sensitivity panel');
+{
+  const { ctx, page, errors } = await newPage();
+  await page.goto(new globalThis.URL(ANALYSE, URL).toString(), { waitUntil: 'networkidle' });
+
+  // promotions.applied_at is indexed with a 101-bound histogram: the sweep
+  // flips Seq Scan → Bitmap Heap Scan between p10 and p50 on the seed.
+  await setSql(page, "SELECT * FROM promotions WHERE applied_at > '2025-01-01'");
+  await analyse(page);
+  await tab(page, 'Sensitivity');
+
+  await page.locator('button:has-text("Sweep the constant")').click();
+  await page.waitForSelector('.sweep__flip, .sweep__noflip', { timeout: 90000 });
+
+  const panel = await page.locator('.sweep').innerText();
+  check('the swept predicate and its why sentence render',
+    /applied_at/.test(panel) && /pg_class\.reltuples|usable statistics/.test(panel), panel.slice(0, 160));
+  check('the variant table lists the as-written baseline and the p-points',
+    /as written/.test(panel) && /p10/.test(panel) && /p90/.test(panel));
+  check('the flip callout renders with its bracket headline',
+    (await page.locator('.sweep__flip').count()) >= 1 && /the plan flips/i.test(panel));
+  check('the estimate-only disclaimer stands',
+    /estimates, not measurements|planner estimate/i.test(panel) && /nothing executed/i.test(panel));
+  check('the flanking plan diff expands behind a toggle', await (async () => {
+    await page.locator('.sweep .diff__toggle').first().click();
+    await page.waitForSelector('.sweep .diff__body', { timeout: 15000 });
+    return (await page.locator('.sweep .diff__row').count()) > 0;
+  })());
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-sensitivity.png`, fullPage: true });
   await ctx.close();
 }
 
@@ -756,6 +829,43 @@ section('Workload page');
   await ctx.close();
 }
 
+section('Workload consolidation');
+{
+  const { ctx, page, errors } = await newPage();
+  // Deterministic setup through the same origin the browser uses (the dev
+  // server proxies /api to the agent): two saved stand-ins with a shared
+  // prefix demand, and a snapshot so a window exists even standalone.
+  const post = (path, body) => fetch(new globalThis.URL(path, URL), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  await post('/api/saved', { name: 'ui-wl-a', sql: "SELECT * FROM orders WHERE status = 'disputed' AND created_at > '2024-03-01'" });
+  await post('/api/saved', { name: 'ui-wl-b', sql: "SELECT * FROM orders WHERE status = 'disputed'" });
+  await post('/api/workload/snapshot', {});
+
+  await page.goto(new globalThis.URL('/workload', URL).toString(), { waitUntil: 'networkidle' });
+  await page.waitForSelector('.workload-row', { timeout: 60000 });
+
+  const button = page.locator('.consolidation button:has-text("Find one index for many queries")');
+  check('the consolidation section renders under the entries', (await button.count()) > 0);
+  check('the saved stand-in checkbox is on by default',
+    await page.locator('.consolidation .toggle input').isChecked());
+
+  await button.click();
+  await page.waitForSelector('.consolidation .proof__verdict', { timeout: 90000 });
+  check('a candidate card shows its verdict',
+    (await page.locator('.consolidation .proof__verdict').first().innerText()).trim().length > 0);
+  const consolidationText = await page.locator('.consolidation').innerText();
+  check('the merged orders index is among the candidates',
+    consolidationText.includes('CREATE INDEX CONCURRENTLY ON orders (status, created_at);'),
+    consolidationText.slice(0, 200));
+  check('per-query claims and sentinels are distinguishable',
+    (await page.locator('.consolidation .pill', { hasText: 'claimed' }).count()) > 0);
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-consolidation.png`, fullPage: true });
+  await ctx.close();
+}
+
 section('Decisions page');
 {
   const { ctx, page, errors } = await newPage();
@@ -793,6 +903,55 @@ section('Decisions page');
   await ctx.close();
 }
 
+section('Indexes page');
+{
+  const { ctx, page, errors } = await newPage();
+  await page.goto(new globalThis.URL('/indexes', URL).toString(), { waitUntil: 'networkidle' });
+  await page.waitForSelector('.indexrow, .alert', { timeout: 60000 });
+
+  check('the deep link renders the inventory',
+    (await page.locator('.indexrow').count()) > 0);
+  check('the page frames idx_scan honestly, caveats first',
+    /replica|reset/i.test(await page.locator('.verdict__sub').innerText()));
+  check('semantics-enforcing indexes are separated with their evidence',
+    /Not droppable for performance/i.test(await page.locator('.main').innerText()) &&
+    /indisprimary/.test(await page.locator('.main').innerText()));
+  check('candidate rows carry the usage evidence sentence',
+    /since/.test(await page.locator('.indexrow__evidence').first().innerText()));
+  check('the prove button is enabled when the capability is on',
+    await page.locator('button:has-text("Prove drop")').first().isEnabled());
+
+  // Prove the safe drop end to end. The store has queries from the sections
+  // above, none of which plan through promotions_applied_at_idx.
+  const promoRow = page.locator('.indexrow', { hasText: 'promotions_applied_at_idx' });
+  await promoRow.locator('button:has-text("Prove drop")').click();
+  await page.waitForSelector('.proof__verdict', { timeout: 90000 });
+  // The proof must reach a real drop verdict, not merely render something.
+  // promotions_applied_at_idx is untouched by the store's queries, so hiding
+  // it changes no plan — the panel says "No plan changed" (bounded to the
+  // tested queries), never an unbounded green "safe" on zero evidence.
+  check('the proof reaches the no-plan-changed verdict',
+    /No plan changed/i.test(await page.locator('.proof__verdict').first().innerText()),
+    await page.locator('.proof__verdict').first().innerText());
+  check('the proof is labelled estimate-only',
+    (await page.locator('.chip', { hasText: 'estimate only' }).count()) > 0);
+  check('coverage is stated on the panel',
+    /tested/.test(await page.locator('.proof').first().innerText()));
+
+  // Nav + back button for the new route.
+  await page.click('.header__link:has-text("Workload")');
+  await page.waitForTimeout(250);
+  await page.goBack();
+  await page.waitForTimeout(250);
+  check('the back button returns to the indexes page',
+    new globalThis.URL(page.url()).pathname === '/indexes', page.url());
+  check('the view follows the back button', (await page.locator('.indexrow').count()) > 0);
+
+  check('no console errors', errors.length === 0, errors.join('; '));
+  if (OUT) await page.screenshot({ path: `${OUT}/e2e-indexes.png`, fullPage: true });
+  await ctx.close();
+}
+
 section('Command palette');
 {
   const { ctx, page } = await newPage();
@@ -811,6 +970,20 @@ section('Command palette');
   await page.waitForTimeout(600);
   check('selecting an operation goes to the reference',
     new globalThis.URL(page.url()).pathname === '/reference');
+
+  // Every page is reachable from the palette; the indexes page (drop proofs)
+  // was the one the sprint added, so search for it by its plural page name —
+  // distinct from the singular plan operations ("Index Scan").
+  await page.keyboard.press('Control+k');
+  await page.waitForSelector('.palette', { timeout: 15000 });
+  await page.fill('.palette__input', 'Indexes');
+  await page.waitForTimeout(200);
+  check('the palette finds the indexes page',
+    (await page.locator('.palette__item').allInnerTexts()).some((t) => /^Indexes\b/.test(t.trim())));
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(600);
+  check('selecting it navigates to /indexes',
+    new globalThis.URL(page.url()).pathname === '/indexes');
 
   await page.keyboard.press('Control+k');
   await page.waitForSelector('.palette', { timeout: 15000 });

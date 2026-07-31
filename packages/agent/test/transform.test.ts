@@ -539,13 +539,13 @@ describe('correlated-subquery-in-select', () => {
     );
   });
 
-  test('count(*) refuses structurally; sum() becomes a precondition', () => {
-    assert.match(
-      blocked(correlated('SELECT o.id, (SELECT count(*) FROM order_items i WHERE i.order_id = o.id) FROM orders o')),
-      /grouped join/,
-    );
-    const c = ok(correlated('SELECT o.id, (SELECT sum(i.qty) FROM order_items i WHERE i.order_id = o.id) FROM orders o'));
-    assert.deepEqual(c.preconditions.map(p => p.kind), ['unique-key-covers', 'function-not-aggregate']);
+  test('aggregate subqueries route to the grouped-join generator now', () => {
+    // These used to refuse (count) or lean on function-not-aggregate (sum);
+    // the grouped-join path owns both shapes since it exists.
+    const c1 = ok(correlated('SELECT o.id, (SELECT count(*) FROM order_items i WHERE i.order_id = o.id) FROM orders o'));
+    assert.ok(c1.sql.includes('COALESCE'));
+    const c2 = ok(correlated('SELECT o.id, (SELECT sum(i.qty) FROM order_items i WHERE i.order_id = o.id) FROM orders o'));
+    assert.deepEqual(c2.preconditions.map(p => p.kind), ['function-is-aggregate']);
   });
 
   test('refuses a subquery that is not itself the select-list entry', () => {
@@ -557,6 +557,234 @@ describe('correlated-subquery-in-select', () => {
       blocked(correlated('SELECT o.id FROM orders o WHERE o.total > (SELECT u.n FROM users u WHERE u.id = o.id)')),
       /select-list entry/,
     );
+  });
+});
+
+describe('lateral top-1 (ORDER BY + LIMIT 1 subquery)', () => {
+  const base =
+    'SELECT o.id, (SELECT i.sku FROM order_items i WHERE i.order_id = o.id ORDER BY i.qty DESC LIMIT 1) FROM orders o';
+
+  test('hoists the subquery verbatim into a LEFT JOIN LATERAL', () => {
+    const c = ok(correlated(`${base} WHERE o.total_cents > 5`));
+    assert.ok(c.sql.includes('LEFT JOIN LATERAL (SELECT i.sku FROM order_items i WHERE i.order_id = o.id ORDER BY i.qty DESC LIMIT 1) qn_0 ON true'));
+    assert.ok(c.sql.includes('o.id, qn_0.sku'));
+    assert.ok(c.sql.indexOf('LATERAL') < c.sql.indexOf('WHERE o.total_cents'));
+  });
+
+  test('the tie-break precondition covers correlation and sort columns', () => {
+    const c = ok(correlated(base));
+    const p = c.preconditions[0];
+    assert.equal(p.kind, 'unique-key-covers');
+    if (p.kind === 'unique-key-covers') {
+      assert.deepEqual(p.relation, ['order_items']);
+      assert.deepEqual(p.columns, ['order_id', 'qty']);
+      assert.match(p.why, /tie/i);
+    }
+    // NULLs stay tied under a unique index, so every sort column also needs
+    // NOT NULL established.
+    const nn = c.preconditions.filter(x => x.kind === 'column-not-null');
+    assert.deepEqual(nn.map(x => x.kind === 'column-not-null' ? x.column : ''), ['qty']);
+  });
+
+  test('an outer-qualified sort key contributes nothing to the pin set', () => {
+    const c = ok(correlated(
+      'SELECT o.id, (SELECT i.sku FROM order_items i WHERE i.order_id = o.id ORDER BY o.id, i.qty LIMIT 1) FROM orders o',
+    ));
+    const p = c.preconditions[0];
+    assert.ok(p.kind === 'unique-key-covers' && p.columns.join(',') === 'order_id,qty');
+  });
+
+  test('an AS alias names the hoisted reference', () => {
+    const c = ok(correlated(
+      'SELECT o.id, (SELECT i.qty * 2 AS double_qty FROM order_items i WHERE i.order_id = o.id ORDER BY i.qty LIMIT 1) FROM orders o',
+    ));
+    assert.ok(c.sql.includes('qn_0.double_qty'));
+  });
+
+  test('an anonymous expression refuses with the AS advice', () => {
+    assert.match(
+      blocked(correlated(
+        'SELECT o.id, (SELECT i.qty * 2 FROM order_items i WHERE i.order_id = o.id ORDER BY i.qty LIMIT 1) FROM orders o',
+      )),
+      /AS/,
+    );
+  });
+
+  test('unqualified inner columns are fine — the body keeps its own scope', () => {
+    // The plain-join path must refuse this; the lateral path must not.
+    ok(correlated(
+      'SELECT o.id, (SELECT i.sku FROM order_items i WHERE i.order_id = o.id ORDER BY qty LIMIT 1) FROM orders o',
+    ));
+  });
+
+  test('LIMIT other than 1, or OFFSET, falls back to the plain-join refusals', () => {
+    // Neither is the top-1 idiom, so both land on the plain path's ORDER BY
+    // refusal, which names the lateral pattern this generator now covers.
+    assert.match(
+      blocked(correlated(
+        'SELECT o.id, (SELECT i.sku FROM order_items i WHERE i.order_id = o.id ORDER BY i.qty LIMIT 2) FROM orders o',
+      )),
+      /lateral-join pattern/,
+    );
+    assert.match(
+      blocked(correlated(
+        'SELECT o.id, (SELECT i.sku FROM order_items i WHERE i.order_id = o.id ORDER BY i.qty LIMIT 1 OFFSET 1) FROM orders o',
+      )),
+      /lateral-join pattern/,
+    );
+  });
+
+  test('an inner-only equality does not pin the tie-break columns', () => {
+    // i.parent_id = i.alt (both inner) must NOT be treated as a correlation
+    // pin: parent_id is not fixed per outer row, so certifying determinism
+    // over it would be unsound. Only owner_id (= outer) and the sort key pin.
+    const c = ok(correlated(
+      'SELECT o.id, (SELECT i.sku FROM order_items i WHERE i.order_id = o.id AND i.qty = i.id ORDER BY i.qty DESC LIMIT 1) FROM orders o',
+    ));
+    const p = c.preconditions[0];
+    assert.ok(p.kind === 'unique-key-covers' && p.columns.join(',') === 'order_id,qty', p.kind === 'unique-key-covers' ? p.columns.join(',') : p.kind);
+  });
+
+  test("LIMIT '1'::int is still recognised as the top-1 idiom", () => {
+    const c = ok(correlated(
+      "SELECT o.id, (SELECT i.sku FROM order_items i WHERE i.order_id = o.id ORDER BY i.qty DESC LIMIT '1'::int) FROM orders o",
+    ));
+    assert.ok(c.sql.includes('LEFT JOIN LATERAL'));
+  });
+
+  test('a multi-table inner refuses: no single index pins the choice', () => {
+    assert.match(
+      blocked(correlated(
+        'SELECT o.id, (SELECT i.sku FROM order_items i JOIN orders o2 ON o2.id = i.order_id WHERE i.order_id = o.id ORDER BY i.qty LIMIT 1) FROM orders o',
+      )),
+      /unique index/,
+    );
+  });
+});
+
+describe('grouped join (aggregate subquery)', () => {
+  const base = 'SELECT o.id, (SELECT count(*) FROM order_items i WHERE i.order_id = o.id) FROM orders o';
+
+  test('count(*) becomes a grouped derived table with COALESCE 0', () => {
+    const c = ok(correlated(base));
+    assert.ok(c.sql.replace(/\s+/g, ' ').includes('LEFT JOIN (SELECT i.order_id, count(*) AS agg FROM order_items i GROUP BY i.order_id) qn_0 ON qn_0.order_id = o.id'));
+    assert.ok(c.sql.includes('COALESCE(qn_0.agg, 0)'));
+  });
+
+  test('sum keeps NULL semantics — no COALESCE', () => {
+    const c = ok(correlated(
+      'SELECT o.id, (SELECT sum(i.qty) FROM order_items i WHERE i.order_id = o.id) FROM orders o',
+    ));
+    assert.ok(!c.sql.includes('COALESCE'));
+    assert.ok(c.sql.replace(/\s+/g, ' ').includes('sum(i.qty) AS agg'));
+  });
+
+  test('declares function-is-aggregate — the mirror precondition', () => {
+    const c = ok(correlated(base));
+    assert.deepEqual(c.preconditions.map(p => p.kind), ['function-is-aggregate']);
+    const p = c.preconditions[0];
+    assert.ok(p.kind === 'function-is-aggregate' && p.functions.join() === 'count');
+  });
+
+  test('residual inner-only conditions stay in the derived WHERE', () => {
+    const c = ok(correlated(
+      "SELECT o.id, (SELECT count(*) FROM order_items i WHERE i.order_id = o.id AND i.qty > 2 AND i.sku <> 'X') FROM orders o",
+    ));
+    assert.ok(c.sql.replace(/\s+/g, ' ').includes("WHERE i.qty > 2 AND i.sku <> 'X' GROUP BY i.order_id"));
+  });
+
+  test('an outer-referencing non-equality refuses — it cannot be decorrelated', () => {
+    assert.match(
+      blocked(correlated(
+        'SELECT o.id, (SELECT count(*) FROM order_items i WHERE i.order_id = o.id AND i.qty > o.total_cents) FROM orders o',
+      )),
+      /cannot move/,
+    );
+  });
+
+  test('count(DISTINCT col) is preserved verbatim', () => {
+    const c = ok(correlated(
+      'SELECT o.id, (SELECT count(DISTINCT i.sku) FROM order_items i WHERE i.order_id = o.id) FROM orders o',
+    ));
+    assert.ok(c.sql.replace(/\s+/g, ' ').includes('count(DISTINCT i.sku) AS agg'));
+    assert.ok(c.sql.includes('COALESCE'));
+  });
+
+  test('FILTER refuses; unknown aggregates refuse with the whitelist reason', () => {
+    assert.match(
+      blocked(correlated(
+        'SELECT o.id, (SELECT count(*) FILTER (WHERE i.qty > 1) FROM order_items i WHERE i.order_id = o.id) FROM orders o',
+      )),
+      /FILTER/,
+    );
+    // The whitelist branch itself: a real aggregate outside count/sum/min/max/avg.
+    assert.match(
+      blocked(correlated(
+        'SELECT o.id, (SELECT array_agg(DISTINCT i.sku) FROM order_items i WHERE i.order_id = o.id) FROM orders o',
+      )),
+      /count, sum, min, max and avg/,
+    );
+  });
+
+  test('a schema-qualified aggregate is refused — the name alone is not the builtin', () => {
+    // app.sum shares pg_catalog.sum's name but not its empty-group value.
+    assert.match(
+      blocked(correlated(
+        'SELECT o.id, (SELECT app.sum(i.qty) FROM order_items i WHERE i.order_id = o.id) FROM orders o',
+      )),
+      /built-in of that name/,
+    );
+  });
+
+  test('a function in the residual or aggregate argument refuses (volatility)', () => {
+    assert.match(
+      blocked(correlated(
+        'SELECT o.id, (SELECT count(*) FROM order_items i WHERE i.order_id = o.id AND random() < 0.01) FROM orders o',
+      )),
+      /volatile/,
+    );
+  });
+
+  test('a parenthesised nested-AND residual is not withheld', () => {
+    const c = ok(correlated(
+      "SELECT o.id, (SELECT count(*) FROM order_items i WHERE i.order_id = o.id AND (i.qty > 2 AND i.qty < 9) AND i.sku <> 'X') FROM orders o",
+    ));
+    assert.ok(c.sql.includes('COALESCE'));
+  });
+
+  test('a residual ending in a line comment does not swallow the GROUP BY', () => {
+    const c = ok(correlated(
+      'SELECT o.id, (SELECT count(*) FROM order_items i WHERE i.order_id = o.id AND i.qty > 2 -- keep\n) FROM orders o',
+    ));
+    assert.match(c.sql, /GROUP BY/);
+  });
+
+  test('an aggregate argument referencing the outer query refuses', () => {
+    // count(o.id) passes the scope check — o is a real outer name — but the
+    // argument cannot survive the move into an uncorrelated derived table.
+    assert.match(
+      blocked(correlated(
+        'SELECT o.id, (SELECT count(o.id) FROM order_items i WHERE i.order_id = o.id) FROM orders o',
+      )),
+      /outer query/,
+    );
+  });
+
+  test('a pinned column named agg forces a fresh aggregate alias', () => {
+    const c = ok(correlated(
+      'SELECT o.id, (SELECT count(*) FROM order_items agg_t WHERE agg_t.agg = o.id) FROM orders o',
+    ));
+    assert.ok(!/AS agg\b.*\bagg\b.*AS agg\b/.test(c.sql));
+    assert.match(c.sql, /AS agg_\d/);
+  });
+
+  test('multi-column correlation groups by all pins', () => {
+    const c = ok(correlated(
+      'SELECT o.id, (SELECT count(*) FROM order_items i WHERE i.order_id = o.id AND i.qty = o.total_cents) FROM orders o',
+    ));
+    assert.ok(c.sql.includes('GROUP BY i.order_id, i.qty') || c.sql.includes('GROUP BY i.qty, i.order_id'));
+    assert.ok(c.sql.includes('ON qn_0.order_id = o.id AND qn_0.qty = o.total_cents') ||
+              c.sql.includes('ON qn_0.qty = o.total_cents AND qn_0.order_id = o.id'));
   });
 });
 

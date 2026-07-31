@@ -24,8 +24,18 @@ export interface Health {
     readOnlyRole: boolean;
     hypopgAvailable: boolean;
     hypopgInstalled: boolean;
+    /** hypopg_hide_index exists — hiding arrived in hypopg 1.4.0. */
+    hypopgHideIndex?: boolean;
     error: string | null;
   };
+  /** The opt-in DDL sandbox for statistics proofs. Null when not configured. */
+  sandbox?: {
+    configured: boolean;
+    connected: boolean;
+    database: string | null;
+    canDdl: boolean;
+    error: string | null;
+  } | null;
   capabilities: {
     whatIfIndex: boolean;
     whatIfSettings: boolean;
@@ -33,6 +43,14 @@ export interface Health {
     rewriteAdvisor: boolean;
     /** Generated rewrites can be proven — needs a connection and the parser. */
     proveRewrite?: boolean;
+    /** Drop proofs need hypopg 1.4+ (hypopg_hide_index) on the target. */
+    dropIndex?: boolean;
+    /** Statistics proofs need the sandbox (connected, can DDL) and the parser. */
+    proveStatistics?: boolean;
+    /** Parameter sensitivity — needs a connection and the parser, no extension. */
+    sensitivity?: boolean;
+    /** Workload consolidation proves via hypothetical indexes — needs hypopg. */
+    consolidateIndexes?: boolean;
     persistence: boolean;
   };
   store?: { analyses: number; savedQueries: number; decisions: number; queries: number };
@@ -96,7 +114,7 @@ export interface Decision {
   id: number;
   analysisSlug: string | null;
   fingerprint: string;
-  kind: 'index' | 'settings';
+  kind: 'index' | 'settings' | 'rewrite' | 'drop-index' | 'statistics';
   change: string;
   verdict: string;
   headline: string;
@@ -159,6 +177,82 @@ export interface WorkloadResponse {
   snapshots: number;
 }
 
+// ── Workload consolidation ───────────────────────────────────────────────────
+
+export interface ConsolidationScopeQuery {
+  fingerprint: string;
+  sql: string;
+  share: number;
+  source: 'workload' | 'saved-matched' | 'saved-extra';
+  queryId: string | null;
+  savedName: string | null;
+  /** No index demand — the statement acts as a regression sentinel. */
+  noDemand: boolean;
+}
+
+export interface ConsolidationSkipped {
+  queryId: string | null;
+  savedName: string | null;
+  share: number;
+  reason: string;
+  hint: string | null;
+}
+
+export interface ConsolidationPerQuery {
+  fingerprint: string;
+  queryId: string | null;
+  savedName: string | null;
+  source: 'workload' | 'saved-matched' | 'saved-extra';
+  share: number;
+  claimed: boolean;
+  verdict: string | null;
+  costBefore: number | null;
+  costAfter: number | null;
+  costChange: number | null;
+  headline: string | null;
+  accessChanges: string[];
+  error: string | null;
+}
+
+export interface ConsolidationCandidate {
+  relation: string;
+  columns: string[];
+  roles: Array<'eq' | 'range'>;
+  ddl: string;
+  rationale: string;
+  weight: number;
+  claims: string[];
+  replaces: Array<{ relation: string; columns: string[] }>;
+  perQuery: ConsolidationPerQuery[];
+  served: number;
+  servedShare: number;
+  regressed: number;
+  verdict: 'improved' | 'regressed' | 'unchanged';
+  summary: string;
+  costOnly: true;
+  note: string;
+  decisionId: number | null;
+}
+
+export interface ConsolidationReport {
+  window: {
+    isDelta: boolean;
+    fromAt: string | null;
+    toAt: string;
+    totalMs: number;
+    resetDetected: boolean;
+  };
+  scope: {
+    queries: ConsolidationScopeQuery[];
+    skipped: ConsolidationSkipped[];
+    explainableShare: number;
+  };
+  candidates: ConsolidationCandidate[];
+  standalone: Array<{ relation: string; columns: string[]; fingerprints: string[] }>;
+  omitted: Array<{ relation: string; columns: string[]; weight: number }>;
+  summary: string;
+}
+
 export interface HistoryPoint {
   slug: string;
   createdAt: string;
@@ -192,10 +286,32 @@ export interface HistoryReport {
   summary: string | null;
 }
 
+/** A CREATE STATISTICS suggestion, refined by the agent (AST + catalog probe). */
+export interface StatisticsFinding {
+  nodeId: string;
+  relation: string;
+  columns: string[];
+  statName: string;
+  ddl: string;
+  reason: string;
+  estimatedRows: number;
+  actualRows: number;
+  ratio: number;
+  confidence: 'high' | 'medium' | 'low';
+  caveat: string | null;
+  /** 'plan-text' means the AST could not confirm the columns — degraded. */
+  source: 'ast' | 'plan-text';
+  existingState: 'none' | 'not-analysed' | 'analysed' | 'wrong-kind' | 'not-visible' | 'unknown';
+  existing: { name: string; columns: string[]; kinds: string[] } | null;
+  existingAdvice: string | null;
+}
+
 export interface Analysis {
   plan: QueryPlan;
   findings: Finding[];
   indexSuggestions: IndexSuggestion[];
+  /** Absent on analyses recorded before the advisor existed. */
+  statisticsSuggestions?: StatisticsFinding[];
   rewrites: RewriteFinding[];
   narration: string;
   flame: FlameLayout;
@@ -229,7 +345,8 @@ export interface WhatIfResult {
   change:
     | { kind: 'index'; ddl: string }
     | { kind: 'settings'; settings: Record<string, string> }
-    | { kind: 'rewrite'; sql: string };
+    | { kind: 'rewrite'; sql: string }
+    | { kind: 'statistics'; ddl: string };
   findingsAfter: Finding[];
   costOnly: boolean;
   note: string | null;
@@ -266,6 +383,176 @@ export interface RewriteProof {
   outcome: RewriteProofOutcome;
   planDiff: WhatIfResult | null;
   equivalence: EquivalenceResult | null;
+  note: string;
+}
+
+// ── Index inventory and drop proofs ──────────────────────────────────────────
+
+export interface IndexDisqualifier {
+  kind: 'primary-key' | 'unique' | 'exclusion-constraint' | 'replica-identity' | 'constraint-backing';
+  evidence: string;
+}
+
+export interface IndexInventoryEntry {
+  schema: string;
+  table: string;
+  index: string;
+  definition: string;
+  sizeBytes: number;
+  scans: number;
+  lastScanAt: string | null;
+  valid: boolean;
+  droppableForPerformance: boolean;
+  disqualifiers: IndexDisqualifier[];
+  evidence: string;
+}
+
+export interface IndexInventory {
+  statsResetAt: string | null;
+  hasLastScan: boolean;
+  statsNote: string;
+  indexes: IndexInventoryEntry[];
+}
+
+export interface ProofSetSkip {
+  source: 'store' | 'workload';
+  fingerprint: string | null;
+  reason: string;
+}
+
+export interface PerQueryDropResult {
+  fingerprint: string;
+  sql: string;
+  source: 'store' | 'workload';
+  usedIndex: boolean;
+  verdict: 'improved' | 'regressed' | 'unchanged' | 'restructured' | null;
+  headline: string | null;
+  costBefore: number | null;
+  costAfter: number | null;
+  costChange: number | null;
+  accessChanges: string[];
+  error: string | null;
+}
+
+export type DropOutcome = 'no-plan-changed' | 'plans-changed-not-worse' | 'regressed';
+
+export interface DropIndexProof {
+  index: { schema: string; table: string; name: string; definition: string; sizeBytes: number };
+  usage: {
+    scans: number | null;
+    lastScanAt: string | null;
+    statsResetAt: string | null;
+    evidence: string;
+  };
+  perQuery: PerQueryDropResult[];
+  coverage: {
+    tested: number;
+    fromStore: number;
+    fromWorkload: number;
+    skipped: ProofSetSkip[];
+    capped: boolean;
+    cap: number;
+  };
+  outcome: DropOutcome;
+  costOnly: true;
+  note: string;
+}
+
+// ── Parameter sensitivity (mirrored from the agent's sensitivity.ts) ─────────
+
+export interface PredicateCandidate {
+  column: string | null;
+  operator: string | null;
+  value: string | null;
+  location: number;
+  chosen: boolean;
+  skipped: string | null;
+}
+
+export interface FlipBoundary {
+  fromLabel: string;
+  toLabel: string;
+  fromValue: string;
+  toValue: string;
+  before: string[];
+  after: string[];
+  costFrom: number;
+  costTo: number;
+  headline: string;
+}
+
+export interface SensitivityVariant {
+  label: string;
+  value: string;
+  sql: string;
+  frequency: number | null;
+  /** Diff verdict against the as-written baseline; null on the baseline itself. */
+  verdict: 'improved' | 'regressed' | 'unchanged' | 'restructured' | null;
+  totalCost: number;
+  estimatedRows: number;
+  scanRows: number | null;
+  signature: string[];
+  /** Full plan only for the two points flanking the first flip; baseline carries it when no flip. */
+  plan: QueryPlan | null;
+  diff: PlanDiff | null;
+}
+
+export interface SensitivityResult {
+  predicate: {
+    column: string;
+    relation: string[];
+    operator: string;
+    originalValue: string;
+    location: number;
+    charSpan: { start: number; end: number };
+    why: string;
+  };
+  candidates: PredicateCandidate[];
+  basis: {
+    kind: 'histogram' | 'mcv';
+    evidence: string;
+    nDistinct: number | null;
+    nullFrac: number | null;
+    reltuples: number;
+  };
+  baseline: SensitivityVariant;
+  variants: SensitivityVariant[];
+  flips: FlipBoundary[];
+  baselineMatchesLabel: string | null;
+  narrative: string;
+  costOnly: true;
+  note: string;
+}
+
+export type StatisticsProofOutcome = 'estimates-fixed' | 'estimates-improved' | 'no-effect';
+
+export interface StatisticsAccuracySide {
+  estimatedRows: number;
+  actualRows: number;
+  ratio: number;
+}
+
+/** What a sandbox statistics proof measured. Claims are scoped to the sandbox. */
+export interface StatisticsProof {
+  /** The rolled-back statement that ran on the sandbox. */
+  ddl: string;
+  /** The durable form to actually ship: named object plus its ANALYZE. */
+  adviceDdl: string;
+  relation: string;
+  columns: string[];
+  outcome: StatisticsProofOutcome;
+  accuracy: {
+    before: StatisticsAccuracySide;
+    after: StatisticsAccuracySide;
+    nodeLabel: string;
+  } | null;
+  accuracyUnavailableReason: string | null;
+  dependency: {
+    pairs: Array<{ determinant: string[]; dependent: string; degree: number }>;
+    raw: string;
+  } | null;
+  planDiff: WhatIfResult;
+  sandbox: { database: string };
   note: string;
 }
 
@@ -330,6 +617,20 @@ export const api = {
   whatIfRewrite: (sql: string, kind: string, location: number | null) =>
     request<RewriteProof>('/api/whatif/rewrite', { sql, kind, location }),
 
+  /**
+   * Prove a CREATE STATISTICS suggestion on the opt-in sandbox. Coordinates
+   * only — the DDL is composed server-side and always rolled back.
+   */
+  whatIfStatistics: (sql: string, relation: string, columns: string[]) =>
+    request<StatisticsProof>('/api/whatif/statistics', { sql, relation, columns }),
+
+  /**
+   * Parameter sensitivity: re-plan the query at constants drawn from pg_stats
+   * and report where the plan flips. Estimate-only by design — nothing runs.
+   */
+  sensitivity: (sql: string, location: number | null = null) =>
+    request<SensitivityResult>('/api/whatif/sensitivity', { sql, location }),
+
   // ── Persistence ────────────────────────────────────────────────────────────
 
   /** Re-open a recorded analysis. This is what a shared link resolves to. */
@@ -345,8 +646,23 @@ export const api = {
 
   workload: () => request<WorkloadResponse>('/api/workload'),
 
+  /** Every user index with usage evidence; needs no extension. */
+  indexes: () => request<IndexInventory>('/api/indexes'),
+
+  /**
+   * Prove an index is safe to drop. Only the name (and optional schema) is
+   * sent — the server resolves, disqualifies, hides and re-plans in its own
+   * single session, so no SQL or oid ever crosses the wire.
+   */
+  whatIfDropIndex: (index: string, schema: string | null) =>
+    request<DropIndexProof>('/api/whatif/drop-index', { index, schema }),
+
   workloadSnapshot: () =>
     request<{ id: number; takenAt: string; entries: number }>('/api/workload/snapshot', {}),
+
+  /** One index proven against many queries — scope derived server-side. */
+  consolidateWorkload: (input: { includeSaved?: boolean; limit?: number; maxCandidates?: number }) =>
+    request<ConsolidationReport>('/api/workload/consolidate', input),
 
   listSaved: () => request<{ queries: SavedQuery[] }>('/api/saved'),
 
@@ -363,7 +679,7 @@ export const api = {
   recordDecision: (input: {
     analysisSlug: string | null;
     fingerprint: string;
-    kind: 'index' | 'settings' | 'rewrite';
+    kind: 'index' | 'settings' | 'rewrite' | 'drop-index' | 'statistics';
     change: string;
     verdict: string;
     headline: string;

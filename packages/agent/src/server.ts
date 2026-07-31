@@ -18,13 +18,17 @@ import {
   analyzeQuery,
   verifySuggestions,
   whatIfIndex,
+  whatIfParameterSensitivity,
   whatIfRewrite,
   whatIfSettings,
+  whatIfStatistics,
 } from './explain.ts';
 import { fingerprint, TUNABLE_GUCS } from './safety.ts';
 import { analyzeRewrites, initParser, SqlParseError } from './rewrite.ts';
+import { consolidateWorkload } from './consolidate.ts';
 import { Store } from './store.ts';
 import { buildHistory } from './history.ts';
+import { listIndexInventory, proveDropIndex } from './dropindex.ts';
 import {
   collectWorkload,
   deltaWorkload,
@@ -36,6 +40,24 @@ import {
 
 const config = configFromEnv();
 const db = new Database(config);
+
+/**
+ * The statistics sandbox — a second, opt-in connection with DDL rights on a
+ * disposable copy. The target pool above stays read-only by design; this one
+ * exists because CREATE STATISTICS cannot be hypothetical. One connection on
+ * purpose: an in-transaction ANALYZE holds ShareUpdateExclusive on the table
+ * until rollback, so proofs serialise instead of stacking behind each other's
+ * locks.
+ */
+const sandbox = config.sandboxUrl
+  ? new Database({
+      ...config,
+      connectionString: config.sandboxUrl,
+      maxConnections: 1,
+      applicationName: 'query-not-sandbox',
+    })
+  : null;
+
 const app = express();
 
 // The rewrite advisor's parser loads a wasm module once at startup. Tracked as
@@ -75,6 +97,20 @@ function requireSql(body: unknown): string {
 
 app.get('/api/health', async (_req, res) => {
   const probe = await db.probe();
+
+  // The sandbox is probed fresh alongside the target. canDdl is the bit the
+  // statistics proof actually needs — probe() already measures exactly it.
+  const sandboxProbe = sandbox ? await sandbox.probe() : null;
+  const sandboxHealth = sandboxProbe
+    ? {
+        configured: true,
+        connected: sandboxProbe.connected,
+        database: sandboxProbe.database,
+        canDdl: sandboxProbe.connected && !sandboxProbe.readOnlyRole,
+        error: sandboxProbe.error,
+      }
+    : null;
+
   res.json({
     agent: 'ok',
     statementTimeoutMs: config.statementTimeoutMs,
@@ -82,6 +118,7 @@ app.get('/api/health', async (_req, res) => {
     store: store.stats(),
     workload: { snapshots: store.workloadSnapshotCount() },
     database: probe,
+    sandbox: sandboxHealth,
     // Surfaced so the UI can warn rather than silently offering a broken feature.
     capabilities: {
       whatIfIndex: probe.hypopgInstalled,
@@ -91,6 +128,21 @@ app.get('/api/health', async (_req, res) => {
       // The one what-if that can be executed rather than just costed — it
       // needs a connection and the parser, and no extension at all.
       proveRewrite: probe.connected && parserReady,
+      // Hiding an existing index needs hypopg 1.4+ (hypopg_hide_index),
+      // probed by function existence rather than version-string parsing. The
+      // /api/indexes listing itself needs no extension; only proving does.
+      dropIndex: probe.hypopgInstalled && probe.hypopgHideIndex,
+      // Statistics proofs run real (rolled-back) DDL, so they need the
+      // opt-in sandbox with a role that can write, plus the parser for the
+      // server-side candidate re-derivation.
+      proveStatistics: (sandboxHealth?.canDdl ?? false) && parserReady,
+      // Parameter sensitivity needs a connection (pg_stats + EXPLAIN) and the
+      // parser, no extension — surfaced so the UI gates the sweep button
+      // rather than offering a broken one.
+      sensitivity: probe.connected && parserReady,
+      // Workload consolidation proves via hypothetical indexes, so it is
+      // gated by the same extension as whatIfIndex.
+      consolidateIndexes: probe.hypopgInstalled,
       persistence: true,
     },
   });
@@ -292,6 +344,73 @@ function withExplainable<T extends { query: string }>(entry: T) {
   return { ...entry, explainable: ok, notExplainableReason: reason };
 }
 
+// ── Indexes ──────────────────────────────────────────────────────────────────
+
+/**
+ * Every user index with its usage evidence, semantics-enforcing ones flagged.
+ *
+ * Works without hypopg — it reads statistics and the catalog only. The listing
+ * never says "safe"; verdicts are the prove endpoint's job.
+ */
+app.get('/api/indexes', async (_req, res) => {
+  try {
+    res.json(await listIndexInventory(db));
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+/**
+ * Prove an index is safe to drop: hide it with hypopg_hide_index in one
+ * session, re-plan every query this agent knows about, diff each plan, and
+ * conclude — or refuse, when the index enforces semantics rather than speed.
+ */
+app.post('/api/whatif/drop-index', async (req, res) => {
+  try {
+    const index = req.body?.index;
+    if (typeof index !== 'string' || index.trim().length === 0) {
+      throw new AgentError('Provide an "index" name.');
+    }
+    const schema = req.body?.schema;
+    if (schema !== undefined && schema !== null && typeof schema !== 'string') {
+      throw new AgentError('"schema" must be a string or null.');
+    }
+    res.json(await proveDropIndex(db, store, index, typeof schema === 'string' ? schema : null));
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+/**
+ * Consolidate the workload's index demands into a few composite candidates and
+ * prove each one against every in-scope statement via hypothetical indexes.
+ *
+ * No SQL in the body: the scope is derived server-side from the workload
+ * window and the saved queries, the same way /api/whatif/rewrite derives its
+ * candidate — so the proof can only ever describe what the agent itself
+ * assembled.
+ */
+app.post('/api/workload/consolidate', async (req, res) => {
+  try {
+    const body = req.body ?? {};
+    const includeSaved = body.includeSaved === undefined ? true : body.includeSaved;
+    if (typeof includeSaved !== 'boolean') {
+      throw new AgentError('"includeSaved" must be a boolean.');
+    }
+    const limit = body.limit === undefined ? 12 : body.limit;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 25) {
+      throw new AgentError('"limit" must be an integer between 1 and 25.');
+    }
+    const maxCandidates = body.maxCandidates === undefined ? 5 : body.maxCandidates;
+    if (!Number.isInteger(maxCandidates) || maxCandidates < 1 || maxCandidates > 8) {
+      throw new AgentError('"maxCandidates" must be an integer between 1 and 8.');
+    }
+    res.json(await consolidateWorkload(db, store, { includeSaved, limit, maxCandidates }));
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
 app.get('/api/saved', (_req, res) => {
   res.json({ queries: store.listSavedQueries() });
 });
@@ -329,8 +448,9 @@ app.delete('/api/saved/:name', (req, res) => {
 app.post('/api/decisions', (req, res) => {
   try {
     const body = req.body ?? {};
-    if (body.kind !== 'index' && body.kind !== 'settings' && body.kind !== 'rewrite') {
-      throw new AgentError('kind must be "index", "settings" or "rewrite".');
+    const kinds = ['index', 'settings', 'rewrite', 'drop-index', 'statistics'];
+    if (!kinds.includes(body.kind)) {
+      throw new AgentError(`kind must be one of ${kinds.map((k) => `"${k}"`).join(', ')}.`);
     }
     if (typeof body.change !== 'string' || body.change.trim().length === 0) {
       throw new AgentError('Provide the "change" that was tested.');
@@ -407,6 +527,66 @@ app.post('/api/whatif/rewrite', async (req, res) => {
     }
     res.json(await whatIfRewrite(db, sql, kind, location, { analyze: req.body?.analyze === true }));
   } catch (err) {
+    fail(res, err);
+  }
+});
+
+/**
+ * Prove a CREATE STATISTICS suggestion on the opt-in sandbox.
+ *
+ * Coordinates only — {sql, relation, columns} — never DDL: every statement
+ * that reaches the sandbox is composed server-side from validated parts, and
+ * the candidate is re-derived from the SQL's AST (mismatch → 409). Without a
+ * configured sandbox this is a 412 that explains QUERYNOT_SANDBOX_URL and the
+ * manual recipe; the suggestion stands as advice either way.
+ */
+app.post('/api/whatif/statistics', async (req, res) => {
+  try {
+    const sql = requireSql(req.body);
+    if (!parserReady) {
+      throw new AgentError(
+        'The SQL parser failed to load; statistics proofs are unavailable.',
+        null,
+        503,
+      );
+    }
+    const relation = req.body?.relation;
+    if (typeof relation !== 'string' || relation.trim().length === 0) {
+      throw new AgentError('Provide the "relation" the statistics object would cover.');
+    }
+    const columns = req.body?.columns;
+    res.json(await whatIfStatistics(sandbox, sql, relation.trim(), columns));
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+/**
+ * Parameter sensitivity: sweep one predicate's constant along the column's own
+ * pg_stats and re-plan at each point. Estimate-only, structurally — see
+ * whatIfParameterSensitivity for the two-part why. The optional "location"
+ * pins a discovered candidate by the byte offset reported in candidates[],
+ * mirroring whatif/rewrite's coordinate idiom.
+ */
+app.post('/api/whatif/sensitivity', async (req, res) => {
+  try {
+    const sql = requireSql(req.body);
+    if (!parserReady) {
+      throw new AgentError('The SQL parser failed to load; sensitivity analysis is unavailable.', null, 503);
+    }
+    const location = req.body?.location ?? null;
+    if (location !== null && typeof location !== 'number') {
+      throw new AgentError('Provide the candidate\'s numeric "location", or null.');
+    }
+    res.json(await whatIfParameterSensitivity(db, sql, location));
+  } catch (err) {
+    if (err instanceof SqlParseError) {
+      res.status(400).json({
+        error: err.message,
+        hint: err.cursorPosition !== null ? `Parser stopped at character ${err.cursorPosition}.` : null,
+      });
+      return;
+    }
     fail(res, err);
   }
 });
@@ -507,6 +687,19 @@ const server = app.listen(port, () => {
       console.warn('[agent] hypopg not installed: index what-ifs are unavailable until you CREATE EXTENSION hypopg.');
     }
   });
+  if (sandbox) {
+    sandbox.probe().then((p) => {
+      if (!p.connected) {
+        console.warn(`[agent] statistics sandbox not connected: ${p.error}`);
+      } else if (p.readOnlyRole) {
+        console.warn(
+          '[agent] statistics sandbox is configured but its role cannot run DDL — proofs will fail until it owns the target tables.',
+        );
+      } else {
+        console.log(`[agent] statistics sandbox: ${p.database} (proofs run there, in rolled-back transactions)`);
+      }
+    });
+  }
 });
 
 async function shutdown(signal: string): Promise<void> {
@@ -514,6 +707,7 @@ async function shutdown(signal: string): Promise<void> {
   server.close();
   store.close();
   await db.close();
+  await sandbox?.close();
   process.exit(0);
 }
 

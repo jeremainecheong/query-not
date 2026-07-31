@@ -1,10 +1,10 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 
-// SF Pro and SF Mono are vendored and imported by styles.css. Read
-// src/fonts/LICENSE-NOTE.md before deploying publicly — Apple's licence for
-// them is narrower than it looks, and the compliant fallback stack is a
-// two-line change documented there.
+// Inter is vendored and imported by styles.css. The sans stack still leads
+// with -apple-system, so Apple devices render SF Pro from the OS; vendoring SF
+// itself is off the table — Apple's licence does not allow redistributing it.
+// Inter is SIL OFL (src/fonts/LICENSE.txt), which allows exactly this.
 import { App } from './App';
 import { RouterProvider } from './router';
 import { ErrorBoundary } from './components/ErrorBoundary';

@@ -23,6 +23,7 @@ interface Item {
 const PAGES: Item[] = [
   { id: 'analyse', label: 'Analyse a query', hint: 'Page', route: { name: 'analyse' } },
   { id: 'workload', label: 'Workload', hint: 'Page', route: { name: 'workload' } },
+  { id: 'indexes', label: 'Indexes', hint: 'Page', route: { name: 'indexes' } },
   { id: 'queries', label: 'Query history', hint: 'Page', route: { name: 'queries' } },
   { id: 'saved', label: 'Saved queries', hint: 'Page', route: { name: 'saved' } },
   { id: 'decisions', label: 'Decisions', hint: 'Page', route: { name: 'decisions' } },

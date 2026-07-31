@@ -10,7 +10,12 @@
 
 export * from './types.ts';
 export { parseExplainJson, findNode, describeNode, PlanParseError } from './parse.ts';
-export { analyze, suggestIndexes } from './analyze.ts';
+export {
+  analyze,
+  composeExtendedStatisticsDdl,
+  suggestExtendedStatistics,
+  suggestIndexes,
+} from './analyze.ts';
 export type { AnalyzeOptions } from './analyze.ts';
 export {
   narratePlan,
@@ -26,6 +31,16 @@ export { layoutFlame, hotspots } from './flame.ts';
 export type { FlameLayout, FlameCell } from './flame.ts';
 export { extractColumns, orderForIndex, quoteIdent } from './predicates.ts';
 export type { ExtractedColumn, PredicateOp } from './predicates.ts';
+export { consolidateDemands, extractIndexDemands, serves } from './consolidate.ts';
+export type {
+  ConsolidateOptions,
+  ConsolidatedIndex,
+  ConsolidationResult,
+  DemandExtractionOptions,
+  DroppedColumn,
+  IndexDemand,
+  WeightedDemand,
+} from './consolidate.ts';
 export {
   formatMs,
   formatRows,
