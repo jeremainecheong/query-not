@@ -603,7 +603,7 @@ const GRP_SQL =
 const grpRw = await call('/api/rewrite', { sql: GRP_SQL });
 const grpFinding = (grpRw.body.rewrites ?? []).find((r) => r.kind === 'correlated-subquery-in-select');
 check('the finding carries the grouped derived table with COALESCE',
-  /LEFT JOIN \(SELECT i\.order_id, count\(\*\) AS agg FROM order_items i GROUP BY i\.order_id\)/.test(grpFinding?.candidate?.sql ?? '') &&
+  /LEFT JOIN \(SELECT i\.order_id, count\(\*\) AS agg\s+FROM order_items i\s+GROUP BY i\.order_id\)/.test(grpFinding?.candidate?.sql ?? '') &&
   /COALESCE\(qn_0\.agg, 0\)/.test(grpFinding?.candidate?.sql ?? ''),
   grpFinding?.candidateBlocked ?? 'no candidate');
 const grpProof = await call('/api/whatif/rewrite', {
