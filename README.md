@@ -26,13 +26,16 @@ That second sentence is the point. The tool says what it proved and what it didn
 
 [![query-not — narrated demo](docs/demo/poster.png)](docs/demo/query-not-demo.mp4)
 
-**[▶ Watch the demo](docs/demo/query-not-demo.mp4)** — 4 minutes, narrated and
-captioned ([subtitles](docs/demo/query-not-demo.srt)). Everything on screen is real,
-measured output against a seeded 4-million-row database: the hero query's
-87,748 → 422 index proof, the plan graph with its ringed hotspot, the operation
-reference, the generated `LEFT JOIN` rewrite proven with `customers_pkey` cited
-from the catalog and 19,999 rows compared — and the generated rewrite the tool
-itself tells you not to apply. The CI gate fails a build on camera.
+**[▶ Watch the demo](docs/demo/query-not-demo.mp4)** — narrated and captioned
+([subtitles](docs/demo/query-not-demo.srt)). Everything on screen is real, measured
+output against a seeded 4-million-row database: the hero query's 87,748 → 422 index
+proof, the plan graph with its ringed hotspot, the operation reference, and a
+generated `LEFT JOIN` rewrite proven with `customers_pkey` cited from the catalog —
+alongside the rewrite the tool tells you *not* to apply. Then the index-lifecycle
+half: it proves a load-bearing index is unsafe to drop by hiding it and re-planning
+(cost 11 → 101,491, +884,738%), clears an unused one, and sweeps a query across its
+own `pg_stats` to show the exact point its plan flips from Index Scan to Seq Scan.
+The CI gate fails a build on camera.
 
 ## What works today
 

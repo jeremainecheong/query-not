@@ -1,151 +1,179 @@
 1
-00:00:00,350 --> 00:00:05,972
+00:00:00,350 --> 00:00:06,293
 A PostgreSQL query optimiser that proves what would fix your slow plan.
 
 2
-00:00:06,267 --> 00:00:12,146
+00:00:06,600 --> 00:00:12,542
 Every visualiser tells you what happened. None tell you what to do — or check that it worked.
 
 3
-00:00:12,450 --> 00:00:16,011
+00:00:12,850 --> 00:00:16,375
 A query against 4,000,000 orders.
 
 4
-00:00:16,181 --> 00:00:21,057
+00:00:16,545 --> 00:00:21,382
 Executed in a read-only transaction — measured, not guessed.
 
 5
-00:00:21,367 --> 00:00:28,630
+00:00:21,700 --> 00:00:28,494
 It read 4.00M rows to return 621.
 
 6
-00:00:28,800 --> 00:00:35,197
+00:00:28,664 --> 00:00:34,975
 99.7% of the work, thrown away by a filter.
 
 7
-00:00:35,483 --> 00:00:41,241
+00:00:35,283 --> 00:00:41,244
 The plan as a graph — rows flow upward, leaves at the bottom.
 
 8
-00:00:41,411 --> 00:00:47,292
+00:00:41,414 --> 00:00:47,295
 Edge thickness is row volume. Waste you can see.
 
 9
-00:00:47,462 --> 00:00:52,719
+00:00:47,465 --> 00:00:52,512
 The slowest operation is ringed HOTSPOT — not left to inference.
 
 10
-00:00:53,000 --> 00:00:57,770
+00:00:52,800 --> 00:00:57,704
 Click any node: what it does, what it cost, how it fails.
 
 11
-00:00:58,083 --> 00:01:07,761
+00:00:58,017 --> 00:01:08,148
 A flame graph can’t rank nodes — every ancestor is full-width. That’s why the list exists.
 
 12
-00:01:08,067 --> 00:01:12,181
+00:01:08,467 --> 00:01:12,408
 Anyone can show you a slow query. Here’s the part nobody does.
 
 13
-00:01:12,483 --> 00:01:18,182
+00:01:12,717 --> 00:01:18,788
 It suggests an index — then re-plans against a hypothetical one. Nothing is built.
 
 14
-00:01:18,352 --> 00:01:24,435
+00:01:18,958 --> 00:01:25,279
 Estimated cost 87,748 → 422. Down 99.5%.
 
 15
-00:01:24,733 --> 00:01:34,033
+00:01:25,600 --> 00:01:34,829
 It says what it did not prove: an estimate, not a measured speedup.
 
 16
-00:01:34,350 --> 00:01:39,440
+00:01:35,117 --> 00:01:40,442
 Wrong column → unchanged. Never improved.
 
 17
-00:01:39,610 --> 00:01:43,411
+00:01:40,612 --> 00:01:44,143
 Every verdict kept — with its numbers.
 
 18
-00:01:43,733 --> 00:01:49,882
-24 operations Postgres can pick. Which is right, and when?
+00:01:44,433 --> 00:01:49,521
+Every optimiser tells you what to add. This one proves what&#8217;s safe to remove.
 
 19
-00:01:50,183 --> 00:01:56,269
-A reference for all 24 — starting where most slow queries are decided.
+00:01:49,850 --> 00:01:59,862
+Every index, its size, and its last-used evidence.
 
 20
-00:01:56,439 --> 00:02:03,451
-Seq Scan: right for most of a table. Ruinous for 621 of 4M.
+00:02:00,032 --> 00:02:10,374
+Hide it, re-plan: 11 → 101,491. Load-bearing — do not drop.
 
 21
-00:02:03,621 --> 00:02:10,959
-Bitmap Heap Scan: the middle ground between the two.
+00:02:10,544 --> 00:02:17,642
+The unused one: no plan changed — safe, and it says against what.
 
 22
-00:02:11,129 --> 00:02:17,247
-Each card: what it does · why the planner picks it · what goes wrong.
+00:02:17,933 --> 00:02:22,076
+Where a query will break — before your data gets there.
 
 23
-00:02:17,417 --> 00:02:26,794
-Joins, aggregates, sorts, parallelism — from the same glossary the narrator reads.
+00:02:22,383 --> 00:02:28,716
+The same query, swept across its own pg_stats. Below the line: Index Scan.
 
 24
-00:02:27,100 --> 00:02:32,718
-One idea: plan against a world, change it, re-plan, diff.
+00:02:28,886 --> 00:02:37,263
+Above 3.6M: it flips to Seq Scan. It finds the exact tipping point.
 
 25
-00:02:33,017 --> 00:02:37,566
-Anti-patterns from the real Postgres parser, not a regex.
+00:02:37,567 --> 00:02:43,704
+24 operations Postgres can pick. Which is right, and when?
 
 26
-00:02:37,736 --> 00:02:46,987
-NOT IN → NOT EXISTS is the fix and can change your results.
+00:02:44,017 --> 00:02:50,332
+A reference for all 24 — starting where most slow queries are decided.
 
 27
-00:02:47,300 --> 00:02:53,525
-For 5 patterns it doesn&#8217;t stop at advice — it writes the query.
+00:02:50,502 --> 00:02:57,725
+Seq Scan: right for most of a table. Ruinous for 621 of 4M.
 
 28
-00:02:53,817 --> 00:03:01,433
-A hidden N+1 — a subquery per row. The advisor writes the join.
+00:02:57,895 --> 00:03:05,249
+Bitmap Heap Scan: the middle ground between the two.
 
 29
-00:03:01,603 --> 00:03:09,501
-A unique index means the join cannot fan out — cited by name from pg_index.
+00:03:05,419 --> 00:03:11,654
+Each card: what it does · why the planner picks it · what goes wrong.
 
 30
-00:03:09,671 --> 00:03:18,994
-Cost 165,892 → 10,128 · 19,999 rows compared — identical.
+00:03:11,824 --> 00:03:20,852
+Joins, aggregates, sorts, parallelism — from the same glossary the narrator reads.
 
 31
-00:03:19,300 --> 00:03:25,918
-Its own rewrite, tested: Made it worse — do not apply.
+00:03:21,133 --> 00:03:27,006
+One idea: plan against a world, change it, re-plan, diff.
 
 32
-00:03:26,088 --> 00:03:31,794
-47,912 rows matched — and it still says no. Evidence over enthusiasm.
+00:03:27,317 --> 00:03:31,976
+Anti-patterns from the real Postgres parser, not a regex.
 
 33
-00:03:32,117 --> 00:03:35,686
-Ranked by total time, not mean.
+00:03:32,146 --> 00:03:41,655
+NOT IN → NOT EXISTS is the fix and can change your results.
 
 34
-00:03:35,856 --> 00:03:45,472
-0.72ms x 12,000 calls beats the 708ms report.
+00:03:41,967 --> 00:03:48,191
+For 7 patterns it doesn&#8217;t stop at advice — it writes the query.
 
 35
-00:03:45,767 --> 00:03:53,015
-When did this get slower, and what changed?
+00:03:48,483 --> 00:03:56,639
+A hidden N+1 — a subquery per row. The advisor writes the join.
 
 36
-00:03:53,350 --> 00:03:56,945
-A migration drops an index a hot query depended on.
+00:03:56,809 --> 00:04:05,164
+A unique index means the join cannot fan out — cited by name from pg_index.
 
 37
-00:03:57,115 --> 00:04:01,759
-The build fails before it ships.
+00:04:05,334 --> 00:04:14,202
+Cost 165,892 → 10,128 · 19,999 rows compared — identical.
 
 38
-00:04:02,067 --> 00:04:08,081
+00:04:14,500 --> 00:04:20,884
+Its own rewrite, tested: Made it worse — do not apply.
+
+39
+00:04:21,054 --> 00:04:26,785
+47,912 rows matched — and it still says no. Evidence over enthusiasm.
+
+40
+00:04:27,117 --> 00:04:30,845
+Ranked by total time, not mean.
+
+41
+00:04:31,015 --> 00:04:41,002
+0.72ms x 12,000 calls beats the 708ms report.
+
+42
+00:04:41,333 --> 00:04:48,591
+When did this get slower, and what changed?
+
+43
+00:04:48,917 --> 00:04:52,528
+A migration drops an index a hot query depended on.
+
+44
+00:04:52,698 --> 00:04:57,461
+The build fails before it ships.
+
+45
+00:04:57,767 --> 00:05:03,751
 Find it. Prove it. Ship it.
