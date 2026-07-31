@@ -75,6 +75,11 @@ export function LandingPage({ health }: { health: Health | null }) {
           body="What the server is actually spending its day on, ranked by total time — not the slow query everyone notices, the cheap one running constantly."
         />
         <Card
+          to={{ name: 'indexes' }}
+          title="Indexes"
+          body="Prove an index is safe to drop: hide it and re-plan every query the tool knows about, so a load-bearing one shows itself before you remove it."
+        />
+        <Card
           to={{ name: 'queries' }}
           title="Query history"
           body="Every run is recorded. When a plan changes shape — an index scan becoming a sequential scan — you can see exactly when."
