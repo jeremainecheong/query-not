@@ -924,8 +924,13 @@ section('Indexes page');
   const promoRow = page.locator('.indexrow', { hasText: 'promotions_applied_at_idx' });
   await promoRow.locator('button:has-text("Prove drop")').click();
   await page.waitForSelector('.proof__verdict', { timeout: 90000 });
-  check('a completed proof shows its outcome',
-    (await page.locator('.proof__verdict').first().innerText()).trim().length > 0);
+  // The proof must reach a real drop verdict, not merely render something.
+  // promotions_applied_at_idx is untouched by the store's queries, so hiding
+  // it changes no plan — the outcome is "Safe to drop", never a green badge
+  // on zero evidence.
+  check('the proof reaches the safe-to-drop verdict',
+    /Safe to drop/i.test(await page.locator('.proof__verdict').first().innerText()),
+    await page.locator('.proof__verdict').first().innerText());
   check('the proof is labelled estimate-only',
     (await page.locator('.chip', { hasText: 'estimate only' }).count()) > 0);
   check('coverage is stated on the panel',
