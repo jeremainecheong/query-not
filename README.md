@@ -51,7 +51,7 @@ itself tells you not to apply. The CI gate fails a build on camera.
   `NOT IN` null semantics, deep `OFFSET`, leading-wildcard `LIKE`, `OR` across columns,
   and scalar subqueries in the select list. Rewrites that change *results* rather than
   just speed say so explicitly.
-- **Generated rewrites, proven** — for five kinds, the advisor writes the optimised
+- **Generated rewrites, proven** — for seven kinds, the advisor writes the optimised
   statement itself: `NOT IN (SELECT …)` → `NOT EXISTS`, `NOT IN (list)` → a VALUES
   anti-join, `date(col) = 'D'` → a half-open range an index can serve, `WHERE a OR b`
   → `UNION ALL` arms guarded with `AND (earlier arm) IS NOT TRUE` so they partition
